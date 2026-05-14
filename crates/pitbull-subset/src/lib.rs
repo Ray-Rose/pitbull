@@ -39,6 +39,14 @@
 //!                       subset checker itself.
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
+// When the build script sets `--cfg rustc_public_real` (opt-in via
+// `PITBULL_USE_RUSTC_PUBLIC=1` on a nightly toolchain), enable the
+// `rustc_private` feature so we can `extern crate rustc_public;`.
+// Default builds (stable Rust, no opt-in) skip this entirely and the
+// shadow MIR types in `mir_api.rs` carry the build.
+#![cfg_attr(rustc_public_real, feature(rustc_private))]
+#[cfg(rustc_public_real)]
+extern crate rustc_public;
 pub mod config;
 pub mod diagnostic;
 pub mod mir_api;

@@ -383,4 +383,55 @@ The following are tracked but not in v0.1:
 - Tree-Borrows-aware soundness cross-check protocol.
 - Trusted-build-script hash verification.
 - IDE integration (LSP, SARIF live updates).
+### 17.1 Milestone 2 (rustc_public wiring) — in-progress sub-checklist
+A working scaffold for Milestone 2 is in tree as of the post-v0.1 polish
+checkpoint. The following items remain before the milestone can be
+declared complete:
+**Build infrastructure (DONE):**
+- ✅ `crates/pitbull-subset/build.rs` opt-in env var `PITBULL_USE_RUSTC_PUBLIC=1`
+- ✅ Custom rustc cfg `rustc_public_real` declared in workspace lints
+- ✅ `extern crate rustc_public` + `feature(rustc_private)` in lib.rs (cfg-gated)
+**Architectural correction (DONE):**
+- ✅ Adapter pattern: shadow IR is the always-compiled internal type set;
+  real rustc_public types are translated into shadow types by
+  `mir_api::adapter` (cfg-gated). The visitor never sees real
+  rustc_public types directly.
+**Adapter translation surface (PARTIAL):**
+- ✅ `adapter::def_id` — stub via Debug-rendering hash
+- ✅ `adapter::span` — placeholder (returns `Span::default()`; needs
+  byte-offset extraction via `compiler_interface::with`)
+- ✅ `adapter::ty` — placeholder (returns `Ty::Bool`; needs full
+  RigidTy/TyKind dispatch under compiler context)
+- ✅ `adapter::body` — body shell with translated locals; statements
+  and terminators not yet translated
+- ⏳ `adapter::statement` — 13 StatementKind variants
+- ⏳ `adapter::terminator` — 15 TerminatorKind variants
+- ⏳ `adapter::rvalue` — 15 Rvalue variants
+- ⏳ `adapter::operand`, `adapter::place`, `adapter::projection` — full surface
+- ⏳ Real `Span` byte-offset extraction (requires rustc context)
+- ⏳ Full `RigidTy` / `TyKind` translation (requires rustc context)
+**Driver integration (NOT STARTED):**
+- ⏳ `pitbull-driver` rustc_driver callback wrapping
+- ⏳ `RustcPublicProvider` implementing `BodyProvider` against the adapter
+- ⏳ Reachability seeding from `#[pitbull::verify]` annotated items
+- ⏳ Activate `corpus_runs_full_pipeline` integration test
+**Known limitations of the current scaffold:**
+- Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
+  rustc internals like `rustc_data_structures`, `rustc_index`). This is
+  a known `rustc_private` mechanism limitation; tools like Kani and
+  Creusot solve it by running tests inside `rustc_driver` callbacks
+  rather than as standalone test binaries. The pitbull-subset crate's
+  unit tests work fine on stable Rust (49 + 1 ignored, the v0.1
+  baseline). The driver-side test harness is the right home for tests
+  that exercise the adapter against real MIR.
+- Shadow `Span` carries `lo/hi/file` triple but `adapter::span` returns
+  zeros; SARIF reports against real-rustc_public bodies will have
+  placeholder source locations until byte-offset extraction lands.
+**Verification today:**
+```bash
+# Stable: v0.1 baseline (49 + 1 ignored, 0 warnings)
+cargo test --workspace --all-features
+# Nightly + opt-in: adapter scaffold compiles
+PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 check -p pitbull-subset
+```
 See `docs/ROADMAP.md` (forthcoming) for the milestone plan.

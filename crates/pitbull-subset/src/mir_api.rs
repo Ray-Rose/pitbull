@@ -16,32 +16,55 @@
 //!
 //! When upstream stabilizes, we drop the nightly pin from `rust-toolchain.toml`
 //! and this module becomes trivial re-exports.
-// The full `rustc_public` surface is enormous. We re-export only what the
-// subset visitor actually needs, and we name the imports explicitly to avoid
-// star-imports masking version-skew breakage.
-#[cfg(rustc_public_real)]
-pub use rustc_public::{
-    mir::{
-        BasicBlock, BinOp, Body, Local, LocalDecl, Mutability, NullOp, Operand,
-        Place, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
-        TerminatorKind, UnOp,
-    },
-    ty::{AdtDef, FnDef, GenericArgs, IntTy, RigidTy, Ty, TyKind, UintTy},
-    CrateDef, DefId, Span,
-};
-// -----------------------------------------------------------------------------
-// Shadow types for testing and out-of-toolchain builds.
+// =====================================================================
+// DESIGN NOTE — Adapter pattern (Milestone 2 architectural correction)
+// =====================================================================
 //
-// When the `rustc-public-real` feature is off, we expose minimal shadow types
-// that mirror the rustc_public API surface so that the subset crate compiles
-// in isolation (and so its tests can run without a nightly toolchain).
+// The original v0.1 build guide proposed: under `cfg(rustc_public_real)`,
+// re-export real `rustc_public` types directly so the visitor consumes
+// them; under the default cfg, expose shadow types for stable-Rust
+// builds and tests. The visitor would compile against either set
+// thanks to (assumed) structural equivalence.
 //
-// These shadows are *not* used in production verification; they exist solely
-// to let `cargo check` work in the CI lane that builds against stable Rust,
-// and to support the mutation-testing harness, which fabricates MIR-shaped
-// inputs to exercise the visitor.
-// -----------------------------------------------------------------------------
-#[cfg(not(rustc_public_real))]
+// **That design did not survive contact with the real API.** Concrete
+// shape differences observed against `rustc_public` on
+// nightly-2026-01-29:
+//
+//   - `mir::Local` is a type alias `= usize`, not `struct Local(u32)`.
+//   - `mir::BasicBlock` is a struct holding statements + terminator, not
+//     a numeric index newtype; the index alias is `BasicBlockIdx = usize`.
+//   - `mir::StatementKind::Coverage` is a tuple variant (carries data),
+//     not a unit variant.
+//   - `mir::RigidTy::FnPtr` is a tuple variant (carries the fn signature),
+//     not a unit variant.
+//   - `mir::CastKind` has a different variant set than the shadow's.
+//   - `ty::Span` does not implement `Default`, `Serialize`, or
+//     `Deserialize`, and exposes no `lo`/`hi` fields (its layout is
+//     opaque). The shadow's `Span` did all of these.
+//
+// Updating the visitor's ~75 exhaustive match arms to handle both
+// shapes would cascade through every PSS-1 detector and invalidate the
+// v0.1 test fixtures. Instead, we adopt the adapter pattern:
+//
+//   - **Shadow types are always compiled** as Pitbull's stable internal
+//     IR. The visitor matches against this IR exclusively.
+//   - **Under `cfg(rustc_public_real)`, an `adapter` submodule** is
+//     additionally compiled. It owns the conversion from real
+//     `rustc_public::mir::Body` (etc.) into shadow types, gated to
+//     nightly + opt-in via `PITBULL_USE_RUSTC_PUBLIC=1`.
+//   - The driver (`pitbull-driver`) calls into the adapter to ingest
+//     real MIR; the visitor never sees `rustc_public` types.
+//
+// Audit benefit: the visitor's view of the program is one fixed type
+// set, regardless of whether tests fabricate it or the adapter
+// translates it from rustc. Soundness analysis is simpler, and adapter
+// bugs are isolated to one well-defined translation surface that can
+// be unit-tested against synthetic real-rustc_public inputs.
+//
+// Cost: adapter must keep up with `rustc_public` API drift. That cost
+// was already going to land somewhere when the guide's design met
+// reality; concentrating it here keeps the rest of the crate stable.
+
 mod shadow {
     // The shadow types mirror the rustc_public surface variant-for-variant.
     // Per-field documentation on the named variants of TerminatorKind,
@@ -516,10 +539,17 @@ mod shadow {
         RawPtr,
     }
 }
-#[cfg(not(rustc_public_real))]
+// Shadow types are Pitbull's stable internal IR; always re-exported. The
+// adapter module below (compiled only under `cfg(rustc_public_real)`)
+// translates real rustc_public types into these.
 pub use shadow::{
     AdtDef, AggregateKind, AssertMessage, BasicBlock, BasicBlockData, BinOp, Body, CastKind,
     ConstOperand, DefId, FloatTy, IntTy, Local, LocalDecl, Mutability, NonDivergingIntrinsic,
     NullOp, Operand, Place, ProjectionElem, RetagKind, RigidTy, Rvalue, Span, Statement,
     StatementKind, Terminator, TerminatorKind, Ty, TyKind, UintTy, UnOp,
 };
+// Adapter: real rustc_public -> shadow IR. Compiled only when the user
+// opts in via `PITBULL_USE_RUSTC_PUBLIC=1` on a nightly toolchain. See
+// the design note at the top of this file.
+#[cfg(rustc_public_real)]
+pub mod adapter;
