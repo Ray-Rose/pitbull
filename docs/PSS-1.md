@@ -410,8 +410,19 @@ declared complete:
 - ⏳ `adapter::operand`, `adapter::place`, `adapter::projection` — full surface
 - ⏳ Real `Span` byte-offset extraction (requires rustc context)
 - ⏳ Full `RigidTy` / `TyKind` translation (requires rustc context)
-**Driver integration (NOT STARTED):**
-- ⏳ `pitbull-driver` rustc_driver callback wrapping
+**Driver integration (PARTIAL):**
+- ✅ `crates/pitbull-driver/build.rs` mirrors the subset crate's opt-in
+- ✅ `pitbull-rustc` wrapper binary (`crates/pitbull-driver/src/bin/pitbull-rustc.rs`):
+  on stable a stub that prints a diagnostic and exits 1; on nightly+opt-in
+  uses `rustc_driver::run_compiler` with NoopCallbacks (passthrough)
+- ✅ `cargo pitbull check` invokes `cargo check` with
+  `RUSTC_WORKSPACE_WRAPPER` set to the wrapper's absolute path, so cargo
+  calls our binary in place of rustc for every compile unit
+- ✅ End-to-end smoke confirmed: nightly+opt-in wrapper compiles a Rust
+  source file via rustc_driver, output binary runs correctly
+- ⏳ `PitbullCallbacks` implementing `rustc_driver::Callbacks` —
+  currently `NoopCallbacks`, needs `after_analysis` hook that walks
+  reachable MIR through the adapter and runs `SubsetVisitor`
 - ⏳ `RustcPublicProvider` implementing `BodyProvider` against the adapter
 - ⏳ Reachability seeding from `#[pitbull::verify]` annotated items
 - ⏳ Activate `corpus_runs_full_pipeline` integration test

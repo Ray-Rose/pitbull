@@ -7,11 +7,25 @@ authors.workspace = true
 repository.workspace = true
 description = "cargo subcommand driver for the Pitbull deductive verifier"
 [[bin]]
-# This binary is invoked as `cargo pitbull` because cargo treats any
-# binary named `cargo-<name>` on the PATH as a subcommand. Install via
-# `cargo install --path crates/pitbull-driver`.
+# Cargo subcommand entry point. cargo treats any binary named `cargo-<name>`
+# on the PATH as a subcommand, so this is invoked as `cargo pitbull`.
+# Install via `cargo install --path crates/pitbull-driver`.
 name = "cargo-pitbull"
 path = "src/main.rs"
+[[bin]]
+# rustc-replacement wrapper. When `cargo pitbull check` runs, it sets
+# `RUSTC_WORKSPACE_WRAPPER` to the absolute path of this binary so that
+# cargo invokes it instead of `rustc` for every crate in the target
+# workspace. The wrapper uses `rustc_driver` to run the standard compile
+# pipeline AND inject the Pitbull subset-checking pass after MIR
+# generation. Pattern adapted from Clippy/Kani/Creusot.
+#
+# On stable (no opt-in), this binary compiles to a stub that prints a
+# diagnostic and exits with a clear error — that way `cargo install`
+# succeeds without nightly-toolchain-only dependencies, and any
+# accidental wrapper invocation fails loudly rather than silently.
+name = "pitbull-rustc"
+path = "src/bin/pitbull-rustc.rs"
 [dependencies]
 pitbull-subset = { path = "../pitbull-subset" }
 clap = { version = "4", features = ["derive"] }

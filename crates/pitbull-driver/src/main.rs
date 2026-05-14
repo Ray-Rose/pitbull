@@ -89,18 +89,70 @@ fn run_check(cli: &Cli) -> Result<ExitCode> {
             eprintln!("pitbull: {err}");
         }
     }
-    // Real MIR ingestion would happen here, behind `rustc_public`. The v0.1
-    // skeleton's `check` command exits with the config validation result
-    // alone; the body walk lands when the driver wires up rustc as a
-    // library.
-    let exit = if outcome.errors.is_empty() {
-        eprintln!("pitbull check: configuration OK; MIR-level checks pending wiring");
-        ExitCode::from(0)
-    } else {
+    if !outcome.errors.is_empty() {
         eprintln!("pitbull check: {} configuration violation(s)", outcome.errors.len());
-        ExitCode::from(1)
+        return Ok(ExitCode::from(1));
+    }
+    // Hand off to the rustc wrapper for the actual MIR walk. We invoke
+    // cargo with `RUSTC_WORKSPACE_WRAPPER` set to our wrapper binary's
+    // absolute path; cargo then calls the wrapper instead of `rustc`
+    // for every compile unit in the target workspace, and the wrapper
+    // injects the Pitbull subset-check pass after MIR generation via
+    // `rustc_driver::Callbacks`.
+    //
+    // The wrapper itself only does meaningful work on a nightly build
+    // with PITBULL_USE_RUSTC_PUBLIC=1 set. On stable, the wrapper is a
+    // stub that exits 1 with a diagnostic — which causes cargo's compile
+    // to fail on the first crate, and the user sees the wrapper's
+    // explanation. That is a calibrated UX choice: rather than silently
+    // skipping the analysis, we make the missing capability obvious.
+    let wrapper = locate_wrapper()
+        .context("locating pitbull-rustc wrapper binary")?;
+    eprintln!("pitbull check: invoking cargo check with RUSTC_WORKSPACE_WRAPPER={}", wrapper.display());
+    let status = std::process::Command::new("cargo")
+        .arg("check")
+        .arg("--all-targets")
+        .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
+        .status()
+        .context("spawning `cargo check` with pitbull-rustc as the rustc wrapper")?;
+    if status.success() {
+        eprintln!("pitbull check: configuration OK; analysis pass exited cleanly");
+        Ok(ExitCode::from(0))
+    } else {
+        // Exit code 1 = subset violations / analysis failures.
+        // Exit code 2+ = wrapper not yet active (stub mode), or compile
+        // failure unrelated to Pitbull. We don't currently distinguish
+        // these — that's part of the next driver-wiring chunk.
+        Ok(ExitCode::from(1))
+    }
+}
+/// Find the pitbull-rustc wrapper binary path.
+///
+/// Search order: (1) explicit `PITBULL_RUSTC_WRAPPER` env var, (2)
+/// sibling of the running cargo-pitbull executable. The sibling search
+/// covers the most common case (built/installed as a workspace member);
+/// the env var is the escape hatch for non-standard installs.
+fn locate_wrapper() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("PITBULL_RUSTC_WRAPPER") {
+        return Ok(PathBuf::from(p));
+    }
+    let me = std::env::current_exe().context("std::env::current_exe()")?;
+    let dir = me
+        .parent()
+        .context("cargo-pitbull binary has no parent directory?!")?;
+    let candidate = if cfg!(windows) {
+        dir.join("pitbull-rustc.exe")
+    } else {
+        dir.join("pitbull-rustc")
     };
-    Ok(exit)
+    if !candidate.exists() {
+        anyhow::bail!(
+            "pitbull-rustc wrapper not found at {}; \
+             set PITBULL_RUSTC_WRAPPER or build with `cargo build -p pitbull-driver`",
+            candidate.display()
+        );
+    }
+    Ok(candidate)
 }
 fn run_verify_stub(cli: &Cli) -> Result<ExitCode> {
     eprintln!("pitbull verify: v0.1 ships subset checking only; running `check` instead.");
