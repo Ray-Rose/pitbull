@@ -1,0 +1,172 @@
+//! Diagnostic emission for subset violations.
+//!
+//! ## Output channels
+//!
+//! - **Compiler-style terminal output** via `miette` for interactive runs.
+//! - **SARIF 2.1.0** JSON for IDE and CI integration (consumed by GitHub
+//!   code-scanning, GitLab, and most IDE LSP layers).
+//! - **JUnit XML** for legacy CI systems (under feature flag, not in v0.1).
+//!
+//! ## Design rule
+//!
+//! Diagnostics are *terminal* artifacts. The compiler may have type errors
+//! that suppress further analysis, in which case Pitbull emits its own
+//! "did-not-run" report rather than mis-attributing the cause. The
+//! `SubsetReport` carries a `phase_completed` field for this purpose.
+pub use crate::rules::{RuleId, Severity};
+use crate::mir_api::Span;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+/// A single subset violation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubsetError {
+    /// The PSS-1 rule violated.
+    pub rule: RuleId,
+    /// Where in the source the violation occurred.
+    pub span: Span,
+    /// Human-readable extra information specific to the violation site.
+    pub detail: String,
+    /// Whether the violation occurred in a specification expression.
+    pub in_spec: bool,
+}
+impl fmt::Display for SubsetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rule = crate::rules::lookup(self.rule).expect("registered rule");
+        write!(
+            f,
+            "{rule_id}: {title} — {detail}",
+            rule_id = self.rule,
+            title = rule.title,
+            detail = self.detail
+        )
+    }
+}
+/// Phase the visitor reached before terminating.
+///
+/// Reported to distinguish "verified" from "we did not finish" — the latter
+/// should never be silently equated with success.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhaseCompleted {
+    /// Subset checking ran on every reachable body.
+    SubsetCheckComplete,
+    /// Aborted before completion (e.g. compilation failed).
+    Aborted,
+}
+/// The accumulated report of a verification run.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubsetReport {
+    /// All recorded violations, in encounter order.
+    pub errors: Vec<SubsetError>,
+    /// What phase the visitor reached.
+    pub phase_completed: PhaseCompleted,
+    /// PSS version this report was produced against.
+    pub pss_version: String,
+}
+impl SubsetReport {
+    /// Construct a report from a list of errors. Marks the phase as
+    /// `SubsetCheckComplete`; for aborted runs use `aborted()`.
+    #[must_use]
+    pub fn new(errors: Vec<SubsetError>) -> Self {
+        Self {
+            errors,
+            phase_completed: PhaseCompleted::SubsetCheckComplete,
+            pss_version: crate::PSS_VERSION.to_string(),
+        }
+    }
+    /// Construct an aborted report.
+    #[must_use]
+    pub fn aborted() -> Self {
+        Self {
+            errors: Vec::new(),
+            phase_completed: PhaseCompleted::Aborted,
+            pss_version: crate::PSS_VERSION.to_string(),
+        }
+    }
+    /// Whether the run found any violations.
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+    /// Whether the run is a clean pass: completed phase, zero errors.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.phase_completed == PhaseCompleted::SubsetCheckComplete && self.errors.is_empty()
+    }
+    /// Render as SARIF 2.1.0 JSON. The schema is intentionally minimal here;
+    /// full SARIF generation including code-flow stitching lives in
+    /// `pitbull-report`. This method is provided for unit-test convenience.
+    pub fn to_sarif_minimal(&self) -> serde_json::Value {
+        let results: Vec<serde_json::Value> = self
+            .errors
+            .iter()
+            .map(|e| {
+                let rule = crate::rules::lookup(e.rule).expect("registered rule");
+                serde_json::json!({
+                    "ruleId": format!("{}", e.rule),
+                    "level": match rule.severity {
+                        Severity::Error => "error",
+                        Severity::Audit => "warning",
+                    },
+                    "message": {
+                        "text": format!("{}: {}", rule.title, e.detail),
+                    },
+                    "locations": [{
+                        "physicalLocation": {
+                            "region": {
+                                "byteOffset": e.span.lo,
+                                "byteLength": e.span.hi.saturating_sub(e.span.lo),
+                            },
+                        },
+                    }],
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "pitbull-subset",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "informationUri": "https://github.com/pitbull-verify/pitbull",
+                        "rules": crate::rules::RULES.iter().map(|r| serde_json::json!({
+                            "id": format!("{}", r.id),
+                            "name": r.title,
+                            "shortDescription": { "text": r.rationale },
+                        })).collect::<Vec<_>>(),
+                    },
+                },
+                "results": results,
+            }],
+        })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::PB001;
+    #[test]
+    fn clean_report_has_no_errors() {
+        let r = SubsetReport::new(vec![]);
+        assert!(r.is_clean());
+    }
+    #[test]
+    fn aborted_report_is_not_clean() {
+        let r = SubsetReport::aborted();
+        assert!(!r.is_clean());
+    }
+    #[test]
+    fn sarif_minimal_includes_rule_metadata() {
+        let r = SubsetReport::new(vec![SubsetError {
+            rule: PB001,
+            span: Span::default(),
+            detail: "test".into(),
+            in_spec: false,
+        }]);
+        let s = r.to_sarif_minimal();
+        let rules = &s["runs"][0]["tool"]["driver"]["rules"];
+        assert!(rules.is_array());
+        assert_eq!(rules.as_array().unwrap().len(), crate::RULE_COUNT);
+    }
+}

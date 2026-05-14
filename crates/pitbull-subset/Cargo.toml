@@ -1,0 +1,36 @@
+[package]
+name        = "pitbull-subset"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "PSS-1 subset enforcement for the Pitbull deductive verifier"
+[dependencies]
+# Diagnostic / error infrastructure. Used for accumulating SubsetError across a
+# crate without aborting on the first violation.
+miette      = { version = "7", features = ["fancy"] }
+thiserror   = "1"
+# Serialization for the rule registry export and the SARIF report.
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+# Hashing for cache keys and trusted-build-script verification.
+sha2        = "0.10"
+# rustc_public is the StableMIR crate exposed by nightly rustc. It is not a
+# crates.io crate; it is provided by the pinned nightly toolchain through the
+# rustc_private mechanism. The shadow MIR types in `mir_api.rs` are used
+# whenever the `--cfg rustc_public_real` rustc flag is NOT set, which keeps
+# `cargo check --all-features` working on stable Rust.
+[dev-dependencies]
+trybuild    = "1"
+insta       = { version = "1", features = ["json"] }
+[lints]
+workspace = true
+[features]
+default = []
+# Public test-only helpers (`SubsetConfig::default_for_test`) for downstream
+# crate tests. Off by default because it widens the public API surface.
+"test-helpers" = []
+# Enable the mutation-testing harness module.
+"mutation-testing" = []

@@ -1,0 +1,69 @@
+################################################################################
+# Pitbull — a SPARK-style deductive verifier for Rust
+#
+# Workspace manifest. The three crates here form the v0.1 spine:
+#
+#   pitbull-spec       — attribute proc-macros (requires/ensures/trusted/etc.)
+#                        that rustc treats as no-ops and Pitbull consumes.
+#   pitbull-subset     — the PSS-1 subset enforcer: exhaustive MIR visitor that
+#                        rejects every construct outside the verifiable subset.
+#   pitbull-driver     — `cargo pitbull` subcommand. Orchestrates compilation,
+#                        subset checking, translation, and SMT dispatch.
+#
+# Translation (MIR → Coma → Why3 → SMT), proof caching, and counterexample
+# rendering live in separate crates added in later milestones.
+#
+# Toolchain pinning. We track Creusot's nightly to stay compatible with the
+# upstream we fork pitbull-translate from. Update in lockstep with Creusot
+# releases; the cadence is roughly quarterly.
+################################################################################
+[workspace]
+resolver = "2"
+members = [
+    "crates/pitbull-spec",
+    "crates/pitbull-subset",
+    "crates/pitbull-driver",
+]
+[workspace.package]
+version      = "0.1.0-dev"
+edition      = "2021"
+rust-version = "1.78"
+license      = "MIT OR Apache-2.0"
+authors      = ["The Pitbull Authors"]
+repository   = "https://github.com/pitbull-verify/pitbull"
+[workspace.lints.rust]
+# We are writing a soundness-bearing tool. Lints are not aesthetic — they are
+# defense in depth.
+unsafe_code            = "forbid"
+missing_docs           = "warn"
+unreachable_pub        = "warn"
+unused_must_use        = "deny"
+elided_lifetimes_in_paths = "warn"
+# Declare the custom cfg flag used by `pitbull-subset/src/mir_api.rs` to
+# switch between the shadow MIR types (default) and real `rustc_public`
+# imports (set by the v0.2 driver's build script under nightly). Without
+# this declaration, modern rustc warns "unexpected cfg condition name"
+# on every site that gates on `rustc_public_real`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rustc_public_real)'] }
+[workspace.lints.clippy]
+# Categorical opt-ins. Style lints are advisory; correctness lints are not.
+all          = { level = "deny", priority = -1 }
+pedantic     = { level = "warn", priority = -1 }
+nursery      = { level = "warn", priority = -1 }
+# Specific bans aligned with PSS-1 internal-implementation principles.
+todo         = "warn"
+unimplemented = "warn"
+panic        = "warn"      # panics in the verifier itself are bugs
+unwrap_used  = "warn"
+expect_used  = "warn"      # justify every expect with a comment, then allow locally
+# These are too noisy in a research codebase. Re-enable as quality bars rise.
+module_name_repetitions = "allow"
+missing_errors_doc       = "allow"
+[profile.release]
+overflow-checks = true     # PSS-1 PB049: we eat our own dog food.
+lto             = "thin"
+codegen-units   = 1
+debug           = "line-tables-only"
+strip           = "none"
+[profile.dev]
+overflow-checks = true     # PSS-1 PB049 also at dev time, no exceptions.

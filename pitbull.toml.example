@@ -1,0 +1,79 @@
+# pitbull.toml — Pitbull verifier configuration
+#
+# Place at the verified crate root. Pitbull refuses to verify a crate without
+# this file. Every option below has a documented default; leaving an option
+# unset accepts the default.
+[project]
+# Crate name (must match Cargo.toml). Used to scope the verification report.
+name = "example-crate"
+# PSS-1 PB071: which Pitbull-supported toolchain pair this project pins.
+# The string identifies a known-good combination of (Ferrocene release,
+# rustc nightly used by Pitbull internals, Creusot fork version).
+toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
+[verification]
+# Hard timeout per verification condition (seconds). Timeout counts as failure.
+vc_timeout_seconds = 60
+# Solver agreement threshold. PSS-1 design: require 2-of-3 solvers to return
+# UNSAT before accepting a proof obligation. Increase to 3 for highest-assurance
+# builds. Decrease only with documented justification.
+solver_agreement = 2
+# Solvers to run in parallel. Order is not significance; all run, fastest
+# answer wins (subject to agreement threshold).
+solvers = ["z3", "cvc5", "alt-ergo"]
+# Pinned solver versions. Pitbull refuses to run with versions not on this list
+# unless `--allow-unpinned-solvers` is passed (and that flag taints the report).
+[verification.solver_versions]
+z3        = "4.13.4"
+cvc5      = "1.2.0"
+alt-ergo  = "2.6.0"
+[subset]
+# PSS-1 PB020: maximum implicit stack allocation, bytes. Default 64 KiB.
+# Set lower for tight MCU targets.
+stack_allocation_limit_bytes = 65536
+# PSS-1 PB052: pointer width of the verification target. Pitbull issues stricter
+# arithmetic obligations for narrower platforms.
+target_pointer_width = 32
+# PSS-1 PB048: panic strategy. Must be "abort" in v0.1.
+panic_strategy = "abort"
+# PSS-1 PB068: trust budget. Builds fail if trusted_lines / verified_lines
+# exceeds this fraction. Default 0.05 (5 percent).
+trust_budget_fraction = 0.05
+# PSS-1 PB059: proc macros allowed in verified code. Crates not on this list
+# cause subset rejection if they expand into reachable code.
+allowed_proc_macros = [
+    "pitbull-spec",      # our own attribute macros
+    "thiserror",         # widely audited, no allocation in derived bodies
+    # "serde_derive",    # uncomment after auditing your serde usage profile
+]
+# PSS-1 PB060: build scripts the project explicitly trusts. Each entry must
+# include the SHA-256 of the build.rs file content. Pitbull verifies the hash
+# at every run.
+[[subset.trusted_build_scripts]]
+crate  = "example-build-dep"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+reason = "Vendor-audited build script generates constant lookup tables only."
+[reachability]
+# Entry points that anchor the call graph. Pitbull verifies these and every
+# function transitively reachable from them.
+verify_roots = [
+    "example_crate::verified_api::*",
+]
+# Items explicitly excluded from reachability (e.g. test-only code).
+exclude = [
+    "example_crate::tests::*",
+]
+[reporting]
+# Where to write the SARIF report consumed by CI and IDEs.
+sarif_path = "target/pitbull/report.sarif"
+# Proof certificate directory. Certificates are committed to the repository
+# so that `pitbull replay` can re-execute them against current solver
+# binaries (defense against solver-bug regression).
+certificate_dir = ".pitbull-cache/certs"
+# Whether to fail the run if any certificate replay disagrees with a fresh run.
+strict_replay = true
+[cache]
+# Content-addressed proof cache. Required for usable CI; mandatory off for
+# qualified releases (those reprove from scratch).
+enabled = true
+# Cache signing key path. Caches without valid signatures are rejected.
+signing_key_path = ".pitbull-cache/signing.key"

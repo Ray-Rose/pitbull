@@ -1,0 +1,28 @@
+# Cargo build artifacts
+/target/
+**/target/
+
+# Cargo.lock note (PSS-1 PB072):
+# Pitbull's own Cargo.lock IS committed because pitbull-driver is a binary
+# crate; verified downstream projects must commit their own Cargo.lock per
+# PB072. This .gitignore intentionally does NOT list Cargo.lock.
+
+# IDE / editor scratch
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Pitbull-generated outputs
+.pitbull-cache/
+*.sarif
+
+# Local config overrides not for version control
+pitbull.local.toml
+
+# Anything explicitly tagged for exclusion
+*.bak
+*.tmp
