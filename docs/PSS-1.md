@@ -420,12 +420,24 @@ declared complete:
   calls our binary in place of rustc for every compile unit
 - ✅ End-to-end smoke confirmed: nightly+opt-in wrapper compiles a Rust
   source file via rustc_driver, output binary runs correctly
-- ⏳ `PitbullCallbacks` implementing `rustc_driver::Callbacks` —
-  currently `NoopCallbacks`, needs `after_analysis` hook that walks
-  reachable MIR through the adapter and runs `SubsetVisitor`
-- ⏳ `RustcPublicProvider` implementing `BodyProvider` against the adapter
+- ✅ `PitbullCallbacks` implementing `rustc_driver::Callbacks`:
+  `after_analysis` bridges to rustc_public via
+  `rustc_internal::run(tcx, ...)`, walks `all_local_items()`, calls
+  `adapter::body()` on each item with a body, runs `SubsetVisitor`,
+  reports stats + violations on stderr.
+- ✅ End-to-end via cargo confirmed: throwaway cargo project +
+  `RUSTC_WORKSPACE_WRAPPER=path/to/pitbull-rustc cargo check`
+  invokes the wrapper for each compile unit; PitbullCallbacks fires
+  per-crate. (Reports 0 violations only because adapter::body still
+  stubs the body interior — the pipeline is wired, the visitor sees
+  empty bodies.)
 - ⏳ Reachability seeding from `#[pitbull::verify]` annotated items
-- ⏳ Activate `corpus_runs_full_pipeline` integration test
+  (currently walks every body, an over-approximation of "reachable from
+  a verify root"). Requires querying CrateItem attributes via
+  rustc_public's attribute API.
+- ⏳ Activate `corpus_runs_full_pipeline` integration test (blocked by
+  the rustc_private rlib link issue documented above; needs the
+  rustc_driver test-harness rework).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

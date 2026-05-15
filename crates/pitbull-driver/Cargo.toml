@@ -27,7 +27,12 @@ path = "src/main.rs"
 name = "pitbull-rustc"
 path = "src/bin/pitbull-rustc.rs"
 [dependencies]
-pitbull-subset = { path = "../pitbull-subset" }
+# `test-helpers` exposes `SubsetConfig::default_for_test()` so the
+# pitbull-rustc wrapper can run with a sane in-memory config when no
+# `pitbull.toml` is present in the target project. This is the v0.2
+# scaffold posture; once the driver reads `pitbull.toml` directly the
+# feature can come off.
+pitbull-subset = { path = "../pitbull-subset", features = ["test-helpers"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 miette = { version = "7", features = ["fancy"] }
