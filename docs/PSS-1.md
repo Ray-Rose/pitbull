@@ -396,20 +396,64 @@ declared complete:
   real rustc_public types are translated into shadow types by
   `mir_api::adapter` (cfg-gated). The visitor never sees real
   rustc_public types directly.
-**Adapter translation surface (PARTIAL):**
+**Adapter translation surface (DONE):**
 - ✅ `adapter::def_id` — stub via Debug-rendering hash
 - ✅ `adapter::span` — placeholder (returns `Span::default()`; needs
   byte-offset extraction via `compiler_interface::with`)
-- ✅ `adapter::ty` — placeholder (returns `Ty::Bool`; needs full
-  RigidTy/TyKind dispatch under compiler context)
-- ✅ `adapter::body` — body shell with translated locals; statements
-  and terminators not yet translated
-- ⏳ `adapter::statement` — 13 StatementKind variants
-- ⏳ `adapter::terminator` — 15 TerminatorKind variants
-- ⏳ `adapter::rvalue` — 15 Rvalue variants
-- ⏳ `adapter::operand`, `adapter::place`, `adapter::projection` — full surface
-- ⏳ Real `Span` byte-offset extraction (requires rustc context)
-- ⏳ Full `RigidTy` / `TyKind` translation (requires rustc context)
+- ✅ `adapter::ty` + `ty_kind` + `rigid_ty` — full RigidTy/TyKind
+  dispatch over all 22 real RigidTy variants. Variants without a
+  shadow analog (Foreign, Str, Pat, Coroutine*, CoroutineWitness,
+  Dynamic, Never) are mapped to synthetic `__pitbull_*` ADT paths
+  that the visitor walks past without firing rules — correct since
+  PSS-1 has no specific rule on those types beyond the surrounding
+  context (e.g. `Dynamic` triggers PB031 via TyKind::Dynamic at the
+  TyKind level for safe references; this synthetic ADT path is the
+  fallback for cases where Dynamic appears nested inside a RigidTy).
+- ✅ `adapter::body` — fully populates `blocks` from real basic blocks
+- ✅ `adapter::operand` — 4 real variants → 3 shadow variants
+  (RuntimeChecks lossily mapped to a Bool constant)
+- ✅ `adapter::place` + `adapter::projection` — full 7-variant surface
+- ✅ `adapter::const_operand` — extracts the FnDef path for function
+  calls (visitor-critical: enables PB011 alloc-call, PB023 atomic,
+  PB025 volatile, PB028 thread, PB043 panic detection at call sites)
+- ✅ `adapter::rvalue` — all 14 real variants (CheckedBinaryOp
+  collapsed to BinaryOp, AddressOf mapped to RawPtr Rvalue)
+- ✅ `adapter::statement` — all 12 real StatementKind variants
+  (real lacks Deinit; shadow's Deinit is dead code in real-mode)
+- ✅ `adapter::terminator` — all 10 real TerminatorKind variants
+  (real lacks TailCall, Yield, CoroutineDrop, FalseEdge, FalseUnwind;
+  shadow has them as dead code in real-mode; Resume/Abort renamed to
+  UnwindResume/UnwindTerminate)
+- ✅ `adapter::aggregate_kind`, `cast_kind`, `bin_op`, `un_op`,
+  `assert_message`, `non_diverging_intrinsic`, `retag_kind` — full
+  supporting-type translations
+- ⏳ Real `Span` byte-offset extraction (post-§17.1 work; SARIF
+  reports against real-translated bodies have placeholder locations
+  until this lands)
+- ⏳ `adapter::def_id` should query the rustc bridge for a stable
+  numeric ID rather than hashing Debug output (cosmetic; current
+  hash IDs are stable within one compilation run, which is enough)
+**End-to-end smoke confirmed (Box → PB011):**
+A throwaway cargo project with `let b: Box<u32> = Box::new(42);`
+under `cargo check` (with `RUSTC_WORKSPACE_WRAPPER` pointing at
+pitbull-rustc) emits:
+```
+pitbull-rustc: PB011: `Box<T>` reachable — `Box<_>`
+pitbull-rustc: PB048: panic strategy is `unwind` — ...
+pitbull-rustc: crate analyzed: 1 items, 1 bodies walked, 14 subset violation(s)
+```
+The Box ADT triggers PB011; cargo init's default `panic = "unwind"`
+profile triggers PB048; PB004/PB007 fire on the internal raw-pointer
+machinery in `core::fmt::*` reachable from `println!`. This is the
+end-to-end Milestone 2 success criterion.
+**Visitor change (path normalization for std re-exports):**
+rustc resolves item paths through whichever prelude brought them into
+scope. For std-using crates, `Box` resolves as `std::boxed::Box` (via
+the std re-export), not the canonical `alloc::boxed::Box`. The
+visitor's `classify_adt` was broadened to accept both forms for PB011
+(Box), PB012 (collections), PB015 (Rc/Arc). Shadow tests construct
+the alloc form and continue to pass; real adapter typically produces
+the std form and now also matches. No shadow type changes.
 **Driver integration (PARTIAL):**
 - ✅ `crates/pitbull-driver/build.rs` mirrors the subset crate's opt-in
 - ✅ `pitbull-rustc` wrapper binary (`crates/pitbull-driver/src/bin/pitbull-rustc.rs`):

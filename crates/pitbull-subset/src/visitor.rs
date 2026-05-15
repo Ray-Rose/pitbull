@@ -734,36 +734,58 @@ impl<'cfg> SubsetVisitor<'cfg> {
             return;
         }
         // PB011, PB012: heap allocation.
-        if path == "alloc::boxed::Box" {
+        //
+        // NOTE: rustc resolves these types through whichever prelude
+        // brought them into scope. For std-using crates (the typical
+        // case), `Box` is `std::boxed::Box`, not `alloc::boxed::Box`,
+        // because std re-exports the alloc primitives. We accept both
+        // forms — the alloc path is the canonical definition site,
+        // the std path is the user-facing re-export. The shadow tests
+        // construct the alloc form; the rustc_public adapter typically
+        // produces the std form on real code.
+        if path == "alloc::boxed::Box" || path == "std::boxed::Box" {
             self.reject(rules::PB011, span, "`Box<_>`");
             return;
         }
         if matches!(
             path,
             "alloc::vec::Vec"
+                | "std::vec::Vec"
                 | "alloc::string::String"
+                | "std::string::String"
                 | "alloc::collections::VecDeque"
                 | "alloc::collections::vec_deque::VecDeque"
+                | "std::collections::VecDeque"
+                | "std::collections::vec_deque::VecDeque"
                 | "alloc::collections::BTreeMap"
                 | "alloc::collections::btree_map::BTreeMap"
+                | "std::collections::BTreeMap"
+                | "std::collections::btree_map::BTreeMap"
                 | "alloc::collections::BTreeSet"
                 | "alloc::collections::btree_set::BTreeSet"
+                | "std::collections::BTreeSet"
+                | "std::collections::btree_set::BTreeSet"
                 | "std::collections::HashMap"
                 | "std::collections::hash_map::HashMap"
                 | "std::collections::HashSet"
                 | "std::collections::hash_set::HashSet"
                 | "alloc::collections::LinkedList"
+                | "std::collections::LinkedList"
         ) {
             self.reject(rules::PB012, span, format!("collection type `{path}`"));
             return;
         }
-        // PB015: reference counting.
+        // PB015: reference counting. Same alloc/std split.
         if matches!(
             path,
             "alloc::rc::Rc"
+                | "std::rc::Rc"
                 | "alloc::rc::Weak"
+                | "std::rc::Weak"
                 | "alloc::sync::Arc"
+                | "std::sync::Arc"
                 | "alloc::sync::Weak"
+                | "std::sync::Weak"
         ) {
             self.reject(rules::PB015, span, format!("reference-counted type `{path}`"));
             return;
