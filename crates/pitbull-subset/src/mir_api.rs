@@ -76,18 +76,69 @@ mod shadow {
     #![allow(missing_docs)]
     use serde::{Deserialize, Serialize};
     /// Source span. Mirror of `rustc_public::Span`.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    ///
+    /// ## Field semantics under the rustc_public adapter
+    ///
+    /// rustc_public exposes `Span` as opaque with `get_lines() ->
+    /// LineInfo { start_line, start_col, end_line, end_col }` and
+    /// `get_filename() -> String`. Byte offsets are *not* exposed.
+    /// The adapter (`mir_api/adapter.rs::span`) packs line + column
+    /// into the existing `lo`/`hi` fields as 16-bit composites —
+    /// `(line << 16) | col` — and hashes the filename into `file`.
+    /// This keeps `Span` `Copy` (the visitor passes spans by value
+    /// across ~30 call sites). Filename-string resolution for
+    /// human-readable SARIF URIs is a separate concern handled by a
+    /// future side-channel filename table; for now SARIF reports
+    /// against real-rustc_public-translated bodies have line/col
+    /// regions but opaque file IDs.
+    ///
+    /// ## Decoding helpers
+    ///
+    /// - `start_line() -> u16`  = `(lo >> 16) as u16`
+    /// - `start_col() -> u16`   = `(lo & 0xFFFF) as u16`
+    /// - `end_line() -> u16`    = `(hi >> 16) as u16`
+    /// - `end_col() -> u16`     = `(hi & 0xFFFF) as u16`
+    ///
+    /// Source files with > 65,535 lines or > 65,535 columns at any
+    /// site overflow the encoding. Both are pathological for any
+    /// real-world Rust source.
+    ///
+    /// ## Shadow / unit-test path
+    ///
+    /// Tests construct `Span::default()` everywhere; all fields zero,
+    /// which decodes to (line=0, col=0) at both ends.
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct Span {
-        /// Byte offset of the start of the span.
+        /// Encoded start position: `(start_line << 16) | start_col`.
         pub lo: u32,
-        /// Byte offset of the end of the span.
+        /// Encoded end position: `(end_line << 16) | end_col`.
         pub hi: u32,
-        /// File identifier.
+        /// File identifier — opaque hash of the source filename.
         pub file: u32,
     }
-    impl Default for Span {
-        fn default() -> Self {
-            Self { lo: 0, hi: 0, file: 0 }
+    impl Span {
+        /// Pack a (line, col) pair into a `lo`/`hi` half. Each clamps
+        /// to `u16::MAX` to prevent overflow on pathological inputs.
+        pub fn pack(line: usize, col: usize) -> u32 {
+            let line_bits = line.min(u16::MAX as usize) as u32;
+            let col_bits = col.min(u16::MAX as usize) as u32;
+            (line_bits << 16) | col_bits
+        }
+        /// Decode the start line from `lo`.
+        pub fn start_line(&self) -> u16 {
+            (self.lo >> 16) as u16
+        }
+        /// Decode the start column from `lo`.
+        pub fn start_col(&self) -> u16 {
+            (self.lo & 0xFFFF) as u16
+        }
+        /// Decode the end line from `hi`.
+        pub fn end_line(&self) -> u16 {
+            (self.hi >> 16) as u16
+        }
+        /// Decode the end column from `hi`.
+        pub fn end_col(&self) -> u16 {
+            (self.hi & 0xFFFF) as u16
         }
     }
     /// Definition identifier. Mirror of `rustc_public::DefId`.

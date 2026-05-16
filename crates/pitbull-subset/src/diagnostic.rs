@@ -112,9 +112,26 @@ impl SubsetReport {
                     },
                     "locations": [{
                         "physicalLocation": {
+                            // SARIF region: prefer line/col over byte
+                            // offsets because rustc_public exposes
+                            // line/col but not byte offsets. See the
+                            // Span doc in mir_api.rs for the encoding.
+                            // Lines and columns are 1-indexed in SARIF;
+                            // the rustc_public LineInfo is also
+                            // 1-indexed, so we pass values through.
                             "region": {
-                                "byteOffset": e.span.lo,
-                                "byteLength": e.span.hi.saturating_sub(e.span.lo),
+                                "startLine": e.span.start_line(),
+                                "startColumn": e.span.start_col(),
+                                "endLine": e.span.end_line(),
+                                "endColumn": e.span.end_col(),
+                            },
+                            // The fileId is an opaque hash of the
+                            // source filename. A future side-channel
+                            // file-name table will resolve this to a
+                            // human-readable URI; for now consumers
+                            // get an opaque integer.
+                            "artifactLocation": {
+                                "index": e.span.file,
                             },
                         },
                     }],
@@ -168,5 +185,52 @@ mod tests {
         let rules = &s["runs"][0]["tool"]["driver"]["rules"];
         assert!(rules.is_array());
         assert_eq!(rules.as_array().unwrap().len(), crate::RULE_COUNT);
+    }
+    /// SARIF physicalLocation regions encode line/col, not byte offsets.
+    /// Pin the structural shape so future SARIF changes notice if a
+    /// downstream consumer relies on the field names.
+    #[test]
+    fn sarif_minimal_emits_line_col_region() {
+        let mut span = Span::default();
+        span.lo = Span::pack(7, 12); // line 7, col 12
+        span.hi = Span::pack(7, 18);
+        span.file = 0xCAFE_BABE;
+        let r = SubsetReport::new(vec![SubsetError {
+            rule: PB001,
+            span,
+            detail: "test".into(),
+            in_spec: false,
+        }]);
+        let s = r.to_sarif_minimal();
+        let region = &s["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+        assert_eq!(region["startLine"], 7);
+        assert_eq!(region["startColumn"], 12);
+        assert_eq!(region["endLine"], 7);
+        assert_eq!(region["endColumn"], 18);
+        let artifact = &s["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"];
+        assert_eq!(artifact["index"], 0xCAFE_BABE_u32);
+    }
+    /// Span::pack and the start_line/etc decoders are inverses for
+    /// values in the u16 range. Pathological larger values clamp
+    /// rather than wrap (defended in Span::pack).
+    #[test]
+    fn span_pack_round_trips() {
+        let s = Span {
+            lo: Span::pack(123, 4567),
+            hi: Span::pack(8910, 11),
+            file: 0,
+        };
+        assert_eq!(s.start_line(), 123);
+        assert_eq!(s.start_col(), 4567);
+        assert_eq!(s.end_line(), 8910);
+        assert_eq!(s.end_col(), 11);
+    }
+    #[test]
+    fn span_pack_clamps_overflow() {
+        // Pathological: line > u16::MAX. Must clamp, not wrap.
+        let packed = Span::pack(100_000, 50);
+        let s = Span { lo: packed, hi: 0, file: 0 };
+        assert_eq!(s.start_line(), u16::MAX);
+        assert_eq!(s.start_col(), 50);
     }
 }

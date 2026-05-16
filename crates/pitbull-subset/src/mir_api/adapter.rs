@@ -53,11 +53,28 @@ pub fn def_id(id: rp::DefId) -> shadow::DefId {
     format!("{id:?}").hash(&mut hasher);
     shadow::DefId(hasher.finish())
 }
-pub fn span(_s: rp::ty::Span) -> shadow::Span {
-    // Real `Span` is opaque; byte-offset extraction needs more bridge
-    // wiring (`compiler_interface::with` + line-info APIs). Tracked in
-    // §17.1; for now, all spans come out as zeros.
-    shadow::Span::default()
+pub fn span(s: rp::ty::Span) -> shadow::Span {
+    // rustc_public's Span exposes line/col positions and a filename
+    // string but no byte offsets. We pack the line/col positions into
+    // the shadow's lo/hi fields (16-bit composites — see the Span
+    // doc-comment in mir_api.rs) and hash the filename for the file
+    // ID. SARIF emission decodes these back into region info.
+    //
+    // Note: get_lines() and get_filename() require the rustc_public
+    // compiler context (they call into `with(|cx| ...)`). The driver
+    // ensures we're inside `rustc_internal::run(tcx, ...)` before
+    // calling adapter functions.
+    let lines = s.get_lines();
+    let filename = s.get_filename();
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    filename.hash(&mut hasher);
+    let file_hash = (hasher.finish() & 0xFFFF_FFFF) as u32;
+    shadow::Span {
+        lo: shadow::Span::pack(lines.start_line, lines.start_col),
+        hi: shadow::Span::pack(lines.end_line, lines.end_col),
+        file: file_hash,
+    }
 }
 fn local(l: rp::mir::Local) -> shadow::Local {
     // `rp::mir::Local` is `usize`. Locals beyond ~4 billion would be
