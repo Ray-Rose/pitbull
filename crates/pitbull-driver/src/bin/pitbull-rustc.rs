@@ -169,36 +169,125 @@ impl rustc_driver::Callbacks for PitbullCallbacks {
 }
 #[cfg(rustc_public_real)]
 impl PitbullCallbacks {
-    /// Walk every item in the crate that has a body, translate the body
-    /// via the adapter, run the subset visitor, accumulate counts.
+    /// Walk items via configured `verify_roots`, translate each body via
+    /// the adapter, run the subset visitor, accumulate counts.
+    ///
+    /// Filtering policy:
+    ///   - If `pitbull.toml` is loadable and its `[reachability]
+    ///     verify_roots` is non-empty, walk ONLY items whose
+    ///     fully-qualified name matches at least one root pattern AND
+    ///     does not match any `exclude` pattern.
+    ///   - If `verify_roots` is empty (or no `pitbull.toml`), walk
+    ///     every item with a body. This preserves the over-approximating
+    ///     fail-safe behavior of earlier checkpoints — useful for
+    ///     ad-hoc demos against unconfigured crates.
+    ///
+    /// Why path-based and not `#[pitbull::verify]` attribute-based:
+    /// rustc tool attributes (`#[pitbull::verify]`) require the user's
+    /// crate to declare `#![register_tool(pitbull)]` AND require the
+    /// pitbull-spec proc-macros to re-emit them on the item (currently
+    /// they consume the attribute and return the bare item). Path-based
+    /// filtering via `pitbull.toml` sidesteps both UX hurdles and uses
+    /// the existing `SubsetConfig.reachability.verify_roots` field
+    /// from v0.1. Attribute-based seeding remains a future option once
+    /// the proc-macros and register_tool plumbing land.
     ///
     /// Must be called inside a `rustc_public::rustc_internal::run`
     /// closure or it will panic in `with(...)` calls.
     fn run_pitbull_subset_check(&mut self) {
-        // For this scaffold checkpoint we run the visitor with the
-        // default test config. A future driver-wiring commit threads in
-        // the user's `pitbull.toml`.
-        let cfg = pitbull_subset::SubsetConfig::default_for_test();
+        let cfg = load_config();
+        let verify_roots = cfg.reachability.verify_roots.clone();
+        let exclude = cfg.reachability.exclude.clone();
         let mut visitor = pitbull_subset::SubsetVisitor::new(&cfg);
+        let mut walked = 0usize;
+        let mut filtered_out = 0usize;
         for item in rustc_public::all_local_items() {
             self.items_seen += 1;
             if !item.has_body() {
                 continue;
             }
+            use rustc_public::CrateDef;
+            let item_path = item.name();
+            let matches_root = verify_roots.is_empty()
+                || verify_roots.iter().any(|p| pattern_matches(p, &item_path));
+            let excluded = exclude.iter().any(|p| pattern_matches(p, &item_path));
+            if !matches_root || excluded {
+                filtered_out += 1;
+                continue;
+            }
             let real_body = item.expect_body();
             let shadow_body = pitbull_subset::mir_api::adapter::body(&real_body);
             self.bodies_walked += 1;
-            // For now we run all bodies as untrusted. Reachability
-            // seeding from `#[pitbull::verify]` annotations is the next
-            // sub-chunk; until then, we walk every body, which is a
-            // strict over-approximation of PSS-1's "reachable from a
-            // verify root" semantics.
+            walked += 1;
+            // All bodies are walked as untrusted in v0.2. Trust marking
+            // requires the proc-macro / attribute plumbing described in
+            // the doc comment above.
             visitor.visit_body(&shadow_body, /*trusted=*/ false);
+        }
+        if !verify_roots.is_empty() {
+            eprintln!(
+                "pitbull-rustc: verify-roots mode: {} root pattern(s), walked {} item(s), filtered {}",
+                verify_roots.len(),
+                walked,
+                filtered_out,
+            );
         }
         let report = visitor.into_report();
         self.violations = report.errors.len();
         for err in &report.errors {
             eprintln!("pitbull-rustc: {err}");
         }
+    }
+}
+/// Load pitbull.toml from `$PITBULL_TOML` (if set) or from `./pitbull.toml`
+/// in the current working directory. Falls back to the default test
+/// config if neither is present or loadable. Validation errors are
+/// reported on stderr but do not abort.
+///
+/// The env-var lookup is the preferred path because cargo invokes the
+/// wrapper with CWD set to whichever package is being compiled — for
+/// dependencies that's `~/.cargo/registry/...`, not the user's project.
+/// `cargo-pitbull check` sets `$PITBULL_TOML` to the absolute path of
+/// the user's pitbull.toml so dependency compiles see the same config.
+#[cfg(rustc_public_real)]
+fn load_config() -> pitbull_subset::SubsetConfig {
+    let path = std::env::var_os("PITBULL_TOML")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("pitbull.toml"));
+    if !path.exists() {
+        return pitbull_subset::SubsetConfig::default_for_test();
+    }
+    match pitbull_subset::SubsetConfig::load_and_validate(&path) {
+        Ok(outcome) => {
+            if !outcome.errors.is_empty() {
+                eprintln!(
+                    "pitbull-rustc: {} pitbull.toml validation error(s):",
+                    outcome.errors.len()
+                );
+                for err in &outcome.errors {
+                    eprintln!("pitbull-rustc:   {err}");
+                }
+            }
+            outcome.config
+        }
+        Err(e) => {
+            eprintln!(
+                "pitbull-rustc: could not load {}: {e}; using default config",
+                path.display()
+            );
+            pitbull_subset::SubsetConfig::default_for_test()
+        }
+    }
+}
+/// Pattern matcher mirroring `pitbull_subset::reachability::pattern_matches`.
+/// Patterns ending with `::*` match any item whose path starts with
+/// the prefix; other patterns match exactly. v0.1 deliberately keeps
+/// the matching simple — see `reachability.rs` for the rationale.
+#[cfg(rustc_public_real)]
+fn pattern_matches(pattern: &str, path: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix("::*") {
+        path == prefix || path.starts_with(&format!("{prefix}::"))
+    } else {
+        pattern == path
     }
 }

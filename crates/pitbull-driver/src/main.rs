@@ -108,11 +108,22 @@ fn run_check(cli: &Cli) -> Result<ExitCode> {
     // skipping the analysis, we make the missing capability obvious.
     let wrapper = locate_wrapper()
         .context("locating pitbull-rustc wrapper binary")?;
+    // Resolve pitbull.toml to an absolute path and pass it via env var
+    // so the wrapper sees the user's config no matter which package
+    // cargo is currently compiling. Cargo runs each rustc invocation
+    // with CWD set to the package being compiled — for dependencies
+    // that's the registry cache, not the user's project root. Without
+    // an absolute PITBULL_TOML the wrapper would only see the user's
+    // config on the user's own crate compile.
+    let pitbull_toml_abs = std::fs::canonicalize(&cfg_path)
+        .with_context(|| format!("canonicalizing {}", cfg_path.display()))?;
     eprintln!("pitbull check: invoking cargo check with RUSTC_WORKSPACE_WRAPPER={}", wrapper.display());
+    eprintln!("pitbull check: PITBULL_TOML={}", pitbull_toml_abs.display());
     let status = std::process::Command::new("cargo")
         .arg("check")
         .arg("--all-targets")
         .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
+        .env("PITBULL_TOML", &pitbull_toml_abs)
         .status()
         .context("spawning `cargo check` with pitbull-rustc as the rustc wrapper")?;
     if status.success() {
