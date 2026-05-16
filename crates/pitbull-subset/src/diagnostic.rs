@@ -16,6 +16,7 @@
 pub use crate::rules::{RuleId, Severity};
 use crate::mir_api::Span;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 /// A single subset violation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,6 +62,16 @@ pub struct SubsetReport {
     pub phase_completed: PhaseCompleted,
     /// PSS version this report was produced against.
     pub pss_version: String,
+    /// Optional file-id → URI resolution map. `Span::file` is an
+    /// opaque u32 hash of the source filename (Copy-friendly, no
+    /// owned strings in spans); when this table is populated, SARIF
+    /// emission resolves each `Span::file` to a human-readable
+    /// `artifactLocation.uri`. Absent for shadow tests (which never
+    /// produce non-default spans through the adapter); populated by
+    /// the rustc_public-backed wrapper via
+    /// `adapter::take_filename_table()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filenames: Option<HashMap<u32, String>>,
 }
 impl SubsetReport {
     /// Construct a report from a list of errors. Marks the phase as
@@ -71,6 +82,7 @@ impl SubsetReport {
             errors,
             phase_completed: PhaseCompleted::SubsetCheckComplete,
             pss_version: crate::PSS_VERSION.to_string(),
+            filenames: None,
         }
     }
     /// Construct an aborted report.
@@ -80,6 +92,7 @@ impl SubsetReport {
             errors: Vec::new(),
             phase_completed: PhaseCompleted::Aborted,
             pss_version: crate::PSS_VERSION.to_string(),
+            filenames: None,
         }
     }
     /// Whether the run found any violations.
@@ -101,6 +114,22 @@ impl SubsetReport {
             .iter()
             .map(|e| {
                 let rule = crate::rules::lookup(e.rule).expect("registered rule");
+                // The fileId is an opaque hash of the source filename
+                // — Copy-friendly for spans. When the report carries
+                // a `filenames` resolution table (populated by the
+                // wrapper via `adapter::take_filename_table()`), emit
+                // both the opaque `index` (round-trip stable) and a
+                // `uri` string for SARIF consumers. Without the table
+                // (shadow tests), only `index` is emitted, preserving
+                // the v0.1 behavior.
+                let mut artifact_location = serde_json::json!({
+                    "index": e.span.file,
+                });
+                if let Some(table) = &self.filenames {
+                    if let Some(uri) = table.get(&e.span.file) {
+                        artifact_location["uri"] = serde_json::json!(uri);
+                    }
+                }
                 serde_json::json!({
                     "ruleId": format!("{}", e.rule),
                     "level": match rule.severity {
@@ -125,14 +154,7 @@ impl SubsetReport {
                                 "endLine": e.span.end_line(),
                                 "endColumn": e.span.end_col(),
                             },
-                            // The fileId is an opaque hash of the
-                            // source filename. A future side-channel
-                            // file-name table will resolve this to a
-                            // human-readable URI; for now consumers
-                            // get an opaque integer.
-                            "artifactLocation": {
-                                "index": e.span.file,
-                            },
+                            "artifactLocation": artifact_location,
                         },
                     }],
                 })
@@ -209,6 +231,32 @@ mod tests {
         assert_eq!(region["endColumn"], 18);
         let artifact = &s["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"];
         assert_eq!(artifact["index"], 0xCAFE_BABE_u32);
+    }
+    /// When the report carries a `filenames` resolution table, the
+    /// SARIF artifactLocation surfaces the URI alongside the opaque
+    /// index. Without the table (shadow-test default), the URI is
+    /// absent and only the index is present (`sarif_minimal_emits_line_col_region`
+    /// covers that path).
+    #[test]
+    fn sarif_minimal_emits_uri_when_filename_table_present() {
+        let mut span = Span::default();
+        span.lo = Span::pack(3, 5);
+        span.hi = Span::pack(3, 10);
+        span.file = 0xDEAD_BEEF;
+        let mut table = HashMap::new();
+        table.insert(0xDEAD_BEEF_u32, "src/lib.rs".to_string());
+        let mut r = SubsetReport::new(vec![SubsetError {
+            rule: PB001,
+            span,
+            detail: "test".into(),
+            in_spec: false,
+        }]);
+        r.filenames = Some(table);
+        let s = r.to_sarif_minimal();
+        let artifact = &s["runs"][0]["results"][0]["locations"][0]
+            ["physicalLocation"]["artifactLocation"];
+        assert_eq!(artifact["uri"], "src/lib.rs");
+        assert_eq!(artifact["index"], 0xDEAD_BEEF_u32);
     }
     /// Span::pack and the start_line/etc decoders are inverses for
     /// values in the u16 range. Pathological larger values clamp

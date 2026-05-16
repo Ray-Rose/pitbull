@@ -312,10 +312,42 @@ impl PitbullCallbacks {
                 filtered_out,
             );
         }
-        let report = visitor.into_report();
+        let mut report = visitor.into_report();
+        // Drain the per-thread filename table the adapter accumulated
+        // while building shadow Spans; attach it to the report so SARIF
+        // emission can surface `artifactLocation.uri` strings (the span
+        // file IDs alone are opaque hashes). Empty table → leave the
+        // optional field at None (shadow-test parity).
+        let filename_table =
+            pitbull_subset::mir_api::adapter::take_filename_table();
+        if !filename_table.is_empty() {
+            report.filenames = Some(filename_table);
+        }
         self.violations = report.errors.len();
         for err in &report.errors {
             eprintln!("pitbull-rustc: {err}");
+        }
+        // Optional SARIF emission. When `PITBULL_SARIF_OUT` is set,
+        // write the (minimal) SARIF report to that path. Each wrapper
+        // invocation overwrites the file — fine for single-crate
+        // smoke tests; multi-crate aggregation is a job for the
+        // `cargo pitbull check` subcommand (it can set a per-invocation
+        // unique path or merge later).
+        if let Some(out) = std::env::var_os("PITBULL_SARIF_OUT") {
+            let sarif = report.to_sarif_minimal();
+            match serde_json::to_string_pretty(&sarif) {
+                Ok(text) => match std::fs::write(&out, text) {
+                    Ok(()) => eprintln!(
+                        "pitbull-rustc: SARIF written to {}",
+                        std::path::Path::new(&out).display(),
+                    ),
+                    Err(e) => eprintln!(
+                        "pitbull-rustc: failed to write SARIF to {}: {e}",
+                        std::path::Path::new(&out).display(),
+                    ),
+                },
+                Err(e) => eprintln!("pitbull-rustc: SARIF serialize failed: {e}"),
+            }
         }
     }
 }

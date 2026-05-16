@@ -44,6 +44,38 @@
 #![allow(clippy::cast_possible_truncation)] // usize→u32 for Local/Field is documented above.
 use crate::mir_api::shadow;
 use rustc_public as rp;
+use std::cell::RefCell;
+use std::collections::HashMap;
+// Filename side-channel for SARIF artifactLocation URIs.
+//
+// `shadow::Span::file` is an opaque u32 hash of the source filename
+// (chosen for Copy-friendliness; the shadow IR is shared between
+// stable tests and the nightly adapter path, and we don't want spans
+// to hold owned strings). Without resolution, SARIF emission can only
+// surface the integer hash, which is opaque to IDEs and CI tools.
+//
+// The wrapper drains this table via `take_filename_table()` after the
+// visitor completes and attaches it to `SubsetReport::filenames`;
+// `to_sarif_minimal` then emits both `index` and `uri` per artifact
+// location. Shadow tests never call adapter::span, so the table stays
+// empty and SubsetReport::filenames remains None — preserving the
+// existing test behavior.
+//
+// Thread-local because rustc compilation is single-threaded per
+// compile unit; if rustc ever parallelizes our after_analysis hook,
+// the worst-case is a partially-populated table (degraded URIs, not
+// broken correctness).
+thread_local! {
+    static FILENAME_TABLE: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
+}
+/// Drain the per-thread filename table accumulated by `adapter::span`
+/// calls during this compile unit. Called by the wrapper after
+/// `visitor.into_report()` to attach the resolution map to the
+/// `SubsetReport` for SARIF emission.
+#[must_use]
+pub fn take_filename_table() -> HashMap<u32, String> {
+    FILENAME_TABLE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+}
 // =====================================================================
 // Identity & span (unchanged from scaffold; documented above).
 // =====================================================================
@@ -78,6 +110,12 @@ pub fn span(s: rp::ty::Span) -> shadow::Span {
     // doc-comment in mir_api.rs) and hash the filename for the file
     // ID. SARIF emission decodes these back into region info.
     //
+    // The filename string is also stored in the FILENAME_TABLE
+    // thread-local so the wrapper can attach a resolution map to the
+    // final SubsetReport (see top of file). The hash stays the file
+    // identity in shadow types; the table maps it back to a URI for
+    // SARIF artifactLocation.
+    //
     // Note: get_lines() and get_filename() require the rustc_public
     // compiler context (they call into `with(|cx| ...)`). The driver
     // ensures we're inside `rustc_internal::run(tcx, ...)` before
@@ -88,6 +126,11 @@ pub fn span(s: rp::ty::Span) -> shadow::Span {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     filename.hash(&mut hasher);
     let file_hash = (hasher.finish() & 0xFFFF_FFFF) as u32;
+    FILENAME_TABLE.with(|t| {
+        t.borrow_mut()
+            .entry(file_hash)
+            .or_insert_with(|| filename.clone());
+    });
     shadow::Span {
         lo: shadow::Span::pack(lines.start_line, lines.start_col),
         hi: shadow::Span::pack(lines.end_line, lines.end_col),

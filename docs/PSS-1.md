@@ -427,9 +427,10 @@ declared complete:
 - ✅ `adapter::aggregate_kind`, `cast_kind`, `bin_op`, `un_op`,
   `assert_message`, `non_diverging_intrinsic`, `retag_kind` — full
   supporting-type translations
-- ⏳ Real `Span` byte-offset extraction (post-§17.1 work; SARIF
-  reports against real-translated bodies have placeholder locations
-  until this lands)
+- ✅ `adapter::span` real line/col extraction (Task B, commit d581354)
+  and filename URI side-channel (Task F, see Driver integration below).
+  rustc_public does not expose byte offsets, so SARIF region encoding
+  uses line/col only — adequate for IDE/CI consumers.
 - ⏳ `adapter::def_id` should query the rustc bridge for a stable
   numeric ID rather than hashing Debug output (cosmetic; current
   hash IDs are stable within one compilation run, which is enough)
@@ -505,6 +506,19 @@ the std form and now also matches. No shadow type changes.
   `verify_roots` pattern filter is fn-path-shaped, so static/const
   items are walked only in the open-walk fallback (verify_roots
   empty); the `exclude` filter still applies.
+- ✅ Filename side-channel for SARIF artifactLocation URIs (Task F).
+  Shadow `Span::file` is an opaque u32 hash (Copy-friendly, no
+  owned strings); `adapter::span` populates a thread-local
+  `FILENAME_TABLE` mapping each hash back to the rustc_public
+  filename string. The wrapper drains it via
+  `adapter::take_filename_table()` after `visitor.into_report()` and
+  attaches it to the new optional `SubsetReport::filenames` field.
+  `to_sarif_minimal` then emits `artifactLocation.uri` alongside the
+  opaque `index`. Shadow tests stay unchanged (no adapter call,
+  table empty, field stays `None`, only `index` is emitted).
+  Wrapper now writes SARIF JSON to the path in `PITBULL_SARIF_OUT`
+  when that env var is set; each invocation overwrites — multi-crate
+  aggregation is a follow-up for the `cargo pitbull check` subcommand.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
