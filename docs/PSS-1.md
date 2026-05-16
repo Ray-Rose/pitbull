@@ -492,9 +492,8 @@ the std form and now also matches. No shadow type changes.
   against each corpus file, gracefully skipping if prerequisites
   (wrapper binary, nightly toolchain) are missing. `PITBULL_REQUIRE_E2E=1`
   escalates missing-prerequisites to hard failure for CI.
-  Documented unimplemented exceptions: PB001 (HIR-discarded unsafe
-  block markers), PB041 (call-graph SCC analysis not implemented),
-  PB054 (VC obligation, not visitor rule).
+  Documented unimplemented exceptions: PB041 (call-graph SCC analysis
+  not implemented), PB054 (VC obligation, not visitor rule).
 - ✅ Wrapper enumerates static + const items (Task E). `pitbull-rustc`
   now matches on `CrateItem::kind()` and dispatches `ItemKind::Static`
   through `visit_static_item` (PB018 fires end-to-end) and
@@ -519,6 +518,23 @@ the std form and now also matches. No shadow type changes.
   Wrapper now writes SARIF JSON to the path in `PITBULL_SARIF_OUT`
   when that env var is set; each invocation overwrites — multi-crate
   aggregation is a follow-up for the `cargo pitbull check` subcommand.
+- ✅ HIR pre-pass for PB001 `unsafe { ... }` block detection (Task G).
+  rustc's MIR construction discards HIR-level block scopes, so PB001
+  (the bare `unsafe` block, distinct from the rules that fire on
+  operations *within* one — PB004/PB007/PB009) was previously
+  undetectable in the wrapper. The wrapper now adds an `extern crate
+  rustc_hir; extern crate rustc_span;` and an `UnsafeBlockVisitor`
+  implementing `rustc_hir::intravisit::Visitor` with
+  `NestedFilter = nested_filter::All`, driven by
+  `tcx.hir_visit_all_item_likes_in_crate`. Each block whose
+  `BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided)` matches
+  emits PB001; `CompilerGenerated` (e.g. unsafe-trait method bodies
+  rustc desugars) is ignored. Spans are converted from
+  `rustc_span::Span` to shadow `Span` via `SourceMap::lookup_char_pos`
+  and the same DefaultHasher-on-filename scheme adapter::span uses,
+  so both walks share the SARIF filename table. PB001 violations are
+  appended to the report alongside the MIR-derived ones; the
+  per-crate summary now reports unsafe-block count separately.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -528,9 +544,6 @@ the std form and now also matches. No shadow type changes.
   unit tests work fine on stable Rust (49 + 1 ignored, the v0.1
   baseline). The driver-side test harness is the right home for tests
   that exercise the adapter against real MIR.
-- Shadow `Span` carries `lo/hi/file` triple but `adapter::span` returns
-  zeros; SARIF reports against real-rustc_public bodies will have
-  placeholder source locations until byte-offset extraction lands.
 **Verification today:**
 ```bash
 # Stable: v0.1 baseline (49 + 1 ignored, 0 warnings)

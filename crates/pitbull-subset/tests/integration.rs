@@ -211,12 +211,6 @@ fn corpus_runs_full_pipeline() {
 /// limitation; the corpus file is "future-proof" for when the rule
 /// is implemented in a later milestone.
 ///
-/// - PB001 (`unsafe` block): the visitor runs post-MIR, which has
-///   already discarded HIR-level `unsafe { }` block markers. Detection
-///   is indirect — operations within an unsafe block (raw pointer
-///   ops, transmute, intrinsics) fire their own rules (PB004, PB007,
-///   PB009). A v0.2 HIR pre-pass closes the gap.
-///
 /// - PB041 (recursion without `#[decreases]`): requires call-graph
 ///   strongly-connected-component analysis. The visitor walks bodies
 ///   one at a time without the call graph. v0.2's reachability
@@ -228,7 +222,7 @@ fn corpus_runs_full_pipeline() {
 ///   for the v0.2+ VC generator to discharge. This is by design (see
 ///   visitor.rs `visit_projection`) — PSS-1 PB054 is a VC obligation,
 ///   not a syntactic visitor rule.
-const KNOWN_UNIMPLEMENTED_REJECT: &[u16] = &[1, 41, 54];
+const KNOWN_UNIMPLEMENTED_REJECT: &[u16] = &[41, 54];
 /// Environment needed to drive the wrapper: paths to the built
 /// pitbull-rustc binary and the nightly sysroot.
 struct E2eEnv {

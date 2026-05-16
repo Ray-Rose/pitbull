@@ -71,11 +71,15 @@ fn main() {
 #[cfg(rustc_public_real)]
 extern crate rustc_driver;
 #[cfg(rustc_public_real)]
+extern crate rustc_hir;
+#[cfg(rustc_public_real)]
 extern crate rustc_interface;
 #[cfg(rustc_public_real)]
 extern crate rustc_middle;
 #[cfg(rustc_public_real)]
 extern crate rustc_public;
+#[cfg(rustc_public_real)]
+extern crate rustc_span;
 #[cfg(rustc_public_real)]
 fn main() {
     // Cargo invokes a `RUSTC_WORKSPACE_WRAPPER` binary as
@@ -135,6 +139,10 @@ struct PitbullCallbacks {
     /// Number of non-body items (statics, consts) dispatched to
     /// `visit_static_item` / `visit_const_item`.
     non_body_items_walked: usize,
+    /// Number of HIR-level `unsafe { ... }` blocks PB001 fired on
+    /// during the pre-pass. Reported separately from MIR-derived
+    /// violations because the detection mechanism differs.
+    hir_unsafe_blocks: usize,
     /// Total subset violations found across all bodies.
     violations: usize,
 }
@@ -164,10 +172,11 @@ impl rustc_driver::Callbacks for PitbullCallbacks {
         // happened. The driver-side cargo-pitbull command wraps this in
         // higher-level reporting; for now this raw output is fine.
         eprintln!(
-            "pitbull-rustc: crate analyzed: {} items, {} bodies walked, {} non-fn items, {} subset violation(s)",
+            "pitbull-rustc: crate analyzed: {} items, {} bodies walked, {} non-fn items, {} unsafe blocks, {} subset violation(s)",
             self.items_seen,
             self.bodies_walked,
             self.non_body_items_walked,
+            self.hir_unsafe_blocks,
             self.violations,
         );
         // Continue compilation. Pitbull's analysis is read-only with
@@ -220,6 +229,16 @@ impl PitbullCallbacks {
         let mut visitor = pitbull_subset::SubsetVisitor::new(&cfg);
         let mut walked = 0usize;
         let mut filtered_out = 0usize;
+        // HIR pre-pass: rustc_public's MIR has already discarded
+        // HIR-level `unsafe { ... }` block markers (operations inside
+        // an unsafe block fire their own rules — PB004/PB007/PB009 —
+        // but PB001 on the bare block needs HIR). We walk HIR once
+        // before the MIR pass and emit PB001 violations directly into
+        // the report. tcx.hir_visit_all_item_likes_in_crate is callable
+        // here because tcx remains valid inside rustc_internal::run.
+        let (hir_pb001_errors, hir_filename_partials) =
+            collect_hir_unsafe_blocks(tcx);
+        self.hir_unsafe_blocks = hir_pb001_errors.len();
         // CrateDef gives `name()`, `span()`, `def_id()` as trait methods.
         // `ty()` is exposed as an inherent method on CrateItem (via the
         // `crate_def_with_ty!` macro), so no separate trait import needed.
@@ -313,13 +332,22 @@ impl PitbullCallbacks {
             );
         }
         let mut report = visitor.into_report();
+        // Append HIR-derived PB001 violations to the MIR-derived
+        // violations. The two walks see distinct constructs (HIR
+        // unsafe-blocks vs MIR statements/types), so there's no
+        // duplication concern.
+        report.errors.extend(hir_pb001_errors);
         // Drain the per-thread filename table the adapter accumulated
-        // while building shadow Spans; attach it to the report so SARIF
-        // emission can surface `artifactLocation.uri` strings (the span
-        // file IDs alone are opaque hashes). Empty table → leave the
-        // optional field at None (shadow-test parity).
-        let filename_table =
+        // while building shadow Spans, then merge in the HIR-side
+        // filename map. Both paths use DefaultHasher on the filename
+        // string; if the string format differs between paths the same
+        // file may appear under two hashes (visible only as duplicate
+        // URI entries in SARIF — soft degradation, not incorrect).
+        let mut filename_table =
             pitbull_subset::mir_api::adapter::take_filename_table();
+        for (hash, name) in hir_filename_partials {
+            filename_table.entry(hash).or_insert(name);
+        }
         if !filename_table.is_empty() {
             report.filenames = Some(filename_table);
         }
@@ -401,5 +429,114 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
         path == prefix || path.starts_with(&format!("{prefix}::"))
     } else {
         pattern == path
+    }
+}
+/// HIR pre-pass that emits PB001 for every user-authored
+/// `unsafe { ... }` block in the crate.
+///
+/// ## Why HIR and not MIR
+///
+/// rustc's MIR construction discards HIR-level block scopes — by the
+/// time the visitor sees a body, the `unsafe` keyword that wrapped a
+/// raw-pointer deref is gone. The deref itself fires PB004 from MIR,
+/// but PSS-1 also rejects the bare `unsafe` block (even if its body
+/// happens to be empty or trivially safe). So this is a separate
+/// HIR-only signal.
+///
+/// ## How
+///
+/// `tcx.hir_visit_all_item_likes_in_crate` enters every free item,
+/// trait item, impl item, and foreign item. With
+/// `NestedFilter = nested_filter::All`, the visitor recurses into
+/// nested items (including bodies). `visit_block` fires on every
+/// `hir::Block`, and we match its `rules` field for
+/// `BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided)` —
+/// `CompilerGenerated` covers e.g. `unsafe trait` method bodies that
+/// the compiler adds wrapping unsafety, which is not a user-written
+/// `unsafe { ... }` and not the PSS-1 PB001 target.
+///
+/// Returns the violations and a partial filename table — the wrapper
+/// merges this with `adapter::take_filename_table()` so the SARIF
+/// emission's `artifactLocation.uri` resolves for HIR spans too.
+#[cfg(rustc_public_real)]
+fn collect_hir_unsafe_blocks<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+) -> (
+    Vec<pitbull_subset::SubsetError>,
+    std::collections::HashMap<u32, String>,
+) {
+    let mut visitor = UnsafeBlockVisitor {
+        tcx,
+        violations: Vec::new(),
+        filename_table: std::collections::HashMap::new(),
+    };
+    tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
+    (visitor.violations, visitor.filename_table)
+}
+#[cfg(rustc_public_real)]
+struct UnsafeBlockVisitor<'tcx> {
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    violations: Vec<pitbull_subset::SubsetError>,
+    filename_table: std::collections::HashMap<u32, String>,
+}
+#[cfg(rustc_public_real)]
+impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for UnsafeBlockVisitor<'tcx> {
+    type NestedFilter = rustc_middle::hir::nested_filter::All;
+    fn maybe_tcx(&mut self) -> rustc_middle::ty::TyCtxt<'tcx> {
+        self.tcx
+    }
+    fn visit_block(&mut self, b: &'tcx rustc_hir::Block<'tcx>) {
+        if matches!(
+            b.rules,
+            rustc_hir::BlockCheckMode::UnsafeBlock(
+                rustc_hir::UnsafeSource::UserProvided,
+            )
+        ) {
+            let span =
+                rustc_span_to_shadow(self.tcx, b.span, &mut self.filename_table);
+            self.violations.push(pitbull_subset::SubsetError {
+                rule: pitbull_subset::rules::PB001,
+                span,
+                detail: "`unsafe { ... }` block".to_string(),
+                in_spec: false,
+            });
+        }
+        rustc_hir::intravisit::walk_block(self, b);
+    }
+}
+/// Convert a `rustc_span::Span` to the shadow `Span` (line/col packed
+/// into u32 halves; filename hashed to a u32 file ID). Populates the
+/// caller's filename table with the (hash, filename) mapping so that
+/// SARIF emission can later resolve the URI.
+///
+/// Dummy spans (post-macro-expansion synthetic spans without a source
+/// location) collapse to `Span::default()`.
+///
+/// Column conversion: rustc's `Loc.col` is a 0-indexed `CharPos`; SARIF
+/// wants 1-indexed. We add 1 to match the rustc_public side
+/// (`adapter::span`, which passes through 1-indexed columns directly).
+#[cfg(rustc_public_real)]
+fn rustc_span_to_shadow(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    span: rustc_span::Span,
+    table: &mut std::collections::HashMap<u32, String>,
+) -> pitbull_subset::mir_api::Span {
+    use pitbull_subset::mir_api::Span as ShadowSpan;
+    if span.is_dummy() {
+        return ShadowSpan::default();
+    }
+    let sm = tcx.sess.source_map();
+    let lo = sm.lookup_char_pos(span.lo());
+    let hi = sm.lookup_char_pos(span.hi());
+    let filename = lo.file.name.prefer_local_unconditionally().to_string();
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    filename.hash(&mut hasher);
+    let file_hash = (hasher.finish() & 0xFFFF_FFFF) as u32;
+    table.entry(file_hash).or_insert_with(|| filename.clone());
+    ShadowSpan {
+        lo: ShadowSpan::pack(lo.line, lo.col.0 + 1),
+        hi: ShadowSpan::pack(hi.line, hi.col.0 + 1),
+        file: file_hash,
     }
 }
