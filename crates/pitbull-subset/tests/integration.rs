@@ -217,12 +217,6 @@ fn corpus_runs_full_pipeline() {
 ///   ops, transmute, intrinsics) fire their own rules (PB004, PB007,
 ///   PB009). A v0.2 HIR pre-pass closes the gap.
 ///
-/// - PB018 (`static mut` / interior-mutable static): the wrapper
-///   currently walks function items only via `all_local_items` +
-///   `body()` (which returns None for non-functions). Static-item
-///   walking via `visit_static_item` is wired in pitbull-subset but
-///   the wrapper-side enumeration is a follow-up.
-///
 /// - PB041 (recursion without `#[decreases]`): requires call-graph
 ///   strongly-connected-component analysis. The visitor walks bodies
 ///   one at a time without the call graph. v0.2's reachability
@@ -234,7 +228,7 @@ fn corpus_runs_full_pipeline() {
 ///   for the v0.2+ VC generator to discharge. This is by design (see
 ///   visitor.rs `visit_projection`) — PSS-1 PB054 is a VC obligation,
 ///   not a syntactic visitor rule.
-const KNOWN_UNIMPLEMENTED_REJECT: &[u16] = &[1, 18, 41, 54];
+const KNOWN_UNIMPLEMENTED_REJECT: &[u16] = &[1, 41, 54];
 /// Environment needed to drive the wrapper: paths to the built
 /// pitbull-rustc binary and the nightly sysroot.
 struct E2eEnv {

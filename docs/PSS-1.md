@@ -492,9 +492,19 @@ the std form and now also matches. No shadow type changes.
   (wrapper binary, nightly toolchain) are missing. `PITBULL_REQUIRE_E2E=1`
   escalates missing-prerequisites to hard failure for CI.
   Documented unimplemented exceptions: PB001 (HIR-discarded unsafe
-  block markers), PB018 (wrapper enumerates only function items),
-  PB041 (call-graph SCC analysis not implemented), PB054 (VC
-  obligation, not visitor rule).
+  block markers), PB041 (call-graph SCC analysis not implemented),
+  PB054 (VC obligation, not visitor rule).
+- ✅ Wrapper enumerates static + const items (Task E). `pitbull-rustc`
+  now matches on `CrateItem::kind()` and dispatches `ItemKind::Static`
+  through `visit_static_item` (PB018 fires end-to-end) and
+  `ItemKind::Const` through `visit_const_item`. Mutability is
+  resolved via the rustc_internal bridge — `TyCtxt::is_mutable_static`
+  applied to the internal `DefId` returned by
+  `rustc_internal::internal(tcx, item.def_id())`, since
+  `rustc_public::ItemKind::Static` is a payload-less variant. The
+  `verify_roots` pattern filter is fn-path-shaped, so static/const
+  items are walked only in the open-walk fallback (verify_roots
+  empty); the `exclude` filter still applies.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

@@ -132,6 +132,9 @@ struct PitbullCallbacks {
     items_seen: usize,
     /// Number of items with a reachable MIR body.
     bodies_walked: usize,
+    /// Number of non-body items (statics, consts) dispatched to
+    /// `visit_static_item` / `visit_const_item`.
+    non_body_items_walked: usize,
     /// Total subset violations found across all bodies.
     violations: usize,
 }
@@ -146,8 +149,13 @@ impl rustc_driver::Callbacks for PitbullCallbacks {
         // Inside the closure, calls like `rustc_public::all_local_items()`
         // and `CrateItem::body()` work; outside it they would panic with
         // "rustc_public has not been properly initialized".
+        // `TyCtxt` is `Copy`, so we can move it into the FnOnce closure
+        // and still use it (or its copy) inside. The subset check needs
+        // tcx to resolve static mutability via the rustc_internal bridge
+        // (rustc_public's `ItemKind::Static` is a payload-less variant
+        // and exposes no `mutability()` accessor).
         let result = rustc_public::rustc_internal::run(tcx, || {
-            self.run_pitbull_subset_check();
+            self.run_pitbull_subset_check(tcx);
         });
         if let Err(e) = result {
             eprintln!("pitbull-rustc: rustc_public bridge failed: {e:?}");
@@ -156,8 +164,11 @@ impl rustc_driver::Callbacks for PitbullCallbacks {
         // happened. The driver-side cargo-pitbull command wraps this in
         // higher-level reporting; for now this raw output is fine.
         eprintln!(
-            "pitbull-rustc: crate analyzed: {} items, {} bodies walked, {} subset violation(s)",
-            self.items_seen, self.bodies_walked, self.violations,
+            "pitbull-rustc: crate analyzed: {} items, {} bodies walked, {} non-fn items, {} subset violation(s)",
+            self.items_seen,
+            self.bodies_walked,
+            self.non_body_items_walked,
+            self.violations,
         );
         // Continue compilation. Pitbull's analysis is read-only with
         // respect to the standard compile; we don't want to short-circuit
@@ -194,35 +205,104 @@ impl PitbullCallbacks {
     ///
     /// Must be called inside a `rustc_public::rustc_internal::run`
     /// closure or it will panic in `with(...)` calls.
-    fn run_pitbull_subset_check(&mut self) {
+    ///
+    /// `tcx` is threaded in so that non-function items (statics) can
+    /// resolve mutability via `TyCtxt::is_mutable_static` through the
+    /// rustc_internal bridge — `rustc_public::ItemKind::Static` is a
+    /// plain enum variant with no mutability payload.
+    fn run_pitbull_subset_check<'tcx>(
+        &mut self,
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    ) {
         let cfg = load_config();
         let verify_roots = cfg.reachability.verify_roots.clone();
         let exclude = cfg.reachability.exclude.clone();
         let mut visitor = pitbull_subset::SubsetVisitor::new(&cfg);
         let mut walked = 0usize;
         let mut filtered_out = 0usize;
+        // CrateDef gives `name()`, `span()`, `def_id()` as trait methods.
+        // `ty()` is exposed as an inherent method on CrateItem (via the
+        // `crate_def_with_ty!` macro), so no separate trait import needed.
+        use rustc_public::CrateDef;
         for item in rustc_public::all_local_items() {
             self.items_seen += 1;
-            if !item.has_body() {
-                continue;
-            }
-            use rustc_public::CrateDef;
             let item_path = item.name();
-            let matches_root = verify_roots.is_empty()
-                || verify_roots.iter().any(|p| pattern_matches(p, &item_path));
-            let excluded = exclude.iter().any(|p| pattern_matches(p, &item_path));
-            if !matches_root || excluded {
+            if exclude.iter().any(|p| pattern_matches(p, &item_path)) {
                 filtered_out += 1;
                 continue;
             }
-            let real_body = item.expect_body();
-            let shadow_body = pitbull_subset::mir_api::adapter::body(&real_body);
-            self.bodies_walked += 1;
-            walked += 1;
-            // All bodies are walked as untrusted in v0.2. Trust marking
-            // requires the proc-macro / attribute plumbing described in
-            // the doc comment above.
-            visitor.visit_body(&shadow_body, /*trusted=*/ false);
+            match item.kind() {
+                rustc_public::ItemKind::Fn => {
+                    let matches_root = verify_roots.is_empty()
+                        || verify_roots
+                            .iter()
+                            .any(|p| pattern_matches(p, &item_path));
+                    if !matches_root {
+                        filtered_out += 1;
+                        continue;
+                    }
+                    if !item.has_body() {
+                        // Some Fn items have no MIR body (extern fn
+                        // declarations, intrinsics without a provided
+                        // body). Nothing to walk — skip silently.
+                        continue;
+                    }
+                    let real_body = item.expect_body();
+                    let shadow_body =
+                        pitbull_subset::mir_api::adapter::body(&real_body);
+                    self.bodies_walked += 1;
+                    walked += 1;
+                    // All bodies are walked as untrusted in v0.2. Trust
+                    // marking requires the proc-macro / attribute plumbing
+                    // described in the doc comment above.
+                    visitor.visit_body(&shadow_body, /*trusted=*/ false);
+                }
+                rustc_public::ItemKind::Static => {
+                    // verify_roots patterns are authored for callable
+                    // function paths (e.g. `mycrate::foo::*`). Matching
+                    // them against a `static FOO` path is semantically
+                    // odd and would silently drop most users' statics.
+                    // Walk statics only in the open-walk fallback
+                    // (verify_roots empty).
+                    if !verify_roots.is_empty() {
+                        filtered_out += 1;
+                        continue;
+                    }
+                    let internal_id = rustc_public::rustc_internal::internal(
+                        tcx,
+                        item.def_id(),
+                    );
+                    let mutable = tcx.is_mutable_static(internal_id);
+                    let shadow_ty =
+                        pitbull_subset::mir_api::adapter::ty(item.ty());
+                    let shadow_span =
+                        pitbull_subset::mir_api::adapter::span(item.span());
+                    self.non_body_items_walked += 1;
+                    visitor.visit_static_item(
+                        mutable,
+                        Some(&shadow_ty),
+                        shadow_span,
+                    );
+                }
+                rustc_public::ItemKind::Const => {
+                    if !verify_roots.is_empty() {
+                        filtered_out += 1;
+                        continue;
+                    }
+                    let shadow_ty =
+                        pitbull_subset::mir_api::adapter::ty(item.ty());
+                    let shadow_span =
+                        pitbull_subset::mir_api::adapter::span(item.span());
+                    self.non_body_items_walked += 1;
+                    visitor.visit_const_item(Some(&shadow_ty), shadow_span);
+                }
+                rustc_public::ItemKind::Ctor(rustc_public::CtorKind::Const)
+                | rustc_public::ItemKind::Ctor(rustc_public::CtorKind::Fn) => {
+                    // Tuple/unit-struct constructors are auto-synthesized
+                    // by rustc; no user-authored content for any PSS-1
+                    // rule to fire on in v0.2.
+                }
+            }
         }
         if !verify_roots.is_empty() {
             eprintln!(
