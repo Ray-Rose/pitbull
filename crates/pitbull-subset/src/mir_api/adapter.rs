@@ -48,9 +48,27 @@ use rustc_public as rp;
 // Identity & span (unchanged from scaffold; documented above).
 // =====================================================================
 pub fn def_id(id: rp::DefId) -> shadow::DefId {
+    // The shadow `DefId(u64)` is an opaque identifier. The ideal source
+    // is rustc_public's internal `usize` index (via the `IndexedVal`
+    // trait's `to_index()`), which is the stable bridge ID for the
+    // item. Unfortunately `IndexedVal` is re-exported `pub(crate)` from
+    // rustc_public, so we can't access it from outside the crate.
+    //
+    // The next-best stable input is `DefId::name()` — the fully
+    // qualified path string. It's deterministic per compilation
+    // (same crate compiled twice produces the same path for the same
+    // item), unique per item (path collisions would already be a Rust
+    // language error), and accessible via the public API.
+    //
+    // Hashing the path gives us a u64 opaque ID with the same stability
+    // guarantees the bridge index would. The downside is hash
+    // collisions are theoretically possible (though astronomically
+    // unlikely with DefaultHasher's 64-bit output) — bridge access
+    // would be collision-free. Tracked as a follow-up if rustc_public
+    // ever exposes IndexedVal publicly.
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format!("{id:?}").hash(&mut hasher);
+    id.name().hash(&mut hasher);
     shadow::DefId(hasher.finish())
 }
 pub fn span(s: rp::ty::Span) -> shadow::Span {
