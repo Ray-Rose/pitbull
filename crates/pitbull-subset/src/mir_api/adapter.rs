@@ -119,8 +119,15 @@ pub fn ty(t: rp::ty::Ty) -> shadow::Ty {
 }
 fn ty_kind(k: &rp::ty::TyKind) -> shadow::TyKind {
     match k {
-        rp::ty::TyKind::RigidTy(rigid) => shadow::TyKind::RigidTy(rigid_ty(rigid)),
-        // `dyn Trait` and friends — bubble up the visitor's PB031 signal.
+        rp::ty::TyKind::RigidTy(rigid) => match rigid {
+            // Real `RigidTy::Dynamic(predicates, region)` represents
+            // `dyn Trait` types. The shadow promotes `dyn` to the
+            // TyKind level (`TyKind::Dynamic`) so the visitor's PB031
+            // detector fires directly. Map the real RigidTy form into
+            // the shadow's promoted form here.
+            rp::ty::RigidTy::Dynamic(_, _) => shadow::TyKind::Dynamic,
+            _ => shadow::TyKind::RigidTy(rigid_ty(rigid)),
+        },
         rp::ty::TyKind::Alias(_, _) => {
             // `impl Trait` / projection types post-monomorphization
             // should be resolved; if they're not, the visitor's PB039
@@ -211,15 +218,13 @@ fn rigid_ty(r: &rp::ty::RigidTy) -> shadow::RigidTy {
             is_union: false,
         }),
         // Real `Dynamic(predicates, region)` is the `dyn Trait` type.
-        // Surface as the shadow's TyKind::Dynamic by mapping to a
-        // sentinel Adt — but that's wrong because the visitor checks
-        // TyKind::Dynamic at the TyKind level. We can't reach
-        // TyKind::Dynamic from inside RigidTy because shadow's
-        // structural shape differs. Workaround: the visitor's PB031
-        // also triggers on RigidTy::Closure paths to a "dyn-marker"
-        // synthetic ADT. We use that.
+        // Normally intercepted by `ty_kind` and promoted to shadow's
+        // `TyKind::Dynamic` so the visitor's PB031 detector fires
+        // directly. This arm exists for exhaustiveness and as a
+        // defensive fallback if any future caller bypasses ty_kind
+        // and dispatches a Dynamic variant straight to rigid_ty.
         rp::ty::RigidTy::Dynamic(_, _) => shadow::RigidTy::Adt(shadow::AdtDef {
-            path: "__pitbull_dyn_trait".into(),
+            path: "__pitbull_dyn_trait_fallback".into(),
             is_union: false,
         }),
         // The never type `!`. No PB rule fires on it; visitor accepts.

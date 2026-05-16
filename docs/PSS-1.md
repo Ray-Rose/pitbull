@@ -475,13 +475,26 @@ the std form and now also matches. No shadow type changes.
   per-crate. (Reports 0 violations only because adapter::body still
   stubs the body interior — the pipeline is wired, the visitor sees
   empty bodies.)
-- ⏳ Reachability seeding from `#[pitbull::verify]` annotated items
-  (currently walks every body, an over-approximation of "reachable from
-  a verify root"). Requires querying CrateItem attributes via
-  rustc_public's attribute API.
-- ⏳ Activate `corpus_runs_full_pipeline` integration test (blocked by
-  the rustc_private rlib link issue documented above; needs the
-  rustc_driver test-harness rework).
+- ✅ Reachability seeding via `pitbull.toml`'s `[reachability]
+  verify_roots` (Task A). Path-based filtering — items whose
+  fully-qualified name matches a root pattern get walked, others
+  filtered out. `exclude` patterns also honored. Falls back to walk-all
+  when no config / empty roots (over-approximating fail-safe). Driver
+  forwards the user's `pitbull.toml` to dependency compiles via
+  `PITBULL_TOML` env var.
+  Note: `#[pitbull::verify]` attribute-based seeding remains a future
+  option (requires `register_tool(pitbull)` in user crates AND
+  proc-macro re-emission). Path-based filtering matches Creusot's
+  approach and avoids both UX hurdles.
+- ✅ Activate `corpus_runs_full_pipeline` integration test (Task C).
+  Subprocess-based test that invokes the built `pitbull-rustc.exe`
+  against each corpus file, gracefully skipping if prerequisites
+  (wrapper binary, nightly toolchain) are missing. `PITBULL_REQUIRE_E2E=1`
+  escalates missing-prerequisites to hard failure for CI.
+  Documented unimplemented exceptions: PB001 (HIR-discarded unsafe
+  block markers), PB018 (wrapper enumerates only function items),
+  PB041 (call-graph SCC analysis not implemented), PB054 (VC
+  obligation, not visitor rule).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
