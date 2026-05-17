@@ -371,20 +371,34 @@ impl PitbullCallbacks {
         // smoke tests; multi-crate aggregation is a job for the
         // `cargo pitbull check` subcommand (it can set a per-invocation
         // unique path or merge later).
+        //
+        // H3: the env-var is adversarially controllable via build.rs
+        // (`cargo:rustc-env=PITBULL_SARIF_OUT=$HOME/.bashrc` would
+        // otherwise overwrite that file with JSON). Refuse paths
+        // that don't end in .sarif / .json or that contain `..`.
+        // Skip emission and warn rather than exit, since SARIF output
+        // is optional in the first place.
         if let Some(out) = std::env::var_os("PITBULL_SARIF_OUT") {
-            let sarif = report.to_sarif_minimal();
-            match serde_json::to_string_pretty(&sarif) {
-                Ok(text) => match std::fs::write(&out, text) {
-                    Ok(()) => eprintln!(
-                        "pitbull-rustc: SARIF written to {}",
-                        std::path::Path::new(&out).display(),
-                    ),
-                    Err(e) => eprintln!(
-                        "pitbull-rustc: failed to write SARIF to {}: {e}",
-                        std::path::Path::new(&out).display(),
-                    ),
-                },
-                Err(e) => eprintln!("pitbull-rustc: SARIF serialize failed: {e}"),
+            let out_path = std::path::PathBuf::from(&out);
+            if let Err(e) =
+                check_env_path("PITBULL_SARIF_OUT", &out_path, &["sarif", "json"])
+            {
+                eprintln!("pitbull-rustc: refusing SARIF write: {e}");
+            } else {
+                let sarif = report.to_sarif_minimal();
+                match serde_json::to_string_pretty(&sarif) {
+                    Ok(text) => match std::fs::write(&out_path, text) {
+                        Ok(()) => eprintln!(
+                            "pitbull-rustc: SARIF written to {}",
+                            out_path.display(),
+                        ),
+                        Err(e) => eprintln!(
+                            "pitbull-rustc: failed to write SARIF to {}: {e}",
+                            out_path.display(),
+                        ),
+                    },
+                    Err(e) => eprintln!("pitbull-rustc: SARIF serialize failed: {e}"),
+                }
             }
         }
     }
@@ -399,6 +413,75 @@ impl PitbullCallbacks {
 /// dependencies that's `~/.cargo/registry/...`, not the user's project.
 /// `cargo-pitbull check` sets `$PITBULL_TOML` to the absolute path of
 /// the user's pitbull.toml so dependency compiles see the same config.
+/// Defense-in-depth path validator for env-supplied file paths
+/// (PITBULL_TOML, PITBULL_SARIF_OUT). Audit finding H3.
+///
+/// Threat model
+/// ------------
+/// A hostile transitive dependency's `build.rs` can emit
+/// `cargo:rustc-env=PITBULL_TOML=...` or `PITBULL_SARIF_OUT=...`
+/// which becomes the wrapper's env when cargo invokes us for that
+/// crate's rustc step. Without checks:
+///
+/// - `PITBULL_TOML=$HOME/.ssh/id_rsa` → wrapper opens the file,
+///   `toml::from_str` fails with a parse error that embeds the
+///   first failing characters → secret leak via stderr.
+/// - `PITBULL_SARIF_OUT=$HOME/.bashrc` → wrapper overwrites the
+///   file with SARIF JSON → data destruction (and on some
+///   platforms, lateral movement via config-file execution).
+///
+/// What this catches
+/// -----------------
+/// - Path components containing `..` (traversal).
+/// - Wrong file extension for the env-var's purpose. The realistic
+///   attack targets are dotfiles and key files that don't end in
+///   `.toml` / `.sarif` / `.json`.
+///
+/// What it doesn't catch
+/// ---------------------
+/// - A path with the right extension that points somewhere it
+///   shouldn't (e.g. `~/.config/sneaky.toml`).
+/// - A symlink whose target is sensitive (the wrapper doesn't yet
+///   refuse symlinks; that's a follow-up if real-world abuse appears).
+///
+/// Escape hatch
+/// ------------
+/// `PITBULL_ALLOW_UNSAFE_PATHS=1` disables both checks for the
+/// rare user whose legitimate config path doesn't match the
+/// extension whitelist. Production should leave this unset.
+#[cfg(rustc_public_real)]
+fn check_env_path(
+    var_name: &str,
+    path: &std::path::Path,
+    allowed_extensions: &[&str],
+) -> Result<(), String> {
+    if std::env::var_os("PITBULL_ALLOW_UNSAFE_PATHS").is_some() {
+        return Ok(());
+    }
+    let s = path.to_string_lossy();
+    if s.contains("..") {
+        return Err(format!(
+            "{var_name}={} contains '..' (path traversal); refusing. \
+             Set PITBULL_ALLOW_UNSAFE_PATHS=1 to override.",
+            path.display(),
+        ));
+    }
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| allowed_extensions.iter().any(|a| e.eq_ignore_ascii_case(a)))
+        .unwrap_or(false);
+    if !ext_ok {
+        return Err(format!(
+            "{var_name}={} does not end in one of {:?}; refusing as \
+             defense against build-script env injection. Set \
+             PITBULL_ALLOW_UNSAFE_PATHS=1 to override.",
+            path.display(),
+            allowed_extensions,
+        ));
+    }
+    Ok(())
+}
 #[cfg(rustc_public_real)]
 fn load_config() -> pitbull_subset::SubsetConfig {
     // Two sources, both optional:
@@ -424,6 +507,17 @@ fn load_config() -> pitbull_subset::SubsetConfig {
         Some(p) => (std::path::PathBuf::from(p), true),
         None => (std::path::PathBuf::from("pitbull.toml"), false),
     };
+    // H3: validate env-supplied paths to defend against build-script
+    // env injection (PITBULL_TOML=$HOME/.ssh/id_rsa → file leak via
+    // parse error). The check only applies to the env-var source;
+    // the implicit `./pitbull.toml` fallback is trusted because it's
+    // not adversarially controllable.
+    if source_was_env {
+        if let Err(e) = check_env_path("PITBULL_TOML", &path, &["toml"]) {
+            eprintln!("pitbull-rustc: config error: {e}");
+            std::process::exit(2);
+        }
+    }
     if !path.exists() {
         if source_was_env {
             eprintln!(

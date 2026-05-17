@@ -456,6 +456,132 @@ fn nonexistent_pitbull_toml_path_hard_errors() {
         "H1: stderr should mention 'does not exist'; got:\n{stderr}",
     );
 }
+/// Regression test for audit finding H3: when a hostile build.rs
+/// sets `PITBULL_TOML` to a file without a `.toml` extension (the
+/// realistic attack target being key files like `~/.ssh/id_rsa`
+/// or `~/.aws/credentials` whose content would leak via TOML
+/// parse error messages), the wrapper must refuse rather than
+/// open the file.
+#[test]
+fn pitbull_toml_with_nontoml_extension_refused() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_toml_with_nontoml_extension_refused: SKIPPED");
+        return;
+    };
+    // Create a real file with no `.toml` extension so the path
+    // is observable but the extension check should still refuse it.
+    let mut bad_path = std::env::temp_dir();
+    bad_path.push(format!("pitbull-h3-id_rsa-{}", std::process::id()));
+    fs::write(&bad_path, "PRETEND THIS IS A PRIVATE KEY\n")
+        .expect("write temp file");
+    let corpus = Path::new("tests")
+        .join("corpus")
+        .join("reject")
+        .join("PB018_static_mut.rs");
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &corpus,
+        &[("PITBULL_TOML", bad_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&bad_path);
+    assert_eq!(
+        code,
+        Some(2),
+        "H3: PITBULL_TOML with non-.toml extension must exit 2; \
+         got code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("does not end in") || stderr.contains(".toml"),
+        "H3: stderr should mention the extension requirement; got:\n{stderr}",
+    );
+    // Critical: the file content must NOT appear in stderr.
+    // (That's the actual H3 attack — content leak via parse errors.)
+    assert!(
+        !stderr.contains("PRIVATE KEY"),
+        "H3 VIOLATED: file content leaked into stderr:\n{stderr}",
+    );
+}
+/// Regression test for audit finding H3 (companion): a `PITBULL_TOML`
+/// path containing `..` (path traversal) must be refused regardless
+/// of whether the resolved target is benign.
+#[test]
+fn pitbull_toml_with_traversal_refused() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_toml_with_traversal_refused: SKIPPED");
+        return;
+    };
+    let traversal_path = std::path::PathBuf::from("../something/../config.toml");
+    let corpus = Path::new("tests")
+        .join("corpus")
+        .join("reject")
+        .join("PB018_static_mut.rs");
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &corpus,
+        &[("PITBULL_TOML", traversal_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    assert_eq!(
+        code,
+        Some(2),
+        "H3: PITBULL_TOML with '..' must exit 2; got code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("..") && stderr.contains("traversal"),
+        "H3: stderr should mention traversal; got:\n{stderr}",
+    );
+}
+/// Regression test for audit finding H3 (SARIF side): a hostile
+/// build.rs setting `PITBULL_SARIF_OUT` to a file like `~/.bashrc`
+/// (or any non-`.sarif`/`.json` path) must NOT result in a file
+/// overwrite. The wrapper skips the SARIF emission and logs a
+/// warning, but still completes the rustc compile (SARIF is
+/// optional output, not a hard precondition).
+#[test]
+fn pitbull_sarif_out_with_nonjson_extension_refused() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_sarif_out_with_nonjson_extension_refused: SKIPPED");
+        return;
+    };
+    // Pretend-bashrc: real file with sentinel content.
+    let mut sarif_target = std::env::temp_dir();
+    sarif_target.push(format!("pitbull-h3-bashrc-{}", std::process::id()));
+    let sentinel = "# original bashrc content — must not be overwritten\n";
+    fs::write(&sarif_target, sentinel).expect("write sentinel file");
+    let corpus = Path::new("tests")
+        .join("corpus")
+        .join("reject")
+        .join("PB018_static_mut.rs");
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &corpus,
+        &[("PITBULL_SARIF_OUT", sarif_target.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    // SARIF refusal does not exit; rustc continues. Wrapper just
+    // logs a "refusing SARIF write" warning.
+    assert!(
+        stderr.contains("refusing SARIF write"),
+        "H3: stderr should announce SARIF refusal; got:\n{stderr}",
+    );
+    // Sentinel file content must be intact.
+    let after = fs::read_to_string(&sarif_target).expect("re-read sentinel");
+    let _ = fs::remove_file(&sarif_target);
+    assert_eq!(
+        after, sentinel,
+        "H3 VIOLATED: SARIF write overwrote a non-SARIF file (exit code {code:?})",
+    );
+}
 /// Regression test for audit finding C1: when `pitbull.toml` sets
 /// `verify_roots` to a pattern that does not match any item in the
 /// crate under test, statics and consts must STILL be walked. The
