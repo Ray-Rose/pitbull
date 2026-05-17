@@ -1,0 +1,107 @@
+name: CI
+
+# Build + test gate. Runs on every push to main and every pull
+# request, on both Linux (fast, default for the matrix) and Windows
+# (mirrors the maintainer's dev environment and exercises the
+# rustc-internal DLL path on Windows that the smoke tests rely on).
+#
+# Two jobs:
+#
+#   1. `stable` — runs the workspace's `cargo +stable test` on Linux.
+#      Pins the 61-test / 0-warning / 0-failure invariant established
+#      through Milestone 2 Tasks E–K. The corpus e2e tests
+#      gracefully skip without the nightly wrapper, so this job
+#      passes without nightly toolchain installation.
+#
+#   2. `nightly-e2e` — installs the pinned `nightly-2026-01-29`,
+#      builds the rustc-replacement wrapper with
+#      `PITBULL_USE_RUSTC_PUBLIC=1`, then re-runs the test suite
+#      with `PITBULL_REQUIRE_E2E=1` so the corpus e2e tests are
+#      forced to run (not gracefully skipped). Catches any
+#      adapter / wrapper / HIR-pre-pass regression that the
+#      shadow-only stable tests can't see.
+#
+# Notes on what's intentionally NOT in this workflow:
+#
+# - `cargo fmt --check`: the project source style is intentionally
+#   compact (custom layout). `cargo fmt --all` is explicitly
+#   disallowed by CLAUDE/README guidance.
+#
+# - `cargo clippy -D warnings`: the workspace has 60+ pre-existing
+#   clippy warnings that haven't been audited. Gating on them today
+#   would be a constant red herring. Clippy cleanup is its own task;
+#   when it lands the gate can be added.
+#
+# - Mutation testing harness: defined in `pitbull-subset/src/mutation.rs`
+#   but not yet wired to `cargo-mutants`. The PSS-1 soundness story
+#   wants 100% mutant kill rate as a release gate, but the harness
+#   needs the cargo-mutants integration first.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on the same ref when a new commit is pushed.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  stable:
+    name: Stable test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --workspace --all-features
+        # The corpus e2e tests gracefully skip without the nightly
+        # wrapper binary. PITBULL_REQUIRE_E2E is intentionally NOT
+        # set in this job; the nightly-e2e job below covers that.
+        run: cargo test --workspace --all-features
+
+  nightly-e2e:
+    name: Nightly + opt-in e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is the cheap default; Windows mirrors the dev
+        # environment and exercises the rustc-internal DLL path
+        # the wrapper's PATH manipulation handles on that OS.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned nightly toolchain
+        # The wrapper is hardcoded to nightly-2026-01-29 (the Creusot
+        # migration cadence). Components rustc-dev + rust-src are
+        # required for the rustc_private extern crates.
+        run: |
+          rustup toolchain install nightly-2026-01-29 --component rustc-dev rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Build wrapper (nightly + opt-in)
+        env:
+          PITBULL_USE_RUSTC_PUBLIC: "1"
+        run: cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc
+      - name: Run e2e tests (PITBULL_REQUIRE_E2E=1)
+        # The corpus integration tests subprocess-invoke the wrapper.
+        # PITBULL_REQUIRE_E2E=1 escalates "wrapper missing" to a hard
+        # failure instead of graceful skip — required here, because
+        # the wrapper *was* built in the previous step.
+        env:
+          PITBULL_REQUIRE_E2E: "1"
+        # --test-threads=1: the wrapper writes a unique temp pid in
+        # filenames, but parallel invocations against the same
+        # corpus file would still race on the output artifact path.
+        run: cargo test --workspace --all-features -- --test-threads=1
