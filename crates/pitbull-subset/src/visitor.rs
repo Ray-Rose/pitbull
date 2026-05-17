@@ -565,7 +565,9 @@ impl<'cfg> SubsetVisitor<'cfg> {
             }
             Some(p)
                 if p.starts_with("alloc::alloc::")
-                    || p.starts_with("std::alloc::") =>
+                    || p.starts_with("std::alloc::")
+                    || p.starts_with("core::alloc::Allocator::")
+                    || p.starts_with("std::alloc::Allocator::") =>
             {
                 self.reject(rules::PB011, span, format!("call to allocator API `{p}`"));
             }
@@ -573,7 +575,9 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 if p == "core::mem::transmute"
                     || p == "std::mem::transmute"
                     || p == "core::intrinsics::transmute"
-                    || p == "std::intrinsics::transmute" =>
+                    || p == "std::intrinsics::transmute"
+                    || p == "core::intrinsics::transmute_unchecked"
+                    || p == "std::intrinsics::transmute_unchecked" =>
             {
                 self.reject(rules::PB007, span, "`transmute` call");
             }
@@ -1157,29 +1161,30 @@ impl<'cfg> SubsetVisitor<'cfg> {
         //      raw-SMT-LIB escape hatch.
         let lhs_arg = self.operand_arg_name(lhs);
         let rhs_arg = self.operand_arg_name(rhs);
-        // Collect assumptions for this obligation. Two paths:
+        // Process each precondition through three potential paths,
+        // recording a specific audit note for each rejection so
+        // the auditor sees WHY a given assumption was dropped:
         //
-        //   1. Predicate-translated: the precondition parses as
-        //      `<ident> <cmp> <int>`, binds to an operand by name,
-        //      and translates to a properly-encoded BV assertion.
-        //   2. Raw-SMT-LIB escape hatch: predicate parsing failed,
-        //      but the string lex-validates as a single
-        //      `(assert ...)` form (paren-balanced, no strings,
-        //      no comments) — spliced verbatim.
+        //   1. Predicate parses + binds + translates ⇒ use the
+        //      translated SMT-LIB.
+        //   2. Predicate parses + binds + translation fails (e.g.
+        //      literal out of range for the operand type) ⇒
+        //      audit note with translator's error message. DO NOT
+        //      fall through to raw splice — the user's predicate
+        //      WAS their intent, and the failure has a clean cause.
+        //   3. Predicate parses but doesn't bind to any operand
+        //      OR predicate doesn't parse at all ⇒ try raw splice
+        //      after lex validation (F2 hardening: must be single
+        //      `(assert ...)` form). If invalid, audit note.
         //
-        // Anything else (multi-directive injection, unbalanced
-        // parens, etc.) is REFUSED with a loud audit note rather
-        // than silently spliced. This closes the v0.2 red-team
-        // finding F2: a malformed assumption could otherwise plant
-        // a contradictory hypothesis or subvert the solver verdict.
+        // The path-specific rejection messages help users
+        // distinguish "I wrote a real predicate but it's wrong for
+        // this type" from "I wrote raw SMT but it's malformed".
         let mut assumptions: Vec<String> =
             Vec::with_capacity(self.current_body_preconditions.len());
-        // Collect (raw_index, audit_message) tuples; emit after
-        // the obligation is pushed so notes report after their
-        // related obligation in stderr.
         let mut pending_audit_notes: Vec<String> = Vec::new();
         for raw in &self.current_body_preconditions {
-            let translated = match crate::predicate::parse_predicate(raw) {
+            match crate::predicate::parse_predicate(raw) {
                 Ok(pred) => {
                     let operand_label = if lhs_arg.as_deref() == Some(pred.var.as_str()) {
                         Some("lhs")
@@ -1189,22 +1194,44 @@ impl<'cfg> SubsetVisitor<'cfg> {
                         None
                     };
                     match operand_label {
-                        Some(label) => crate::predicate::predicate_to_smt_assertion(
-                            &pred,
-                            label,
-                            &lhs_name,
-                        )
-                        .ok(),
-                        None => None,
+                        Some(label) => {
+                            match crate::predicate::predicate_to_smt_assertion(
+                                &pred,
+                                label,
+                                &lhs_name,
+                            ) {
+                                Ok(smt) => assumptions.push(smt),
+                                Err(e) => {
+                                    pending_audit_notes.push(format!(
+                                        "rejecting precondition (predicate parsed and \
+                                         bound but translation failed): {e} — input: {raw:?}",
+                                    ));
+                                }
+                            }
+                        }
+                        None => {
+                            // Predicate parsed but its variable
+                            // doesn't bind to any operand here. Try
+                            // raw splice; if not valid SMT-LIB,
+                            // surface a specific message.
+                            match crate::predicate::validate_assertion_form(raw) {
+                                Ok(()) => assumptions.push(raw.clone()),
+                                Err(_) => {
+                                    pending_audit_notes.push(format!(
+                                        "rejecting precondition (predicate variable `{}` does \
+                                         not bind to any operand of this binary op, and the \
+                                         string is not a valid SMT-LIB `(assert ...)` form): \
+                                         input: {raw:?}",
+                                        pred.var,
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
-                Err(_) => None,
-            };
-            match translated {
-                Some(smt) => assumptions.push(smt),
-                None => {
-                    // Predicate path failed. Try raw-SMT-LIB escape
-                    // hatch with lex validation.
+                Err(_) => {
+                    // Predicate parse failed. Try raw-SMT-LIB
+                    // splice with lex validation (F2 hardening).
                     match crate::predicate::validate_assertion_form(raw) {
                         Ok(()) => assumptions.push(raw.clone()),
                         Err(e) => {
@@ -1350,6 +1377,13 @@ pub fn is_panic_call_path(p: &str) -> bool {
         || p.starts_with("std::panicking::")
         || p == "core::panic"
         || p == "std::panic"
+        // `core::panic_any` / `std::panic_any` are the public
+        // top-level API for panicking with an arbitrary payload.
+        // They aren't under `panicking::*`. Discovered in
+        // audit-cleanup #4 (finding H-1 / F11): a user calling
+        // `std::panic_any(payload)` wasn't classified as a panic.
+        || p == "core::panic_any"
+        || p == "std::panic_any"
         || matches!(
             p,
             "std::rt::panic_fmt"
@@ -2353,9 +2387,15 @@ mod tests {
             "core::panicking::panic",
             "core::panicking::panic_fmt",
             "core::panicking::panic_explicit",
+            "core::panicking::panic_nounwind_fmt",
+            "core::panicking::panic_in_cleanup",
+            "core::panicking::panic_const_add_overflow",
             "std::panicking::begin_panic",
+            "std::panicking::set_hook",
             "core::panic",
             "std::panic",
+            "core::panic_any",      // audit-cleanup #4 / F11 fix
+            "std::panic_any",       // audit-cleanup #4 / F11 fix
             "std::rt::panic_fmt",
             "std::rt::panic_display",
             "std::rt::begin_panic",
@@ -2369,10 +2409,55 @@ mod tests {
             "core::sync::atomic::AtomicU32::load",
             "my_crate::helper",
             "std::fmt::Arguments::<'a>::from_str",  // the OTHER unmatched path we observed
+            "core::panic_lookalike",  // similar prefix but not a panic API
             "",
         ];
         for p in negative {
             assert!(!is_panic_call_path(p), "should NOT classify as panic: {p}");
+        }
+    }
+    /// Audit-cleanup #4 / H-2: `transmute_unchecked` is a real
+    /// (unstable but reachable) transmute variant used inside
+    /// `MaybeUninit::assume_init` and similar. Must fire PB007.
+    #[test]
+    fn transmute_unchecked_fires_pb007() {
+        let cfg = SubsetConfig::default_for_test();
+        for path in [
+            "core::intrinsics::transmute_unchecked",
+            "std::intrinsics::transmute_unchecked",
+        ] {
+            let mut v = SubsetVisitor::new(&cfg);
+            let body = body_calling(path);
+            v.visit_body(&body, false);
+            assert!(
+                v.errors.iter().any(|e| e.rule == rules::PB007),
+                "{path}: expected PB007 to fire; got {:?}",
+                v.errors,
+            );
+        }
+    }
+    /// Audit-cleanup #4 / H-3: trait-method-style allocator paths
+    /// (`core::alloc::Allocator::allocate` etc.) must fire PB011.
+    /// Before this fix, only `alloc::alloc::*` and `std::alloc::*`
+    /// matched; trait calls via the `Allocator` trait silently
+    /// missed.
+    #[test]
+    fn allocator_trait_methods_fire_pb011() {
+        let cfg = SubsetConfig::default_for_test();
+        for path in [
+            "core::alloc::Allocator::allocate",
+            "core::alloc::Allocator::deallocate",
+            "std::alloc::Allocator::allocate",
+            "std::alloc::Allocator::grow",
+        ] {
+            let mut v = SubsetVisitor::new(&cfg);
+            let body = body_calling(path);
+            v.visit_body(&body, false);
+            assert!(
+                v.errors.iter().any(|e| e.rule == rules::PB011),
+                "{path}: expected PB011 to fire; got {:?}",
+                v.errors,
+            );
         }
     }
     #[test]

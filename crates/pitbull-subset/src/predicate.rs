@@ -404,22 +404,33 @@ fn int_type_info(name: &str) -> Option<(bool, u32)> {
     Some((signed, bits))
 }
 /// Legal value range for `i<bits>` or `u<bits>` as `i128`.
-/// Returns `None` for `u128` (its max doesn't fit `i128::MAX`).
-/// u128 with predicate ranges is an O.3+ concern — when we
-/// support u128 spec preds, this returns `None` cleanly so the
-/// caller reports an UnsupportedType rather than silent truncation.
+/// Returns `None` for `u128` (its max doesn't fit `i128::MAX`)
+/// and for any width the `i128` arithmetic can't represent.
+///
+/// Audit-cleanup #4 / red-team F3: an earlier version computed
+/// `1i128.checked_shl(127)` for signed-128, which returned
+/// `Some(i128::MIN)` — then `-i128::MIN` panicked in debug and
+/// wrapped in release, producing a wrong range. The fix
+/// special-cases `i128` to the full i128 range (which is exactly
+/// what the predicate IR can express — `lit: i128`).
 fn legal_range_i128(signed: bool, bits: u32) -> Option<(i128, i128)> {
-    if signed {
-        // i<bits> uses two's complement: [-2^(bits-1), 2^(bits-1) - 1].
-        let half = 1i128.checked_shl(bits - 1)?;
-        Some((-half, half - 1))
-    } else if bits == 128 {
-        // u128::MAX = 2^128 - 1 > i128::MAX. The predicate IR uses
-        // i128 literals so cannot express u128 bounds today.
-        None
-    } else {
-        let max = (1i128 << bits) - 1;
-        Some((0, max))
+    match (signed, bits) {
+        // i128: the full i128 range matches the predicate IR
+        // literal type one-to-one. No shifts needed.
+        (true, 128) => Some((i128::MIN, i128::MAX)),
+        // Other signed widths: standard two's-complement range.
+        (true, _) => {
+            let half = 1i128.checked_shl(bits - 1)?;
+            Some((-half, half - 1))
+        }
+        // u128::MAX = 2^128 - 1 > i128::MAX. The predicate IR
+        // uses i128 literals so cannot express u128 bounds today.
+        // Caller reports as UnsupportedType rather than truncating.
+        (false, 128) => None,
+        (false, _) => {
+            let max = (1i128 << bits) - 1;
+            Some((0, max))
+        }
     }
 }
 /// Format an `i128` value as an SMT-LIB bit-vector literal of the
@@ -649,6 +660,26 @@ mod tests {
                 .expect_err(ty);
             assert!(matches!(err, TranslationError::UnsupportedType { .. }));
         }
+    }
+    /// Audit-cleanup F3: i128 predicates translate cleanly without
+    /// the off-by-one overflow that broke `legal_range_i128`
+    /// before the fix. A non-trivial test: a negative literal
+    /// (which exercises two's-complement encoding) and a
+    /// boundary literal (i128::MIN, the value that overflowed).
+    #[test]
+    fn i128_predicates_translate_cleanly() {
+        let p_neg = Predicate { var: "x".into(), op: CmpOp::Gt, lit: -1_000_000 };
+        let smt = predicate_to_smt_assertion(&p_neg, "lhs", "i128")
+            .expect("i128 with negative literal supported");
+        assert!(smt.contains("bvsgt"), "signed-128 must use bvsgt; got {smt}");
+        // i128::MIN must NOT be out-of-range (the bug we fixed).
+        let p_min = Predicate { var: "x".into(), op: CmpOp::Eq, lit: i128::MIN };
+        let _smt = predicate_to_smt_assertion(&p_min, "lhs", "i128")
+            .expect("i128 must accept i128::MIN");
+        // i128::MAX likewise.
+        let p_max = Predicate { var: "x".into(), op: CmpOp::Eq, lit: i128::MAX };
+        let _smt = predicate_to_smt_assertion(&p_max, "lhs", "i128")
+            .expect("i128 must accept i128::MAX");
     }
     /// rhs binding works the same as lhs — the operand name is
     /// just a label in the produced SMT.
