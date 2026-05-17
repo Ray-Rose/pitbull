@@ -236,6 +236,17 @@ mod shadow {
         pub def_id: DefId,
         /// Signature: argument types, return type.
         pub arg_tys: Vec<Ty>,
+        /// Source names of the function's parameters, in declaration
+        /// order. Length matches `arg_tys`; an entry is the empty
+        /// string for anonymous patterns (e.g. `fn foo(_: u32)`) or
+        /// when the upstream MIR carries no debug info for the arg.
+        ///
+        /// Used by VC emission (v0.2) to bind spec preconditions
+        /// (which name parameters by their source identifiers) to
+        /// MIR operands (which are unnamed locals post-mono).
+        /// Specifically, `arg_names[i]` is the source name of MIR
+        /// local `_{i+1}` (since local `_0` is the return slot).
+        pub arg_names: Vec<String>,
         /// Return type.
         pub return_ty: Ty,
         /// Whether the function is declared `unsafe`.

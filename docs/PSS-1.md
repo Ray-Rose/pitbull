@@ -520,6 +520,82 @@ the std form and now also matches. No shadow type changes.
   Wrapper now writes SARIF JSON to the path in `PITBULL_SARIF_OUT`
   when that env var is set; each invocation overwrites — multi-crate
   aggregation is a follow-up for the `cargo pitbull check` subcommand.
+- ✅ Spec-context narrowing — predicate grammar (Task O.2).
+  Replaces O.1's raw-SMT-LIB-only posture with an auditable
+  Rust-like predicate language and a binding pass that maps
+  predicate variables to MIR operand positions.
+
+  Grammar accepted in `[verification.preconditions]`:
+    "<ident> <cmp_op> <int_literal>"  e.g. "x < 100"
+    "<int_literal> <cmp_op> <ident>"  e.g. "100 > x"  (normalized
+                                                       to ident-first)
+  where `<cmp_op>` is one of `<`, `<=`, `>`, `>=`, `==`, `!=`.
+
+  Wiring:
+    * `pitbull_subset::predicate::{Predicate, CmpOp, ParseError,
+      TranslationError}` — typed IR plus a hand-rolled parser.
+      `parse_predicate` accepts arbitrary whitespace, normalizes
+      reversed form via `CmpOp::flip`, rejects malformed inputs
+      with a `ParseError` that names the offender.
+    * `pitbull_subset::predicate::predicate_to_smt_assertion`
+      compiles to SMT-LIB. Signed types use `bvslt`/`bvsle`/etc.;
+      unsigned use `bvult`/`bvule`/etc. Equality and inequality
+      use SMT-LIB's `=` and `distinct`. Negative literals encode
+      as two's-complement bit-vectors (e.g. `i8` -1 → `#xFF`).
+      Out-of-range literals (e.g. `x < 1_000_000` for `u8`)
+      produce `TranslationError::LiteralOutOfRange` rather than
+      silent truncation.
+    * `mir_api::Body` gains `arg_names: Vec<String>`; the adapter
+      populates from `rustc_public::Body::var_debug_info`
+      (1-based `argument_index` shifted to 0-based).
+    * `SubsetVisitor.current_body_arg_names` is set per-body and
+      consulted by a new `operand_arg_name` helper that resolves
+      `Operand::Copy(Place(arg_local, no_projections))` to the
+      source identifier.
+    * `maybe_emit_overflow_obligation` now attempts the parse →
+      bind → translate path per precondition. Any step's failure
+      falls back to the O.1 raw-splice posture, so existing
+      raw-SMT-LIB configs continue to work unchanged.
+
+  Layered tests (24 new):
+    * `predicate::tests::*` — 16 parser/translator tests covering
+      every operator, signed/unsigned, reversed form, negative
+      literals, two's-complement encoding, out-of-range rejection,
+      unsupported types, malformed inputs, and operator-matched-
+      but-operands-bad guarding against `<=`-as-`<` misparsing.
+    * `visitor::tests::predicate_precondition_binds_lhs_operand`
+      pins the parse → bind → translate path end-to-end on a
+      synthetic body that mirrors MIR for `fn add_one(x) { x + 1 }`.
+    * `visitor::tests::unbound_predicate_falls_back_to_raw_splice`
+      pins the fallback when the predicate's variable doesn't
+      match any operand.
+    * `visitor::tests::raw_smt_lib_precondition_unchanged` pins
+      the O.1 escape hatch: hand-written SMT-LIB strings flow
+      through unchanged.
+
+  Smoke (Z3 not on dev machine): wrapper invoked on
+  `pub fn add_two(x: u32, y: u32) -> u32 { x + y }` with
+  `"corpus_test::add_two" = ["x < 100", "y < 100"]` in pitbull.toml
+  emits one obligation with both predicates translated and bound
+  to `lhs`/`rhs`. Visible per-layer via the test suite:
+
+      "x < 100" + arg x at local 1 + BinaryOp(_, Copy(_1), _)
+        → (assert (bvult lhs #x00000064))
+
+  Limitations to lift in O.3:
+    * The binding fires ONLY for `BinaryOp` whose operand is a
+      DIRECT `Operand::Copy(Place(arg_local, []))`. Intermediate
+      `let`s (e.g. `let y = x; y + 1`) introduce temporaries that
+      break the chain; the predicate falls back to raw splice.
+      A future data-flow pass closes that gap.
+    * Constant operands (e.g. the `1` in `x + 1`) are not yet
+      constrained in the SMT problem — they're free BV vars from
+      the solver's perspective, so `x + 1` with `x < 100` still
+      returns sat (witness: rhs=u32::MAX). Constant-value
+      extraction from `ConstOperand` lands in O.2.5 / O.3.
+    * Multi-conjunct preconditions are arrays — each conjunct is
+      one entry in the value array. Single-string `"x < 100 AND
+      y > 0"` is not yet parsed.
 - ✅ Spec-context narrowing — foundation (Task O.1). Threads
   spec-derived preconditions through the visitor → VC obligation →
   SMT-LIB pipeline. The first commit of three staged steps toward

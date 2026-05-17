@@ -50,6 +50,7 @@ extern crate rustc_public;
 pub mod config;
 pub mod diagnostic;
 pub mod mir_api;
+pub mod predicate;
 pub mod reachability;
 pub mod rules;
 pub mod vc;

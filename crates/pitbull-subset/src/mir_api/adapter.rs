@@ -758,6 +758,7 @@ pub fn body(b: &rp::mir::Body) -> shadow::Body {
     shadow::Body {
         def_id: shadow::DefId(0), // Threaded by caller in v0.2 wiring.
         arg_tys: b.arg_locals().iter().map(|ld| ty(ld.ty)).collect(),
+        arg_names: extract_arg_names(b),
         return_ty: ty(b.ret_local().ty),
         is_unsafe: false,
         is_async: false,
@@ -777,6 +778,31 @@ pub fn body(b: &rp::mir::Body) -> shadow::Body {
         blocks: b.blocks.iter().map(basic_block_data).collect(),
         span: span(b.span),
     }
+}
+/// Pull parameter source names from `rustc_public`'s
+/// `var_debug_info`. The result is positional — index `i` holds the
+/// name of MIR local `_{i+1}` (since `_0` is the return slot). Args
+/// with no debug info (anonymous patterns, compiler-generated)
+/// produce empty strings — the caller distinguishes "no name
+/// available" from a real name.
+///
+/// `rustc_public::VarDebugInfo::argument_index` is documented as
+/// 1-based; we shift to 0-based for the returned vec. Out-of-range
+/// indices (which shouldn't happen in well-formed MIR but the
+/// adapter is defensive) are ignored rather than panicking.
+fn extract_arg_names(b: &rp::mir::Body) -> Vec<String> {
+    let arg_count = b.arg_locals().len();
+    let mut names = vec![String::new(); arg_count];
+    for info in &b.var_debug_info {
+        if let Some(arg_idx) = info.argument_index {
+            // 1-based per upstream docs.
+            let zero_based = (arg_idx as usize).saturating_sub(1);
+            if zero_based < arg_count {
+                names[zero_based] = info.name.to_string();
+            }
+        }
+    }
+    names
 }
 fn basic_block_data(bb: &rp::mir::BasicBlock) -> shadow::BasicBlockData {
     shadow::BasicBlockData {

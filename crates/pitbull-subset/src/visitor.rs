@@ -105,6 +105,13 @@ pub struct SubsetVisitor<'cfg> {
     /// a type. Cleared between bodies via the next `visit_body`
     /// overwriting it.
     current_body_locals: Vec<crate::mir_api::LocalDecl>,
+    /// Argument source names of the currently-walked body. Set at
+    /// the start of `visit_body` from `body.arg_names`. Used by VC
+    /// emission to bind predicate-grammar preconditions (which name
+    /// parameters by source identifier) to MIR operand positions
+    /// (`lhs` / `rhs`) when the operand is a direct read of a
+    /// function parameter.
+    current_body_arg_names: Vec<String>,
     /// Spec-derived preconditions for the currently-walked body —
     /// raw SMT-LIB assertion forms that get attached as
     /// `assumptions` to every VC obligation this body emits. Set
@@ -132,6 +139,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
             audit_notes: Vec::new(),
             vc_obligations: Vec::new(),
             current_body_locals: Vec::new(),
+            current_body_arg_names: Vec::new(),
             current_body_preconditions: Vec::new(),
             current_body_trusted: false,
             in_spec_context: false,
@@ -227,6 +235,10 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // the body through every visit method. Cleared on the next
         // visit_body, so there's no cross-body leak.
         self.current_body_locals.clone_from(&body.locals);
+        // Cache arg names for the same reason — used by spec-precondition
+        // binding to map predicate variables (`x` in `x < 100`) to
+        // operand positions (lhs/rhs of the binary op).
+        self.current_body_arg_names.clone_from(&body.arg_names);
         // PB002: unsafe fn definitions are rejected outright. Even trusted
         // functions cannot be unsafe in v0.1; trust is for spec assumption,
         // not for `unsafe` admission.
@@ -1084,11 +1096,50 @@ impl<'cfg> SubsetVisitor<'cfg> {
         }
         let seq = self.vc_obligations.len();
         let id = format!("pb049-{}-{}", arith_op.tag(), seq);
-        // Attach the current body's preconditions as SMT-LIB
-        // assumptions so the solver gets them as additional
-        // hypotheses. Cloned here because preconditions may be
-        // re-used across multiple obligations within the same body.
-        let assumptions = self.current_body_preconditions.clone();
+        // Translate each precondition string. The path:
+        //   1. Try `predicate::parse_predicate` — succeeds for the
+        //      Rust-like grammar `<ident> <cmp> <int>`.
+        //   2. If parsed: try to bind the predicate's variable to
+        //      `lhs` or `rhs` via the operand's arg name. The lhs
+        //      operand binds first; if the variable matches the
+        //      lhs's arg name, the predicate refers to lhs. Same
+        //      for rhs. Otherwise the predicate doesn't apply to
+        //      this op.
+        //   3. If bound: try `predicate_to_smt_assertion` against
+        //      the operand's type. Range checks happen here —
+        //      out-of-range literals produce `LiteralOutOfRange`,
+        //      which falls back to raw splice rather than silently
+        //      truncating.
+        //   4. On any failure (parse, bind, or translate) splice
+        //      the raw string verbatim. That preserves O.1's
+        //      raw-SMT-LIB escape hatch.
+        let lhs_arg = self.operand_arg_name(lhs);
+        let rhs_arg = self.operand_arg_name(rhs);
+        let mut assumptions = Vec::with_capacity(self.current_body_preconditions.len());
+        for raw in &self.current_body_preconditions {
+            let translated = match crate::predicate::parse_predicate(raw) {
+                Ok(pred) => {
+                    let operand_label = if lhs_arg.as_deref() == Some(pred.var.as_str()) {
+                        Some("lhs")
+                    } else if rhs_arg.as_deref() == Some(pred.var.as_str()) {
+                        Some("rhs")
+                    } else {
+                        None
+                    };
+                    match operand_label {
+                        Some(label) => crate::predicate::predicate_to_smt_assertion(
+                            &pred,
+                            label,
+                            &lhs_name,
+                        )
+                        .ok(),
+                        None => None,
+                    }
+                }
+                Err(_) => None,
+            };
+            assumptions.push(translated.unwrap_or_else(|| raw.clone()));
+        }
         self.vc_obligations.push(crate::vc::VcObligation {
             id,
             span,
@@ -1098,6 +1149,44 @@ impl<'cfg> SubsetVisitor<'cfg> {
             },
             assumptions,
         });
+    }
+    /// Resolve an operand to its source-level parameter name when
+    /// the operand is a direct read of a function argument (no
+    /// projections, base local is one of the arg slots). Returns
+    /// `None` for:
+    /// - Constant operands.
+    /// - Places with non-empty projections (deref, field, etc.).
+    /// - Place locals outside the argument range (locals introduced
+    ///   by `let`, return slot `_0`, etc.).
+    /// - Argument slots with no source name (anonymous patterns).
+    ///
+    /// Conservative posture: the binding only fires when the
+    /// operand is "directly" a parameter. Intermediate `let`s
+    /// (e.g. `let y = x; y + 1`) break the chain — the visitor
+    /// doesn't do data-flow analysis. Predicates referring to such
+    /// shadowed parameters silently don't apply at the binary-op
+    /// site and fall back to raw splice.
+    fn operand_arg_name(&self, op: &Operand) -> Option<String> {
+        let place = match op {
+            Operand::Constant(_) => return None,
+            Operand::Copy(p) | Operand::Move(p) => p,
+        };
+        if !place.projection.is_empty() {
+            return None;
+        }
+        // Local `_0` is the return slot; `_1..=_arg_count` are args.
+        // arg_names is indexed [0..arg_count) → maps to locals [1..=arg_count].
+        let local_idx = place.local.0 as usize;
+        if local_idx == 0 {
+            return None;
+        }
+        let arg_idx = local_idx - 1;
+        let name = self.current_body_arg_names.get(arg_idx)?;
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.clone())
+        }
     }
     /// Resolve an operand to a primitive integer type name (`"u32"`,
     /// `"i64"`, …) when possible.
@@ -1162,6 +1251,7 @@ mod tests {
         Body {
             def_id: DefId(0),
             arg_tys: vec![],
+            arg_names: vec![],
             return_ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
             is_unsafe: false,
             is_async: false,
@@ -1426,6 +1516,7 @@ mod tests {
         Body {
             def_id: DefId(0),
             arg_tys: vec![],
+            arg_names: vec![],
             return_ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
             is_unsafe: false,
             is_async: false,
@@ -1461,6 +1552,7 @@ mod tests {
         let body = Body {
             def_id: DefId(0),
             arg_tys: vec![],
+            arg_names: vec![],
             return_ty: u32_ty.clone(),
             is_unsafe: false,
             is_async: false,
@@ -1531,6 +1623,7 @@ mod tests {
         let body = Body {
             def_id: DefId(0),
             arg_tys: vec![u32_ty.clone()],
+            arg_names: vec![],
             return_ty: u32_ty.clone(),
             is_unsafe: false,
             is_async: false,
@@ -1590,6 +1683,7 @@ mod tests {
         let make_body = || Body {
             def_id: DefId(0),
             arg_tys: vec![],
+            arg_names: vec![],
             return_ty: u32_ty.clone(),
             is_unsafe: false,
             is_async: false,
@@ -1646,6 +1740,183 @@ mod tests {
             report.vc_obligations[1].assumptions,
         );
     }
+    /// O.2: a predicate-form precondition like `"x < 100"` is
+    /// parsed, bound to the `x` parameter on the lhs of the binary
+    /// op, and translated to a properly-encoded BV assertion. Pins
+    /// the full visitor path: parse → bind → translate.
+    #[test]
+    fn predicate_precondition_binds_lhs_operand() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        // MIR layout for `fn add_one(x: u32) -> u32 { x + 1 }`:
+        //   _0: u32 (return), _1: u32 (param `x`), _2: u32 (the
+        //   binary op result). The BinaryOp's lhs is Copy(_1).
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone()],
+            arg_names: vec!["x".into()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(2), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_preconditions(vec!["x < 100".into()]);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        assert_eq!(
+            report.vc_obligations[0].assumptions,
+            vec!["(assert (bvult lhs #x00000064))".to_string()],
+            "predicate `x < 100` must bind to lhs (where x is) and \
+             translate to an unsigned-less-than BV assertion",
+        );
+    }
+    /// O.2: precondition whose variable doesn't match any operand's
+    /// arg name falls through the predicate path and gets spliced
+    /// verbatim. This preserves O.1's escape hatch — users keep
+    /// hand-written SMT-LIB working.
+    #[test]
+    fn unbound_predicate_falls_back_to_raw_splice() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone()],
+            arg_names: vec!["x".into()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        // Precondition mentions `x`, but neither operand is a Copy
+        // of param `x` — both are constants. The predicate is
+        // parseable but unbindable; verbatim splice.
+        v.set_current_preconditions(vec!["x < 100".into()]);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        assert_eq!(
+            report.vc_obligations[0].assumptions,
+            vec!["x < 100".to_string()],
+            "unbound predicate must be spliced raw (the o.1 escape \
+             hatch); got {:?}",
+            report.vc_obligations[0].assumptions,
+        );
+    }
+    /// O.2: raw SMT-LIB strings (which fail predicate parsing
+    /// because they don't have a bare comparison operator) flow
+    /// through unchanged. Preserves O.1 behavior for users with
+    /// hand-written SMT.
+    #[test]
+    fn raw_smt_lib_precondition_unchanged() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone()],
+            arg_names: vec!["x".into()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        let raw = "(assert (bvult lhs #x00000050))";
+        v.set_current_preconditions(vec![raw.to_string()]);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        assert_eq!(
+            report.vc_obligations[0].assumptions,
+            vec![raw.to_string()],
+            "raw SMT-LIB must pass through verbatim",
+        );
+    }
     /// Task N negative: a `BinaryOp` on a non-integer (`bool`)
     /// must NOT emit an overflow obligation — the SMT-LIB encoder
     /// would have nothing meaningful to say.
@@ -1656,6 +1927,7 @@ mod tests {
         let body = Body {
             def_id: DefId(0),
             arg_tys: vec![],
+            arg_names: vec![],
             return_ty: bool_ty.clone(),
             is_unsafe: false,
             is_async: false,
@@ -1736,6 +2008,7 @@ mod tests {
         Body {
             def_id: DefId(0),
             arg_tys: vec![],
+            arg_names: vec![],
             return_ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
             is_unsafe: false,
             is_async: false,

@@ -14,18 +14,36 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 # Hard timeout per verification condition (seconds). Timeout counts as failure.
 vc_timeout_seconds = 60
 # Per-function preconditions surfaced to the SMT solver as hypotheses.
-# Keys are fully-qualified function paths; values are arrays of complete
-# SMT-LIB 2 `(assert ...)` directives.
+# Keys are fully-qualified function paths; values are arrays of
+# predicates.
 #
-# v0.2 O.1 posture: the user writes raw SMT-LIB. Operand positions are
-# `lhs` and `rhs` for binary arithmetic. v0.2 O.2 introduces a Rust-like
-# predicate grammar (`x < 100`); v0.2 O.3 wires `#[pitbull::requires(...)]`
-# tool-attribute extraction.
+# v0.2 O.2 (this version) accepts a Rust-like predicate grammar:
+#   "<ident> <cmp_op> <int_literal>"  e.g.  "x < 100"
+#   "<int_literal> <cmp_op> <ident>"  e.g.  "100 > x"  (normalized
+#                                                       to ident-first)
+# where <cmp_op> is one of < <= > >= == !=.
 #
-# Example: prove `add_one(x: u32) -> u32 { x + 1 }` safe by constraining
-# `x < 100` so the overflow at `x + 1` is impossible:
+# The visitor parses each predicate, binds the named variable to the
+# matching parameter (looked up via the body's `arg_names`), and
+# translates the predicate to SMT-LIB with the right signed/unsigned
+# BV operator and literal encoding for the parameter's type.
+#
+# Strings that fail predicate parsing are spliced VERBATIM into the
+# SMT problem — the o.1 escape hatch for cases the grammar doesn't
+# yet cover. Use raw SMT-LIB sparingly; the predicate form is
+# easier to audit.
+#
+# v0.2 O.3 will add `#[pitbull::requires(...)]` extraction so
+# preconditions can live next to the code they constrain instead of
+# in this config file.
+#
+# Example: prove `add_two(x: u32, y: u32) -> u32 { x + y }` safe by
+# constraining both inputs:
 # [verification.preconditions]
-# "my_crate::add_one" = ["(assert (bvult lhs #x00000064))"]
+# "my_crate::add_two" = ["x < 100", "y < 100"]
+#
+# Raw SMT-LIB escape hatch (still works):
+# "my_crate::weird" = ["(assert (= lhs #x00000007))"]
 # Solver agreement threshold. PSS-1 design: require 2-of-3 solvers to return
 # UNSAT before accepting a proof obligation. Increase to 3 for highest-assurance
 # builds. Decrease only with documented justification.

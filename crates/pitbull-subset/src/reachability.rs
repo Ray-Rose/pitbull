@@ -219,6 +219,7 @@ mod tests {
         Body {
             def_id,
             arg_tys: vec![],
+            arg_names: vec![],
             return_ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
             is_unsafe: false,
             is_async: false,
