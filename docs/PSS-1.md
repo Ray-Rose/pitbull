@@ -494,17 +494,19 @@ the std form and now also matches. No shadow type changes.
   escalates missing-prerequisites to hard failure for CI.
   Documented unimplemented exceptions: PB041 (call-graph SCC analysis
   not implemented), PB054 (VC obligation, not visitor rule).
-- ✅ Wrapper enumerates static + const items (Task E). `pitbull-rustc`
-  now matches on `CrateItem::kind()` and dispatches `ItemKind::Static`
-  through `visit_static_item` (PB018 fires end-to-end) and
-  `ItemKind::Const` through `visit_const_item`. Mutability is
-  resolved via the rustc_internal bridge — `TyCtxt::is_mutable_static`
-  applied to the internal `DefId` returned by
-  `rustc_internal::internal(tcx, item.def_id())`, since
-  `rustc_public::ItemKind::Static` is a payload-less variant. The
-  `verify_roots` pattern filter is fn-path-shaped, so static/const
-  items are walked only in the open-walk fallback (verify_roots
-  empty); the `exclude` filter still applies.
+- ✅ Wrapper enumerates static + const items (Task E, corrected by
+  Task H). `pitbull-rustc` matches on `CrateItem::kind()` and
+  dispatches `ItemKind::Static` through `visit_static_item` (PB018
+  fires end-to-end) and `ItemKind::Const` through `visit_const_item`.
+  Mutability is resolved via the rustc_internal bridge —
+  `TyCtxt::is_mutable_static` applied to the internal `DefId`
+  returned by `rustc_internal::internal(tcx, item.def_id())`, since
+  `rustc_public::ItemKind::Static` is a payload-less variant.
+  Statics and consts are walked unconditionally regardless of
+  `verify_roots` — those rules (PB018, PB021, PB022) are
+  project-level and reject any such item in the local crate,
+  independent of which (if any) function reads them. The `exclude`
+  filter still applies for skipping specific item paths by name.
 - ✅ Filename side-channel for SARIF artifactLocation URIs (Task F).
   Shadow `Span::file` is an opaque u32 hash (Copy-friendly, no
   owned strings); `adapter::span` populates a thread-local

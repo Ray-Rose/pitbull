@@ -277,16 +277,20 @@ impl PitbullCallbacks {
                     visitor.visit_body(&shadow_body, /*trusted=*/ false);
                 }
                 rustc_public::ItemKind::Static => {
-                    // verify_roots patterns are authored for callable
-                    // function paths (e.g. `mycrate::foo::*`). Matching
-                    // them against a `static FOO` path is semantically
-                    // odd and would silently drop most users' statics.
-                    // Walk statics only in the open-walk fallback
-                    // (verify_roots empty).
-                    if !verify_roots.is_empty() {
-                        filtered_out += 1;
-                        continue;
-                    }
+                    // `verify_roots` is a reachability-closure filter
+                    // for fn items — it picks the set of bodies whose
+                    // *call closure* gets walked. It does NOT apply to
+                    // project-level items like statics: PB018 (`static
+                    // mut`), PB021 (interior-mutable static),
+                    // PB022 (forbidden static types) all reject ANY
+                    // such item in the local crate regardless of which
+                    // fn (if any) reads it. Earlier (Task E) this arm
+                    // skipped statics when verify_roots was non-empty,
+                    // which silently reintroduced the very PB018 hole
+                    // Task E was meant to close (audit finding C1).
+                    // The `exclude` filter at the top of the loop
+                    // still applies for users who want to skip
+                    // specific item paths by name.
                     let internal_id = rustc_public::rustc_internal::internal(
                         tcx,
                         item.def_id(),
@@ -304,10 +308,8 @@ impl PitbullCallbacks {
                     );
                 }
                 rustc_public::ItemKind::Const => {
-                    if !verify_roots.is_empty() {
-                        filtered_out += 1;
-                        continue;
-                    }
+                    // Same rationale as Static above — consts are
+                    // project-level items; verify_roots doesn't apply.
                     let shadow_ty =
                         pitbull_subset::mir_api::adapter::ty(item.ty());
                     let shadow_span =

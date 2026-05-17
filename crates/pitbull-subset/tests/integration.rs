@@ -293,6 +293,15 @@ fn strip_pitbull_attrs(source: &str) -> String {
 }
 /// Compile one corpus file via the wrapper and return its stderr.
 fn run_one_corpus_file(env: &E2eEnv, path: &Path) -> Result<String, String> {
+    run_one_corpus_file_with_env(env, path, &[])
+}
+/// Compile one corpus file via the wrapper with additional env vars
+/// (PITBULL_TOML, etc.) and return its stderr.
+fn run_one_corpus_file_with_env(
+    env: &E2eEnv,
+    path: &Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> Result<String, String> {
     let source =
         fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let stripped = strip_pitbull_attrs(&source);
@@ -318,8 +327,8 @@ fn run_one_corpus_file(env: &E2eEnv, path: &Path) -> Result<String, String> {
     // missing `main` is not an error).
     let mut output_artifact = std::env::temp_dir();
     output_artifact.push(format!("pitbull-corpus-out-{}.rmeta", std::process::id()));
-    let output = std::process::Command::new(&env.wrapper)
-        .arg("--sysroot")
+    let mut cmd = std::process::Command::new(&env.wrapper);
+    cmd.arg("--sysroot")
         .arg(&env.nightly_sysroot)
         .arg("--edition=2021")
         .arg("--crate-type=lib")
@@ -328,9 +337,11 @@ fn run_one_corpus_file(env: &E2eEnv, path: &Path) -> Result<String, String> {
         .arg(&output_artifact)
         .arg(&temp_dir)
         .env("PATH", &new_path)
-        .env("CARGO_PKG_NAME", "corpus_test")
-        .output()
-        .map_err(|e| format!("spawn wrapper: {e}"))?;
+        .env("CARGO_PKG_NAME", "corpus_test");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().map_err(|e| format!("spawn wrapper: {e}"))?;
     // Best-effort cleanup; ignore errors.
     let _ = fs::remove_file(&temp_dir);
     let _ = fs::remove_file(&output_artifact);
@@ -341,4 +352,61 @@ fn run_one_corpus_file(env: &E2eEnv, path: &Path) -> Result<String, String> {
     // unknown crate `pitbull`) — surface that as part of stderr for the
     // assertion to handle.
     Ok(stderr)
+}
+/// Regression test for audit finding C1: when `pitbull.toml` sets
+/// `verify_roots` to a pattern that does not match any item in the
+/// crate under test, statics and consts must STILL be walked. The
+/// `verify_roots` filter is a reachability closure for fn items only;
+/// item-level rules (PB018 `static mut`, PB021 interior-mutable
+/// static, PB022 forbidden static type) apply unconditionally to all
+/// statics/consts in the local crate.
+///
+/// Before the C1 fix, the wrapper's Static/Const arms short-circuited
+/// when `verify_roots` was non-empty, silently re-opening the PB018
+/// hole Task E was meant to close. This test pins the corrected
+/// behavior.
+#[test]
+fn verify_roots_does_not_skip_pb018_on_statics() {
+    let Some(env) = E2eEnv::probe() else {
+        let require = std::env::var_os("PITBULL_REQUIRE_E2E").is_some();
+        if require {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "verify_roots_does_not_skip_pb018_on_statics: SKIPPED — prerequisites missing.",
+        );
+        return;
+    };
+    // Minimal pitbull.toml with verify_roots set to a pattern that
+    // can't match anything in PB018_static_mut.rs (the corpus file's
+    // fn is named `get_and_increment`, not `nothing`).
+    let mut config_path = std::env::temp_dir();
+    config_path.push(format!("pitbull-c1-regression-{}.toml", std::process::id()));
+    let config_text = "\
+[project]
+name = \"corpus_test\"
+toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"
+
+[reachability]
+verify_roots = [\"nonexistent_crate::nothing\"]
+";
+    fs::write(&config_path, config_text)
+        .expect("write temp pitbull.toml for C1 regression test");
+    let corpus = Path::new("tests")
+        .join("corpus")
+        .join("reject")
+        .join("PB018_static_mut.rs");
+    let result = run_one_corpus_file_with_env(
+        &env,
+        &corpus,
+        &[("PITBULL_TOML", config_path.as_os_str())],
+    );
+    let _ = fs::remove_file(&config_path);
+    let stderr = result.expect("wrapper should run");
+    assert!(
+        stderr.contains("PB018"),
+        "C1 regression: PB018 must fire on `static mut` even when \
+         verify_roots is set to a non-matching fn pattern, but stderr \
+         did not contain PB018:\n{stderr}",
+    );
 }
