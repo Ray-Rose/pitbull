@@ -109,35 +109,54 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
         Err(e) => return SolverResult::Error(format!("wait z3: {e}")),
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let first_line = stdout
+    // Audit hardening (red-team finding F9): a well-formed problem
+    // produces EXACTLY ONE verdict line. Multiple verdicts mean
+    // either (a) an injected `(check-sat)` directive snuck through
+    // (predicate.rs::validate_assertion_form should block this) or
+    // (b) the problem text has multiple check-sat directives by
+    // design (which we don't emit). In either case, we refuse to
+    // pick a verdict — surface the issue as an Error so the wrapper
+    // reports the obligation as undischarged.
+    let verdict_lines: Vec<&str> = stdout
         .lines()
         .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    match first_line {
-        "sat" => SolverResult::Sat,
-        "unsat" => SolverResult::Unsat,
-        "unknown" => SolverResult::Unknown,
-        "timeout" => SolverResult::Timeout,
-        other => {
-            // Z3 sometimes prints a (model ...) block after sat;
-            // sometimes prints "(error ...)" on syntax issues.
-            // Surface what we got so a caller can diagnose.
-            if other.contains("error") {
-                SolverResult::Error(other.to_string())
-            } else if output.status.success() {
-                // Empty stdout + clean exit: probably a malformed
-                // problem that Z3 silently rejected.
+        .filter(|l| matches!(*l, "sat" | "unsat" | "unknown" | "timeout"))
+        .collect();
+    match verdict_lines.as_slice() {
+        ["sat"] => SolverResult::Sat,
+        ["unsat"] => SolverResult::Unsat,
+        ["unknown"] => SolverResult::Unknown,
+        ["timeout"] => SolverResult::Timeout,
+        [] => {
+            // No verdict line at all. Inspect the rest of the
+            // output to characterize the failure for the auditor.
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            if stdout.contains("error") || stderr_str.contains("error") {
                 SolverResult::Error(format!(
-                    "no verdict from z3 (stdout: {stdout:?}, stderr: {:?})",
-                    String::from_utf8_lossy(&output.stderr),
+                    "z3 emitted no verdict; output contained errors. \
+                     stdout: {stdout:?}, stderr: {stderr_str:?}",
+                ))
+            } else if output.status.success() {
+                SolverResult::Error(format!(
+                    "no verdict from z3 (stdout: {stdout:?}, stderr: {stderr_str:?})",
                 ))
             } else {
                 SolverResult::Error(format!(
-                    "z3 exited {:?} with output: {stdout}",
+                    "z3 exited {:?} with no verdict in output: {stdout}",
                     output.status.code(),
                 ))
             }
+        }
+        many => {
+            // Multiple verdicts — refuse to interpret. This is the
+            // F9 defense: an attacker who plants a pre-emit
+            // `(check-sat)` directive intends to confuse our parser
+            // into picking the WRONG verdict.
+            SolverResult::Error(format!(
+                "z3 emitted {} verdict lines (expected exactly 1); \
+                 refusing to interpret. Verdicts: {many:?}",
+                many.len(),
+            ))
         }
     }
 }
@@ -203,6 +222,38 @@ mod tests {
             }
             other => panic!(
                 "expected Sat (overflow witness exists) or NotInstalled; got {other:?}",
+            ),
+        }
+    }
+    /// Audit hardening (red-team F9): a problem with TWO check-sat
+    /// directives (which can happen if a multi-directive injection
+    /// somehow slipped through pitbull-subset's validator) must be
+    /// REFUSED as Error, not silently interpreted as the first or
+    /// last verdict.
+    ///
+    /// pitbull-subset's `validate_assertion_form` should normally
+    /// block this upstream; this test pins the defense-in-depth
+    /// behavior at the solver layer.
+    #[test]
+    fn multiple_verdict_lines_refused() {
+        let problem = "(set-logic QF_BV)\n\
+                       (declare-const x (_ BitVec 32))\n\
+                       (assert (= x #x00000001))\n\
+                       (check-sat)\n\
+                       (assert (= x #x00000002))\n\
+                       (check-sat)\n";
+        match invoke_z3_with_timeout(problem, Duration::from_secs(5)) {
+            SolverResult::Error(msg) => {
+                assert!(
+                    msg.contains("verdict lines") || msg.contains("expected exactly 1"),
+                    "Error should explain the verdict-count problem; got {msg}",
+                );
+            }
+            SolverResult::NotInstalled => {
+                eprintln!("multiple_verdict_lines_refused: SKIPPED — z3 not installed.");
+            }
+            other => panic!(
+                "expected Error (refuse multi-verdict) or NotInstalled; got {other:?}",
             ),
         }
     }

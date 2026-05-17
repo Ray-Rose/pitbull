@@ -177,6 +177,116 @@ fn parse_ident(s: &str) -> Option<String> {
 fn parse_int(s: &str) -> Option<i128> {
     s.parse::<i128>().ok()
 }
+/// Failure mode for `validate_assertion_form` — the lex validator
+/// the visitor runs on raw-SMT-LIB precondition strings (the
+/// O.1 escape hatch). v0.2 red-team finding F2: a maliciously
+/// crafted assumption could carry multiple top-level directives
+/// (`"(check-sat) (assert false)"`) that subvert the wrapper's
+/// solver-verdict interpretation. The validator forces every
+/// raw assumption to be exactly one `(assert ...)` form with
+/// balanced parens and nothing else — strings or comments are
+/// rejected to avoid lexer ambiguity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssertionFormError {
+    /// Input was empty or whitespace.
+    Empty,
+    /// First non-whitespace token wasn't `(assert`.
+    NotAssertForm,
+    /// Parens don't balance (too many opens or too many closes).
+    UnbalancedParens,
+    /// Multiple top-level directives — content appears after the
+    /// first balanced close. Defeats the multi-directive injection
+    /// path documented in the v0.2 red-team.
+    MultipleDirectives,
+    /// Contains a `"` character — string-literal handling would
+    /// require a proper tokenizer (parens inside strings don't
+    /// nest). Rejected for now.
+    StringLiteralNotSupported,
+    /// Contains a `;` character — SMT-LIB comments could mask
+    /// paren imbalance. Rejected for now.
+    CommentNotSupported,
+}
+impl std::fmt::Display for AssertionFormError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "empty or whitespace-only"),
+            Self::NotAssertForm => write!(f, "must start with `(assert`"),
+            Self::UnbalancedParens => write!(f, "parens not balanced"),
+            Self::MultipleDirectives => write!(f, "must be exactly one top-level directive"),
+            Self::StringLiteralNotSupported => write!(f, "string literals not supported"),
+            Self::CommentNotSupported => write!(f, "comments not supported"),
+        }
+    }
+}
+impl std::error::Error for AssertionFormError {}
+/// Lex-validate a raw assumption string as a single SMT-LIB 2
+/// `(assert ...)` directive.
+///
+/// This is a deliberate restriction, narrower than the SMT-LIB
+/// grammar: the validator rejects string literals (`"..."`) and
+/// comments (`;...`) outright. Real Pitbull assumptions never
+/// need either — predicate-translated forms are
+/// `(assert (bvXXX lhs|rhs #x...))` and human-written
+/// assumptions for our use case are similar bit-vector
+/// constraints. The narrow grammar makes paren-balancing
+/// unambiguous and forecloses the multi-directive injection
+/// vector (red-team finding F2).
+///
+/// Returns `Ok(())` for valid input, otherwise a specific error
+/// that the caller surfaces to the auditor.
+pub fn validate_assertion_form(s: &str) -> Result<(), AssertionFormError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(AssertionFormError::Empty);
+    }
+    // Reject string literals and comments wholesale — they require
+    // tokenizer state we don't have, and they aren't needed for
+    // Pitbull's bit-vector assumption shapes.
+    if trimmed.contains('"') {
+        return Err(AssertionFormError::StringLiteralNotSupported);
+    }
+    if trimmed.contains(';') {
+        return Err(AssertionFormError::CommentNotSupported);
+    }
+    if !trimmed.starts_with("(assert") {
+        return Err(AssertionFormError::NotAssertForm);
+    }
+    // After `(assert` the next char must be whitespace or `(` so
+    // we don't accidentally accept `(assertion ...)` or similar.
+    let after_keyword = &trimmed["(assert".len()..];
+    match after_keyword.chars().next() {
+        Some(c) if c.is_whitespace() || c == '(' => {}
+        _ => return Err(AssertionFormError::NotAssertForm),
+    }
+    // Paren-balance scan. The first balanced close ends the
+    // single top-level directive; anything after must be
+    // whitespace only.
+    let mut depth: i32 = 0;
+    let mut closed_at: Option<usize> = None;
+    for (idx, ch) in trimmed.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(AssertionFormError::UnbalancedParens);
+                }
+                if depth == 0 && closed_at.is_none() {
+                    closed_at = Some(idx + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(AssertionFormError::UnbalancedParens);
+    }
+    let end = closed_at.ok_or(AssertionFormError::UnbalancedParens)?;
+    if !trimmed[end..].trim().is_empty() {
+        return Err(AssertionFormError::MultipleDirectives);
+    }
+    Ok(())
+}
 /// Translation failure for `predicate_to_smt_assertion`. The
 /// caller surfaces this as an audit note (silent rejection is
 /// the anti-pattern the v0.1 audit forbids).
@@ -548,5 +658,93 @@ mod tests {
         let smt = predicate_to_smt_assertion(&p, "rhs", "u32")
             .expect("rhs label");
         assert_eq!(smt, "(assert (bvult rhs #x00000064))");
+    }
+    // ----- assertion-form validator (red-team F2) ---------------------
+    /// Predicate-translated forms always validate. Pin a few.
+    #[test]
+    fn validate_accepts_predicate_translated_forms() {
+        for ok in [
+            "(assert (bvult lhs #x00000064))",
+            "(assert (bvsgt rhs #xFFFFFFFF))",
+            "(assert (= lhs #x00000042))",
+            "(assert (distinct rhs #x00000007))",
+            "(assert (bvule lhs (_ bv1 32)))",
+            "  (assert (bvult lhs #x64))  ",   // surrounding whitespace
+        ] {
+            assert!(
+                validate_assertion_form(ok).is_ok(),
+                "valid assumption rejected: {ok:?}",
+            );
+        }
+    }
+    /// The red-team attack vector: multi-directive injection. Each
+    /// of these would have leaked through O.1's verbatim splice.
+    #[test]
+    fn validate_rejects_multi_directive_injection() {
+        for bad in [
+            "(check-sat) (assert false)",
+            "(assert false) (check-sat)",
+            "(assert (bvult lhs #x64)) (assert false)",
+            "(push) (assert false) (pop)",
+            "(define-fun evil () Bool false) (assert evil)",
+        ] {
+            let err = validate_assertion_form(bad).expect_err(bad);
+            assert!(
+                matches!(
+                    err,
+                    AssertionFormError::MultipleDirectives
+                        | AssertionFormError::NotAssertForm,
+                ),
+                "multi-directive `{bad:?}` should be rejected; got {err:?}",
+            );
+        }
+    }
+    /// Unbalanced parens — defeats one form of paren-spoofing.
+    #[test]
+    fn validate_rejects_unbalanced_parens() {
+        for bad in [
+            "(assert (bvult lhs #x64)",   // one too few closes
+            "(assert (bvult lhs #x64)))", // one too many closes
+            "(assert ",                   // truncated
+            "assert (foo))",              // missing leading paren
+        ] {
+            assert!(
+                validate_assertion_form(bad).is_err(),
+                "unbalanced/malformed accepted: {bad:?}",
+            );
+        }
+    }
+    /// Strings and comments rejected — both create lex ambiguity
+    /// the simple validator can't handle. Real assumptions don't
+    /// need either.
+    #[test]
+    fn validate_rejects_strings_and_comments() {
+        assert!(matches!(
+            validate_assertion_form("(assert (= name \"foo\"))"),
+            Err(AssertionFormError::StringLiteralNotSupported),
+        ));
+        assert!(matches!(
+            validate_assertion_form("(assert true) ; trailing comment"),
+            Err(AssertionFormError::CommentNotSupported),
+        ));
+    }
+    /// `(assertion ...)` (typo-like) rejected because the keyword
+    /// must end before the next char.
+    #[test]
+    fn validate_rejects_assert_lookalike_keywords() {
+        for bad in ["(assertion 5)", "(assertfoo)", "(check-sat)"] {
+            let err = validate_assertion_form(bad).expect_err(bad);
+            assert!(matches!(err, AssertionFormError::NotAssertForm));
+        }
+    }
+    /// Empty input rejected.
+    #[test]
+    fn validate_rejects_empty() {
+        for bad in ["", "   ", "\t\n"] {
+            assert!(matches!(
+                validate_assertion_form(bad),
+                Err(AssertionFormError::Empty),
+            ));
+        }
     }
 }

@@ -1157,7 +1157,27 @@ impl<'cfg> SubsetVisitor<'cfg> {
         //      raw-SMT-LIB escape hatch.
         let lhs_arg = self.operand_arg_name(lhs);
         let rhs_arg = self.operand_arg_name(rhs);
-        let mut assumptions = Vec::with_capacity(self.current_body_preconditions.len());
+        // Collect assumptions for this obligation. Two paths:
+        //
+        //   1. Predicate-translated: the precondition parses as
+        //      `<ident> <cmp> <int>`, binds to an operand by name,
+        //      and translates to a properly-encoded BV assertion.
+        //   2. Raw-SMT-LIB escape hatch: predicate parsing failed,
+        //      but the string lex-validates as a single
+        //      `(assert ...)` form (paren-balanced, no strings,
+        //      no comments) — spliced verbatim.
+        //
+        // Anything else (multi-directive injection, unbalanced
+        // parens, etc.) is REFUSED with a loud audit note rather
+        // than silently spliced. This closes the v0.2 red-team
+        // finding F2: a malformed assumption could otherwise plant
+        // a contradictory hypothesis or subvert the solver verdict.
+        let mut assumptions: Vec<String> =
+            Vec::with_capacity(self.current_body_preconditions.len());
+        // Collect (raw_index, audit_message) tuples; emit after
+        // the obligation is pushed so notes report after their
+        // related obligation in stderr.
+        let mut pending_audit_notes: Vec<String> = Vec::new();
         for raw in &self.current_body_preconditions {
             let translated = match crate::predicate::parse_predicate(raw) {
                 Ok(pred) => {
@@ -1180,7 +1200,23 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 }
                 Err(_) => None,
             };
-            assumptions.push(translated.unwrap_or_else(|| raw.clone()));
+            match translated {
+                Some(smt) => assumptions.push(smt),
+                None => {
+                    // Predicate path failed. Try raw-SMT-LIB escape
+                    // hatch with lex validation.
+                    match crate::predicate::validate_assertion_form(raw) {
+                        Ok(()) => assumptions.push(raw.clone()),
+                        Err(e) => {
+                            pending_audit_notes.push(format!(
+                                "rejecting precondition (neither a valid predicate \
+                                 nor a single SMT-LIB `(assert ...)` form): {e} — \
+                                 input: {raw:?}",
+                            ));
+                        }
+                    }
+                }
+            }
         }
         self.vc_obligations.push(crate::vc::VcObligation {
             id,
@@ -1191,6 +1227,13 @@ impl<'cfg> SubsetVisitor<'cfg> {
             },
             assumptions,
         });
+        // Surface any preconditions we refused. The audit posture
+        // is "no silent skips" — if a config has a malformed
+        // assumption, the auditor learns about it via the report
+        // rather than the precondition silently vanishing.
+        for msg in pending_audit_notes {
+            self.audit_note(span, msg);
+        }
     }
     /// Emit a `PanicReachability` VC obligation for a panic call
     /// site. The visitor itself cannot prove unreachability —
@@ -1904,12 +1947,18 @@ mod tests {
              translate to an unsigned-less-than BV assertion",
         );
     }
-    /// O.2: precondition whose variable doesn't match any operand's
-    /// arg name falls through the predicate path and gets spliced
-    /// verbatim. This preserves O.1's escape hatch — users keep
-    /// hand-written SMT-LIB working.
+    /// O.2 + audit hardening (F2): a predicate-format precondition
+    /// whose variable doesn't match any operand is DROPPED with an
+    /// audit note — not silently spliced as raw SMT-LIB (which
+    /// would produce a solver error). The audit note makes the
+    /// rejection visible.
+    ///
+    /// The original O.2 test was named `unbound_predicate_falls_back_to_raw_splice`
+    /// — that name reflected the pre-hardening behavior. The new
+    /// posture is stricter: only well-formed single `(assert ...)`
+    /// SMT-LIB strings get the raw-splice escape hatch.
     #[test]
-    fn unbound_predicate_falls_back_to_raw_splice() {
+    fn unbound_predicate_dropped_with_audit_note() {
         use crate::mir_api::*;
         let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
         let body = Body {
@@ -1953,24 +2002,117 @@ mod tests {
         let cfg = SubsetConfig::default_for_test();
         let mut v = SubsetVisitor::new(&cfg);
         // Precondition mentions `x`, but neither operand is a Copy
-        // of param `x` — both are constants. The predicate is
-        // parseable but unbindable; verbatim splice.
+        // of param `x` — both are constants. The predicate parses
+        // OK but cannot bind to any operand. The raw-splice fallback
+        // requires `(assert ...)` form, so the predicate-format
+        // `"x < 100"` doesn't qualify and is dropped with an audit
+        // note rather than spliced.
         v.set_current_preconditions(vec!["x < 100".into()]);
         v.visit_body(&body, false);
         let report = v.into_report();
         assert_eq!(report.vc_obligations.len(), 1);
-        assert_eq!(
-            report.vc_obligations[0].assumptions,
-            vec!["x < 100".to_string()],
-            "unbound predicate must be spliced raw (the o.1 escape \
-             hatch); got {:?}",
+        assert!(
+            report.vc_obligations[0].assumptions.is_empty(),
+            "unbound predicate must be DROPPED (not spliced as \
+             malformed SMT-LIB); got assumptions={:?}",
             report.vc_obligations[0].assumptions,
         );
+        assert!(
+            report.audit_notes.iter().any(|n|
+                n.message.contains("rejecting precondition")
+            ),
+            "rejection should be surfaced as an audit note; got {:?}",
+            report.audit_notes,
+        );
+    }
+    /// Audit hardening (F2 red-team): a malicious precondition
+    /// containing multiple SMT-LIB directives is REFUSED — the
+    /// raw-splice escape hatch lex-validates the input as a
+    /// single `(assert ...)` form. The rejection produces an
+    /// audit note so the auditor sees the attempt.
+    ///
+    /// Without this guard, splicing `"(check-sat) (assert false)"`
+    /// would let an attacker (e.g. a maintainer-PR with malicious
+    /// pitbull.toml additions) plant contradictory hypotheses or
+    /// pre-emit a verdict that the wrapper's parser then misreads.
+    #[test]
+    fn multi_directive_injection_rejected() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone()],
+            arg_names: vec!["x".into()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        // Each of these has been chosen to model a specific attack
+        // vector documented in the v0.2 red-team finding F2.
+        let attacks = [
+            "(check-sat) (assert false)",       // pre-emit verdict + poison
+            "(assert false) (check-sat)",       // poison + verdict
+            "(push) (assert false) (pop)",      // scoped poison
+            "(define-fun evil () Bool false)",  // stealth definition
+        ];
+        v.set_current_preconditions(attacks.iter().map(|s| s.to_string()).collect());
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        assert!(
+            report.vc_obligations[0].assumptions.is_empty(),
+            "EVERY malicious assumption must be refused; got {:?}",
+            report.vc_obligations[0].assumptions,
+        );
+        // Each attack should have produced its own audit note.
+        assert_eq!(
+            report.audit_notes.len(),
+            attacks.len(),
+            "expected one audit note per refused assumption; got {} notes for {} attacks",
+            report.audit_notes.len(),
+            attacks.len(),
+        );
+        for note in &report.audit_notes {
+            assert!(
+                note.message.contains("rejecting precondition"),
+                "audit note should call out the rejection; got {:?}",
+                note.message,
+            );
+        }
     }
     /// O.2: raw SMT-LIB strings (which fail predicate parsing
     /// because they don't have a bare comparison operator) flow
     /// through unchanged. Preserves O.1 behavior for users with
-    /// hand-written SMT.
+    /// hand-written SMT — but only for valid single-`(assert ...)`
+    /// forms (audit hardening F2).
     #[test]
     fn raw_smt_lib_precondition_unchanged() {
         use crate::mir_api::*;
