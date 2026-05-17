@@ -459,6 +459,60 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) {
             undischarged += 1;
             continue;
         };
+        // Soundness guard (red-team F1): if assumptions are
+        // present, FIRST verify they are jointly satisfiable.
+        // Contradictory preconditions (`(assert false)`, mutually
+        // exclusive constraints, etc.) would make the main check
+        // vacuously unsat — silently "verifying" unsafe code. By
+        // running the consistency check first and treating its
+        // `Unsat` as a hard refusal, we close that hole.
+        //
+        // The consistency check is omitted when there are zero
+        // assumptions (trivially consistent — see compile()).
+        if let Some(cs_smt) = &goal.consistency_check {
+            match pitbull_vc::solver::invoke_z3(cs_smt) {
+                pitbull_vc::SolverResult::Unsat => {
+                    eprintln!(
+                        "pitbull-rustc: vc {}: REFUSED — preconditions are \
+                         contradictory (sat-check returned unsat); a discharge \
+                         claim here would be vacuously true",
+                        obligation.id,
+                    );
+                    undischarged += 1;
+                    continue;
+                }
+                pitbull_vc::SolverResult::NotInstalled => {
+                    // Solver missing — same behavior as the main
+                    // dispatch handles below; fall through to let
+                    // the main check report it once.
+                }
+                pitbull_vc::SolverResult::Sat | pitbull_vc::SolverResult::Unknown => {
+                    // Sat (or Unknown) means the assumptions are
+                    // not provably contradictory — proceed to the
+                    // main check. Unknown is conservative: we
+                    // assume the assumptions COULD be satisfiable
+                    // and let the main check decide.
+                }
+                pitbull_vc::SolverResult::Timeout => {
+                    eprintln!(
+                        "pitbull-rustc: vc {}: undischarged (consistency check \
+                         timed out — assumption set may be too complex)",
+                        obligation.id,
+                    );
+                    undischarged += 1;
+                    continue;
+                }
+                pitbull_vc::SolverResult::Error(e) => {
+                    eprintln!(
+                        "pitbull-rustc: vc {}: undischarged (consistency check \
+                         solver error: {e})",
+                        obligation.id,
+                    );
+                    undischarged += 1;
+                    continue;
+                }
+            }
+        }
         match pitbull_vc::solver::invoke_z3(&goal.smt) {
             pitbull_vc::SolverResult::Unsat => {
                 eprintln!(

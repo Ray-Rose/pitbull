@@ -85,17 +85,51 @@ impl IntInfo {
 pub fn emit_overflow_problem(ty_name: &str, op: ArithOp) -> Option<String> {
     emit_overflow_problem_with_assumptions(ty_name, op, &[])
 }
+/// Emit a SAT-CHECK-ONLY problem for the given assumptions: just
+/// the declarations + each assumption + `(check-sat)`. NO safety
+/// predicate, NO negation.
+///
+/// Used as a precondition-consistency guard (red-team finding F1):
+/// if the solver returns `unsat` here, the assumptions are
+/// LOGICALLY CONTRADICTORY. Under contradictory hypotheses, the
+/// main check-sat would also return unsat for any safety
+/// property — silently "proving" the code safe via vacuous
+/// implication. The dispatch layer refuses to claim discharge
+/// when this consistency check is unsat.
+///
+/// Returns `None` for unsupported types (matching the rest of the
+/// module's behavior).
+#[must_use]
+pub fn emit_consistency_check(
+    ty_name: &str,
+    assumptions: &[String],
+) -> Option<String> {
+    let info = IntInfo::from_name(ty_name)?;
+    let bits = info.bits;
+    let mut smt = format!(
+        "(set-logic QF_BV)\n\
+         (declare-const lhs (_ BitVec {bits}))\n\
+         (declare-const rhs (_ BitVec {bits}))\n",
+    );
+    for assumption in assumptions {
+        smt.push_str(assumption);
+        if !assumption.ends_with('\n') {
+            smt.push('\n');
+        }
+    }
+    smt.push_str("(check-sat)\n");
+    Some(smt)
+}
 /// Same as `emit_overflow_problem`, but each entry in `assumptions`
 /// is spliced verbatim into the problem (between the variable
 /// declarations and the overflow predicate). The assumptions
 /// arrive from `VcObligation.assumptions`, ultimately rooted in
 /// `pitbull.toml`'s `[verification.preconditions]` table.
 ///
-/// Each assumption must be a complete SMT-LIB 2 directive — i.e.
-/// the full `(assert ...)` form, not just the predicate body.
-/// Splicing verbatim means a malformed assumption shows up as a
-/// solver `(error ...)` rather than a panic here; the wrapper
-/// surfaces that distinctly so the auditor sees the cause.
+/// Each assumption must already pass
+/// `pitbull_subset::predicate::validate_assertion_form` — that's
+/// the visitor's job upstream, and it ensures each string is a
+/// single balanced-paren `(assert ...)` directive.
 ///
 /// Ordering: assumptions appear BEFORE the overflow predicate.
 /// SMT-LIB asserts are conjunctive, so the solver gets the
