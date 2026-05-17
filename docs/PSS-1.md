@@ -520,6 +520,43 @@ the std form and now also matches. No shadow type changes.
   Wrapper now writes SARIF JSON to the path in `PITBULL_SARIF_OUT`
   when that env var is set; each invocation overwrites — multi-crate
   aggregation is a follow-up for the `cargo pitbull check` subcommand.
+- ✅ Spec-context narrowing — foundation (Task O.1). Threads
+  spec-derived preconditions through the visitor → VC obligation →
+  SMT-LIB pipeline. The first commit of three staged steps toward
+  `#[pitbull::requires(...)]` end-to-end.
+  Posture today: `[verification.preconditions]` in `pitbull.toml`
+  accepts raw SMT-LIB `(assert ...)` directives per function path.
+  Pieces wired:
+    * `pitbull_subset::vc::VcObligation.assumptions: Vec<String>`
+      with `#[serde(skip_serializing_if = "Vec::is_empty")]`.
+    * `SubsetConfig.verification.preconditions: BTreeMap<String,
+      Vec<String>>` deserialized from TOML.
+    * `SubsetVisitor::set_current_preconditions` /
+      `clear_current_preconditions`. `maybe_emit_overflow_obligation`
+      attaches the current list to every obligation it emits.
+    * `pitbull-rustc.rs`: per-item lookup by `CrateDef::name()` →
+      `set_current_preconditions(...)` before each `visit_body`.
+    * `pitbull_vc::compile` and `pitbull_vc::smt::emit_overflow_problem_with_assumptions`
+      splice each assumption verbatim into the SMT-LIB problem
+      *before* the safety predicate, so the solver gets them as
+      hypotheses.
+
+  Layered tests pin each handoff:
+    * `config::tests::preconditions_table_round_trips_from_toml`
+    * `config::tests::preconditions_table_optional` (backward compat)
+    * `vc::tests::obligation_with_assumptions_round_trips`
+    * `visitor::tests::preconditions_propagate_to_obligation_assumptions`
+    * `visitor::tests::clearing_preconditions_makes_assumptions_empty`
+    * `pitbull_vc::vc::tests::compile_incorporates_assumptions`
+
+  Smoke (Z3 not installed on dev machine): `add_one(x: u32) -> u32 {
+  x + 1 }` with `"corpus_test::add_one" = ["(assert (bvult lhs
+  #x00000064))"]` in pitbull.toml produces one VC with the
+  assumption attached; wrapper reports "undischarged (no solver)"
+  cleanly. On a machine with Z3 in PATH the verdict flows through
+  the normal match arms. The UX is intentionally crude in O.1
+  (users hand-write SMT-LIB and track operand positions) — O.2
+  introduces the Rust-like predicate grammar that fixes both.
 - ✅ v0.2 deductive backend spine: end-to-end VC dispatch (Task N).
   Wires the visitor → `pitbull-vc` → external SMT solver loop that
   makes "deductive verifier" literally true for the first time:

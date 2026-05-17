@@ -83,6 +83,29 @@ impl IntInfo {
 /// (Division/remainder/shift overflow predicates land in a follow-up.)
 #[must_use]
 pub fn emit_overflow_problem(ty_name: &str, op: ArithOp) -> Option<String> {
+    emit_overflow_problem_with_assumptions(ty_name, op, &[])
+}
+/// Same as `emit_overflow_problem`, but each entry in `assumptions`
+/// is spliced verbatim into the problem (between the variable
+/// declarations and the overflow predicate). The assumptions
+/// arrive from `VcObligation.assumptions`, ultimately rooted in
+/// `pitbull.toml`'s `[verification.preconditions]` table.
+///
+/// Each assumption must be a complete SMT-LIB 2 directive — i.e.
+/// the full `(assert ...)` form, not just the predicate body.
+/// Splicing verbatim means a malformed assumption shows up as a
+/// solver `(error ...)` rather than a panic here; the wrapper
+/// surfaces that distinctly so the auditor sees the cause.
+///
+/// Ordering: assumptions appear BEFORE the overflow predicate.
+/// SMT-LIB asserts are conjunctive, so the solver gets the
+/// preconditions as hypotheses when checking the obligation.
+#[must_use]
+pub fn emit_overflow_problem_with_assumptions(
+    ty_name: &str,
+    op: ArithOp,
+    assumptions: &[String],
+) -> Option<String> {
     let info = IntInfo::from_name(ty_name)?;
     let overflow_predicate = match (op, info.signed) {
         (ArithOp::Add, false) => "bvuaddo",
@@ -99,13 +122,22 @@ pub fn emit_overflow_problem(ty_name: &str, op: ArithOp) -> Option<String> {
     let bits = info.bits;
     // QF_BV: quantifier-free bit-vector logic, the decidable
     // fragment Z3 and CVC5 both handle natively.
-    Some(format!(
+    let mut smt = format!(
         "(set-logic QF_BV)\n\
          (declare-const lhs (_ BitVec {bits}))\n\
-         (declare-const rhs (_ BitVec {bits}))\n\
-         (assert ({overflow_predicate} lhs rhs))\n\
-         (check-sat)\n"
-    ))
+         (declare-const rhs (_ BitVec {bits}))\n",
+    );
+    for assumption in assumptions {
+        smt.push_str(assumption);
+        if !assumption.ends_with('\n') {
+            smt.push('\n');
+        }
+    }
+    smt.push_str(&format!(
+        "(assert ({overflow_predicate} lhs rhs))\n\
+         (check-sat)\n",
+    ));
+    Some(smt)
 }
 #[cfg(test)]
 mod tests {

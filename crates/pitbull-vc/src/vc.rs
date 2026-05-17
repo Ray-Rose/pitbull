@@ -34,7 +34,11 @@ pub struct VcGoal {
 pub fn compile(obligation: &VcObligation) -> Option<VcGoal> {
     let smt = match &obligation.kind {
         VcObligationKind::ArithmeticOverflow { op, ty_name } => {
-            crate::smt::emit_overflow_problem(ty_name, *op)?
+            crate::smt::emit_overflow_problem_with_assumptions(
+                ty_name,
+                *op,
+                &obligation.assumptions,
+            )?
         }
         // The following kinds need richer encodings than bit-vector
         // arithmetic alone — path-sensitive symbolic execution,
@@ -63,6 +67,7 @@ mod tests {
                 op: ArithOp::Add,
                 ty_name: "u32".into(),
             },
+            assumptions: Vec::new(),
         };
         let goal = compile(&obligation).expect("u32 + supported");
         assert_eq!(goal.obligation, obligation);
@@ -76,6 +81,7 @@ mod tests {
             id: "pb043-panic-0".into(),
             span: Span::default(),
             kind: VcObligationKind::PanicReachability,
+            assumptions: Vec::new(),
         };
         assert!(
             compile(&obligation).is_none(),
@@ -92,11 +98,50 @@ mod tests {
                     op: ArithOp::Mul,
                     ty_name: "i64".into(),
                 },
+                assumptions: Vec::new(),
             },
             smt: "(check-sat)".into(),
         };
         let s = serde_json::to_string(&goal).expect("serialize");
         let back: VcGoal = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, goal);
+    }
+    /// O.1 wiring: when the obligation carries assumptions, the
+    /// compiled SMT-LIB includes each one as a separate assertion
+    /// inserted BEFORE the safety predicate. Order preserved.
+    #[test]
+    fn compile_incorporates_assumptions() {
+        let obligation = VcObligation {
+            id: "pb049-add-2".into(),
+            span: Span::default(),
+            kind: VcObligationKind::ArithmeticOverflow {
+                op: ArithOp::Add,
+                ty_name: "u32".into(),
+            },
+            assumptions: vec![
+                "(assert (bvult lhs #x00000064))".into(),
+                "(assert (bvult rhs #x00000064))".into(),
+            ],
+        };
+        let goal = compile(&obligation).expect("u32 + supported");
+        assert!(
+            goal.smt.contains("(assert (bvult lhs #x00000064))"),
+            "first assumption should appear verbatim; got:\n{}",
+            goal.smt,
+        );
+        assert!(
+            goal.smt.contains("(assert (bvult rhs #x00000064))"),
+            "second assumption should appear verbatim; got:\n{}",
+            goal.smt,
+        );
+        // The overflow predicate is the LAST assertion (the
+        // negated safety property the solver tries to falsify).
+        let safety_idx = goal.smt.find("(assert (bvuaddo lhs rhs))").expect("safety assertion");
+        let first_idx = goal.smt.find("(assert (bvult lhs #x00000064))").expect("first assumption");
+        assert!(
+            first_idx < safety_idx,
+            "assumptions must come before the safety predicate so the \
+             solver has them as hypotheses; first={first_idx}, safety={safety_idx}",
+        );
     }
 }

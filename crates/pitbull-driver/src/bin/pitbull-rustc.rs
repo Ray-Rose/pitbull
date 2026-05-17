@@ -271,6 +271,21 @@ impl PitbullCallbacks {
                         pitbull_subset::mir_api::adapter::body(&real_body);
                     self.bodies_walked += 1;
                     walked += 1;
+                    // O.1: install spec-derived preconditions for
+                    // this body so VC obligations emitted from its
+                    // walk carry the assumptions. The lookup uses
+                    // the item's full path (via CrateDef::name)
+                    // against `[verification.preconditions]` in
+                    // pitbull.toml. Bodies not in the map get an
+                    // empty list — explicit "clear" so prior body's
+                    // preconditions don't leak across the loop.
+                    let preconditions = cfg
+                        .verification
+                        .preconditions
+                        .get(&item_path)
+                        .cloned()
+                        .unwrap_or_default();
+                    visitor.set_current_preconditions(preconditions);
                     // All bodies are walked as untrusted in v0.2. Trust
                     // marking requires the proc-macro / attribute plumbing
                     // described in the doc comment above.

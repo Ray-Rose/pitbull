@@ -105,6 +105,15 @@ pub struct SubsetVisitor<'cfg> {
     /// a type. Cleared between bodies via the next `visit_body`
     /// overwriting it.
     current_body_locals: Vec<crate::mir_api::LocalDecl>,
+    /// Spec-derived preconditions for the currently-walked body —
+    /// raw SMT-LIB assertion forms that get attached as
+    /// `assumptions` to every VC obligation this body emits. Set
+    /// externally before each `visit_body` via
+    /// `set_current_preconditions`; left as-is across
+    /// `visit_body` invocations, so the caller is responsible for
+    /// updating between bodies (typical pattern: per-item lookup
+    /// in `pitbull.toml`'s `[verification.preconditions]` table).
+    current_body_preconditions: Vec<String>,
     /// Whether the current body has been declared `#[pitbull::trusted]`.
     /// Trusted bodies are exempt from body-level checks but their *signatures*
     /// are still subject to PSS-1.
@@ -123,9 +132,26 @@ impl<'cfg> SubsetVisitor<'cfg> {
             audit_notes: Vec::new(),
             vc_obligations: Vec::new(),
             current_body_locals: Vec::new(),
+            current_body_preconditions: Vec::new(),
             current_body_trusted: false,
             in_spec_context: false,
         }
+    }
+    /// Install the precondition list for the next `visit_body`
+    /// call. The wrapper looks up the item being walked in
+    /// `pitbull.toml`'s `[verification.preconditions]` map and
+    /// passes the result here.
+    ///
+    /// Pass an empty vec (or call `clear_current_preconditions`)
+    /// between bodies that aren't in the config; otherwise the
+    /// previous body's preconditions leak across.
+    pub fn set_current_preconditions(&mut self, preconditions: Vec<String>) {
+        self.current_body_preconditions = preconditions;
+    }
+    /// Companion to `set_current_preconditions` for callers that
+    /// want to make the empty-state explicit at the call site.
+    pub fn clear_current_preconditions(&mut self) {
+        self.current_body_preconditions.clear();
     }
     /// Finalize the visit, producing a report. Transfers errors
     /// (subset violations), audit notes (informational gaps), and
@@ -1058,6 +1084,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
         }
         let seq = self.vc_obligations.len();
         let id = format!("pb049-{}-{}", arith_op.tag(), seq);
+        // Attach the current body's preconditions as SMT-LIB
+        // assumptions so the solver gets them as additional
+        // hypotheses. Cloned here because preconditions may be
+        // re-used across multiple obligations within the same body.
+        let assumptions = self.current_body_preconditions.clone();
         self.vc_obligations.push(crate::vc::VcObligation {
             id,
             span,
@@ -1065,6 +1096,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 op: arith_op,
                 ty_name: lhs_name,
             },
+            assumptions,
         });
     }
     /// Resolve an operand to a primitive integer type name (`"u32"`,
@@ -1485,6 +1517,133 @@ mod tests {
             report.vc_obligations[0].id.starts_with("pb049-add-"),
             "VC id should follow pb{{nnn}}-{{tag}}-{{seq}} format; got {:?}",
             report.vc_obligations[0].id,
+        );
+    }
+    /// O.1 regression: when the visitor has spec-derived
+    /// preconditions installed via `set_current_preconditions`,
+    /// every VC obligation it emits during the next `visit_body`
+    /// must carry those preconditions as `assumptions`. Pins the
+    /// contract for the wrapper → visitor → VcObligation handoff.
+    #[test]
+    fn preconditions_propagate_to_obligation_assumptions() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![LocalDecl {
+                ty: u32_ty.clone(),
+                span: Span::default(),
+                mutability: Mutability::Not,
+            }],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_preconditions(vec![
+            "(assert (bvult lhs #x00000064))".into(),
+        ]);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        assert_eq!(
+            report.vc_obligations[0].assumptions,
+            vec!["(assert (bvult lhs #x00000064))"],
+            "obligation should carry the installed preconditions verbatim",
+        );
+    }
+    /// O.1 hygiene: `clear_current_preconditions` (and the equivalent
+    /// empty `set`) wipes any prior installation, so a body without
+    /// preconditions emits obligations with empty `assumptions`.
+    #[test]
+    fn clearing_preconditions_makes_assumptions_empty() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let make_body = || Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![LocalDecl {
+                ty: u32_ty.clone(),
+                span: Span::default(),
+                mutability: Mutability::Not,
+            }],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Mul,
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        // First body: with preconditions.
+        v.set_current_preconditions(vec!["(assert true)".into()]);
+        v.visit_body(&make_body(), false);
+        // Second body: cleared.
+        v.clear_current_preconditions();
+        v.visit_body(&make_body(), false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 2);
+        assert_eq!(
+            report.vc_obligations[0].assumptions,
+            vec!["(assert true)"],
+            "first body's obligation should carry the precondition",
+        );
+        assert!(
+            report.vc_obligations[1].assumptions.is_empty(),
+            "second body's obligation should have no assumptions after clear; got {:?}",
+            report.vc_obligations[1].assumptions,
         );
     }
     /// Task N negative: a `BinaryOp` on a non-integer (`bool`)

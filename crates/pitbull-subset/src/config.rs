@@ -87,6 +87,27 @@ pub struct VerificationSection {
     /// in v0.1 if you want subset-level panic rejection.
     #[serde(default)]
     pub strict_panic_acceptance: bool,
+    /// Per-function precondition lists. Keys are fully-qualified
+    /// function paths (matched against `CrateDef::name()` for each
+    /// item the wrapper walks). Values are arrays of SMT-LIB 2
+    /// assertion forms that the wrapper attaches as VC-obligation
+    /// assumptions for every obligation emitted while walking the
+    /// matching body.
+    ///
+    /// v0.2 O.1 posture: assumptions are raw SMT-LIB strings — the
+    /// user is responsible for matching operand positions
+    /// (`lhs` / `rhs`) to the function's parameters. O.2 (the next
+    /// commit) introduces a small predicate grammar
+    /// (`<ident> <cmp> <int>`); O.3 wires
+    /// `#[pitbull::requires(...)]` extraction.
+    ///
+    /// Example:
+    /// ```toml
+    /// [verification.preconditions]
+    /// "my_crate::add_one" = ["(assert (bvult lhs #x00000064))"]
+    /// ```
+    #[serde(default)]
+    pub preconditions: std::collections::BTreeMap<String, Vec<String>>,
 }
 impl Default for VerificationSection {
     fn default() -> Self {
@@ -96,6 +117,7 @@ impl Default for VerificationSection {
             solvers: default_solvers(),
             solver_versions: std::collections::BTreeMap::new(),
             strict_panic_acceptance: false,
+            preconditions: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -376,6 +398,54 @@ mod tests {
         let cfg = SubsetConfig::default_for_test();
         let errs = cfg.validate();
         assert!(errs.is_empty(), "default test config produced {} errors", errs.len());
+    }
+    /// O.1: a `[verification.preconditions]` TOML table
+    /// deserializes into a `BTreeMap<String, Vec<String>>` and
+    /// each entry preserves order on lookup. Pins the on-disk
+    /// schema the wrapper consumes.
+    #[test]
+    fn preconditions_table_round_trips_from_toml() {
+        let text = r#"
+[project]
+name = "demo"
+toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
+
+[verification.preconditions]
+"demo::add_one"  = ["(assert (bvult lhs #x00000064))"]
+"demo::add_two"  = [
+    "(assert (bvult lhs #x00000064))",
+    "(assert (bvult rhs #x00000064))",
+]
+"#;
+        let cfg: SubsetConfig = toml::from_str(text)
+            .expect("valid TOML deserializes");
+        let preconds = &cfg.verification.preconditions;
+        assert_eq!(preconds.len(), 2);
+        assert_eq!(
+            preconds.get("demo::add_one").map(Vec::as_slice),
+            Some(&["(assert (bvult lhs #x00000064))".to_string()][..]),
+        );
+        let two = preconds.get("demo::add_two").expect("demo::add_two present");
+        assert_eq!(two.len(), 2);
+        assert!(two[0].contains("lhs"));
+        assert!(two[1].contains("rhs"));
+    }
+    /// Configs without a `[verification.preconditions]` section
+    /// still parse — the field defaults to an empty map. Backwards
+    /// compatible with every pre-O.1 pitbull.toml in the wild.
+    #[test]
+    fn preconditions_table_optional() {
+        let text = r#"
+[project]
+name = "demo"
+toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
+"#;
+        let cfg: SubsetConfig = toml::from_str(text)
+            .expect("config without preconditions table still parses");
+        assert!(
+            cfg.verification.preconditions.is_empty(),
+            "missing table should default to empty map",
+        );
     }
     #[test]
     fn unwind_panic_strategy_rejected() {

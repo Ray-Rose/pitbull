@@ -13,6 +13,19 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 [verification]
 # Hard timeout per verification condition (seconds). Timeout counts as failure.
 vc_timeout_seconds = 60
+# Per-function preconditions surfaced to the SMT solver as hypotheses.
+# Keys are fully-qualified function paths; values are arrays of complete
+# SMT-LIB 2 `(assert ...)` directives.
+#
+# v0.2 O.1 posture: the user writes raw SMT-LIB. Operand positions are
+# `lhs` and `rhs` for binary arithmetic. v0.2 O.2 introduces a Rust-like
+# predicate grammar (`x < 100`); v0.2 O.3 wires `#[pitbull::requires(...)]`
+# tool-attribute extraction.
+#
+# Example: prove `add_one(x: u32) -> u32 { x + 1 }` safe by constraining
+# `x < 100` so the overflow at `x + 1` is impossible:
+# [verification.preconditions]
+# "my_crate::add_one" = ["(assert (bvult lhs #x00000064))"]
 # Solver agreement threshold. PSS-1 design: require 2-of-3 solvers to return
 # UNSAT before accepting a proof obligation. Increase to 3 for highest-assurance
 # builds. Decrease only with documented justification.

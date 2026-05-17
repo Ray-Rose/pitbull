@@ -40,6 +40,30 @@ pub struct VcObligation {
     pub span: Span,
     /// What's being claimed.
     pub kind: VcObligationKind,
+    /// Spec-derived premises the solver gets as additional
+    /// hypotheses when discharging this obligation. Each string is
+    /// an SMT-LIB 2 assertion *form* (the full `(assert ...)`
+    /// directive, not just the predicate body) that the compiler
+    /// splices verbatim into the problem before `(check-sat)`.
+    ///
+    /// v0.2 O.1 (this commit): assumptions are raw SMT-LIB strings
+    /// fed straight from `pitbull.toml`. The user wires
+    /// operand-to-variable bindings manually.
+    /// v0.2 O.2 (next commit): the configuration uses a small
+    /// predicate grammar (`<ident> <cmp> <int>`), and the visitor
+    /// translates predicate variable names to `lhs`/`rhs` via
+    /// shadow `Body::arg_names`.
+    /// v0.2 O.3 (final commit): assumptions originate from
+    /// `#[pitbull::requires(...)]` tool attributes extracted from
+    /// the HIR.
+    ///
+    /// Each well-formed string is one assertion form, e.g.
+    /// `"(assert (bvult lhs #x00000064))"`. Malformed strings get
+    /// inlined verbatim — the solver returns an `(error ...)`
+    /// which the wrapper surfaces as an `Error` verdict so the
+    /// auditor sees the gap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<String>,
 }
 /// Discriminator for VC obligations. Each variant maps to one PSS-1
 /// rule the v0.1 visitor recognizes but cannot itself prove.
@@ -119,6 +143,29 @@ mod tests {
                 op: ArithOp::Add,
                 ty_name: "u32".into(),
             },
+            assumptions: Vec::new(),
+        };
+        let s = serde_json::to_string(&o).expect("serialize");
+        let back: VcObligation = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, o);
+    }
+    /// Obligations with non-empty assumptions also round-trip
+    /// through JSON. (The `skip_serializing_if = "Vec::is_empty"`
+    /// attribute on `assumptions` keeps the JSON terse when no
+    /// preconditions apply — but the field still works when filled.)
+    #[test]
+    fn obligation_with_assumptions_round_trips() {
+        let o = VcObligation {
+            id: "pb049-add-1".into(),
+            span: Span::default(),
+            kind: VcObligationKind::ArithmeticOverflow {
+                op: ArithOp::Add,
+                ty_name: "u32".into(),
+            },
+            assumptions: vec![
+                "(assert (bvult lhs #x00000064))".into(),
+                "(assert (bvult rhs #x00000064))".into(),
+            ],
         };
         let s = serde_json::to_string(&o).expect("serialize");
         let back: VcObligation = serde_json::from_str(&s).expect("deserialize");
