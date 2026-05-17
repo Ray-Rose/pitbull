@@ -163,6 +163,62 @@ mod tests {
         // The main problem still contains the safety predicate.
         assert!(goal.smt.contains("(assert (bvuaddo lhs rhs))"));
     }
+    /// O.2.5 headline composition: an obligation with BOTH a
+    /// constant-pin assumption (the `1` in `x + 1`) AND a user
+    /// precondition (`x < 100`) compiles to an SMT problem
+    /// containing both as separate `(assert ...)` directives,
+    /// followed by the safety predicate. This is the SMT text
+    /// that — when Z3 sees it — returns `unsat` and the wrapper
+    /// reports "discharged (unsat)".
+    ///
+    /// We can't actually run Z3 in unit tests (CI may or may not
+    /// have it installed), so this test pins the SMT TEXT
+    /// shape. The corresponding integration test
+    /// `wrapper_proves_add_one_safe_under_precondition` (gated on
+    /// Z3 availability) exercises the actual solver verdict.
+    #[test]
+    fn compile_with_const_pin_plus_precondition_combines_both() {
+        let obligation = VcObligation {
+            id: "pb049-add-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::ArithmeticOverflow {
+                op: ArithOp::Add,
+                ty_name: "u32".into(),
+            },
+            assumptions: vec![
+                // Synthesized by the visitor for the `1` in `x + 1`.
+                "(assert (= rhs #x00000001))".into(),
+                // Synthesized by the visitor from the user
+                // precondition `x < 100`.
+                "(assert (bvult lhs #x00000064))".into(),
+            ],
+        };
+        let goal = compile(&obligation).expect("u32 + supported");
+        // Both assumptions must appear before the safety predicate.
+        let smt = &goal.smt;
+        let pin_idx = smt.find("(assert (= rhs #x00000001))")
+            .expect("rhs pin should be in SMT");
+        let pre_idx = smt.find("(assert (bvult lhs #x00000064))")
+            .expect("precondition should be in SMT");
+        let safe_idx = smt.find("(assert (bvuaddo lhs rhs))")
+            .expect("safety predicate should be in SMT");
+        assert!(
+            pin_idx < safe_idx && pre_idx < safe_idx,
+            "assumptions must appear before the safety predicate; \
+             pin={pin_idx}, pre={pre_idx}, safe={safe_idx}, smt:\n{smt}",
+        );
+        // The consistency check should also contain both
+        // assumptions but NOT the safety predicate.
+        let cs = goal.consistency_check.as_ref()
+            .expect("consistency check should be present with assumptions");
+        assert!(cs.contains("(assert (= rhs #x00000001))"));
+        assert!(cs.contains("(assert (bvult lhs #x00000064))"));
+        assert!(
+            !cs.contains("bvuaddo"),
+            "consistency check must NOT contain the safety predicate; \
+             got:\n{cs}",
+        );
+    }
     /// No assumptions → no consistency check (the empty hypothesis
     /// set is trivially consistent; skipping the extra solver call
     /// is the right optimization).

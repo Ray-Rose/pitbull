@@ -463,6 +463,24 @@ mod shadow {
         /// this field is populated by the rustc_public adapter from the
         /// resolved `DefId`.
         pub path: Option<String>,
+        /// Numeric value when the constant is an integer-typed
+        /// primitive (`u8..u128`, `i8..i128`). Stored as `i128` to
+        /// cover every supported primitive width with one slot;
+        /// unsigned values that exceed `i128::MAX` wrap via two's
+        /// complement, which the SMT bit-vector encoder reproduces
+        /// exactly. `None` for non-integer constants (FnDef,
+        /// aggregates, etc.) and for constants whose evaluation
+        /// failed.
+        ///
+        /// Audit-cleanup O.2.5: this field enables the v0.2 backend
+        /// to constrain constant operands in the SMT problem. Before
+        /// O.2.5, `fn add_one(x: u32) -> u32 { x + 1 }` with
+        /// `requires(x < 100)` could not prove unsat because the
+        /// constant `1` was a free bit-vector in the SMT problem.
+        /// With this field populated, the visitor synthesizes a
+        /// pinning assertion `(assert (= rhs #x00000001))` that
+        /// makes the overflow check decidable.
+        pub value: Option<i128>,
     }
     /// MIR rvalues. Mirror of `rustc_public::mir::Rvalue`.
     ///

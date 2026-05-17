@@ -405,6 +405,7 @@ pub fn operand(o: &rp::mir::Operand) -> shadow::Operand {
             },
             def_id: None,
             path: None,
+            value: None,
         }),
     }
 }
@@ -428,6 +429,53 @@ pub fn const_operand(c: &rp::mir::ConstOperand) -> shadow::ConstOperand {
         ty: ty(real_ty),
         def_id: def_id_opt,
         path: path_opt,
+        value: try_extract_integer_value(c),
+    }
+}
+/// Attempt to extract a numeric value from a `ConstOperand` when
+/// the constant is an integer-typed primitive (`u8..u128`,
+/// `i8..i128`). Returns `None` for non-integer constants
+/// (`FnDef`, aggregates, references, etc.) and for constants
+/// whose backing allocation isn't yet evaluated.
+///
+/// **O.2.5**: This is the value the visitor needs to constrain
+/// constant operands in the SMT problem. Without it, the
+/// constant `1` in `x + 1` shows up as a free `BitVec 32` to
+/// the solver, and even with `x < 100` as a precondition the
+/// overflow check returns sat (witness: `rhs = u32::MAX`).
+/// With the value extracted, the visitor synthesizes
+/// `(assert (= rhs #x00000001))` so the solver pins it.
+///
+/// Unsigned values that exceed `i128::MAX` wrap via two's
+/// complement when cast to `i128` — that's fine because the
+/// SMT bit-vector encoder reproduces the exact bit pattern.
+/// (Predicate range-checking treats `u128` as unsupported
+/// pending a wider literal type, but operand-value extraction
+/// can ride along: the visitor uses the i128 directly, no
+/// range check needed at the operand-pinning site.)
+fn try_extract_integer_value(c: &rp::mir::ConstOperand) -> Option<i128> {
+    use rp::ty::{ConstantKind, RigidTy, TyKind};
+    let kind = c.const_.kind();
+    let allocated = match kind {
+        ConstantKind::Allocated(alloc) => alloc,
+        // Other kinds (Param, ZeroSized, Ty, Unevaluated) aren't
+        // backed by raw bytes we can read — `read_uint` / `read_int`
+        // would panic or error. Skip silently; the visitor's
+        // constant-pinning path doesn't apply.
+        _ => return None,
+    };
+    let ty_kind = c.const_.ty().kind();
+    match ty_kind {
+        TyKind::RigidTy(RigidTy::Int(_)) => allocated.read_int().ok(),
+        // u64 / u32 / u16 / u8 fit i128 exactly; u128 values
+        // above i128::MAX wrap to negative i128 (two's complement),
+        // which is the same bit pattern the SMT encoder produces
+        // for negative i128 literals — so the wrap is a no-op
+        // from the solver's perspective.
+        TyKind::RigidTy(RigidTy::Uint(_)) => {
+            allocated.read_uint().ok().map(|u| u as i128)
+        }
+        _ => None,
     }
 }
 // =====================================================================

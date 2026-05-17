@@ -1144,6 +1144,33 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // stand behind.
             return;
         }
+        // O.2.5: pin constant-operand values into the SMT problem.
+        // For each operand that's a `Constant` with a known
+        // integer value (extracted by `adapter::const_operand`),
+        // synthesize an `(assert (= <pos> <lit>))` directive. The
+        // visitor adds these to the obligation's assumptions
+        // before the user-supplied preconditions are processed, so
+        // they appear as plain hypotheses to the solver.
+        //
+        // Why: before O.2.5, `fn add_one(x: u32) { x + 1 }` with
+        // `requires(x < 100)` returned `sat` because the SMT
+        // problem had `lhs < 100` (from precondition) but `rhs`
+        // unconstrained → solver witness `rhs = u32::MAX` → false
+        // overflow. With pinning, `rhs = 1` is part of the
+        // hypothesis set, the check returns `unsat`, and the
+        // wrapper reports "discharged (unsat)".
+        let mut const_pin_assertions: Vec<String> = Vec::new();
+        for (label, op) in [("lhs", lhs), ("rhs", rhs)] {
+            if let Operand::Constant(c) = op {
+                if let Some(value) = c.value {
+                    if let Some(assertion) =
+                        crate::predicate::operand_pin_assertion(label, value, &lhs_name)
+                    {
+                        const_pin_assertions.push(assertion);
+                    }
+                }
+            }
+        }
         let seq = self.vc_obligations.len();
         let id = format!("pb049-{}-{}", arith_op.tag(), seq);
         // Translate each precondition string. The path:
@@ -1184,8 +1211,14 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // The path-specific rejection messages help users
         // distinguish "I wrote a real predicate but it's wrong for
         // this type" from "I wrote raw SMT but it's malformed".
-        let mut assumptions: Vec<String> =
-            Vec::with_capacity(self.current_body_preconditions.len());
+        // Reserve room for: constant-pin assertions (at most 2, one
+        // per operand) + user preconditions. The pins go FIRST so
+        // they read naturally in stderr / SARIF output (operand
+        // values are the most basic context for an obligation).
+        let mut assumptions: Vec<String> = Vec::with_capacity(
+            const_pin_assertions.len() + self.current_body_preconditions.len(),
+        );
+        assumptions.extend(const_pin_assertions);
         let mut pending_audit_notes: Vec<String> = Vec::new();
         for raw in &self.current_body_preconditions {
             match crate::predicate::parse_predicate(raw) {
@@ -1712,6 +1745,7 @@ mod tests {
                             ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
                             def_id: None,
                             path: None,
+                            value: None,
                         }),
                         args: vec![],
                         destination: Place { local: Local(0), projection: vec![] },
@@ -1754,11 +1788,13 @@ mod tests {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                             Operand::Constant(ConstOperand {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                         ),
                     ),
@@ -1825,11 +1861,13 @@ mod tests {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                             Operand::Constant(ConstOperand {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                         ),
                     ),
@@ -1887,11 +1925,13 @@ mod tests {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                             Operand::Constant(ConstOperand {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                         ),
                     ),
@@ -1960,6 +2000,7 @@ mod tests {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                         ),
                     ),
@@ -2020,11 +2061,13 @@ mod tests {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                             Operand::Constant(ConstOperand {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                         ),
                     ),
@@ -2063,6 +2106,145 @@ mod tests {
             report.audit_notes,
         );
     }
+    /// O.2.5: when a `BinaryOp` has a Constant operand with a
+    /// known value (extracted by `adapter::const_operand`), the
+    /// visitor synthesizes a pinning assumption that constrains
+    /// the SMT operand to that exact value. This is the
+    /// foundational fix that lets `fn add_one(x: u32) { x + 1 }`
+    /// with `requires(x < 100)` prove `unsat` — without pinning
+    /// `rhs = 1`, the solver finds the witness `rhs = u32::MAX`
+    /// even under `x < 100`.
+    #[test]
+    fn constant_operand_value_pinned_in_assumptions() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        // Body for `fn add_one(x: u32) -> u32 { x + 1 }`:
+        //   _0: u32 (return)
+        //   _1: u32 (param `x`)
+        //   _2: u32 (the binary op result)
+        //   _2 = _1 + 1u32
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone()],
+            arg_names: vec!["x".into()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(2), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            // lhs = x (parameter), no value to pin
+                            Operand::Copy(Place {
+                                local: Local(1),
+                                projection: vec![],
+                            }),
+                            // rhs = 1u32, known constant value
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                                value: Some(1),
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        let assumptions = &report.vc_obligations[0].assumptions;
+        // The rhs operand was a Constant with value 1u32 — its
+        // value gets pinned as `(assert (= rhs #x00000001))`.
+        assert!(
+            assumptions.iter().any(|a| a == "(assert (= rhs #x00000001))"),
+            "expected operand-pinning assertion for rhs=1u32; \
+             got assumptions: {assumptions:?}",
+        );
+        // The lhs operand was a Copy (not a constant) — no
+        // pinning assertion for it.
+        assert!(
+            !assumptions.iter().any(|a| a.contains("= lhs")),
+            "lhs is a Copy operand (parameter `x`), not a constant; \
+             must NOT be pinned. assumptions: {assumptions:?}",
+        );
+    }
+    /// O.2.5: an operand with `value: None` (e.g. a constant whose
+    /// value couldn't be extracted, or a synthetic test fixture)
+    /// produces no pinning assertion. Pins the negative space.
+    #[test]
+    fn constant_operand_without_value_emits_no_pin() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            arg_names: vec![],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![LocalDecl {
+                ty: u32_ty.clone(),
+                span: Span::default(),
+                mutability: Mutability::Not,
+            }],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                                value: None,  // adapter didn't extract a value
+                            }),
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                                value: None,
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        assert!(
+            report.vc_obligations[0].assumptions.is_empty(),
+            "value-less constants must not produce pinning assertions; \
+             got assumptions: {:?}",
+            report.vc_obligations[0].assumptions,
+        );
+    }
     /// Audit hardening (F2 red-team): a malicious precondition
     /// containing multiple SMT-LIB directives is REFUSED — the
     /// raw-splice escape hatch lex-validates the input as a
@@ -2099,6 +2281,7 @@ mod tests {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                         ),
                     ),
@@ -2177,6 +2360,7 @@ mod tests {
                                 ty: u32_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                         ),
                     ),
@@ -2231,11 +2415,13 @@ mod tests {
                                 ty: bool_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                             Operand::Constant(ConstOperand {
                                 ty: bool_ty.clone(),
                                 def_id: None,
                                 path: None,
+                                value: None,
                             }),
                         ),
                     ),
@@ -2306,6 +2492,7 @@ mod tests {
                             ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
                             def_id: None,
                             path: Some(path.into()),
+                            value: None,
                         }),
                         args: vec![],
                         destination: Place { local: Local(0), projection: vec![] },

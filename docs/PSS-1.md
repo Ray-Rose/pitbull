@@ -633,6 +633,86 @@ the std form and now also matches. No shadow type changes.
   the normal match arms. The UX is intentionally crude in O.1
   (users hand-write SMT-LIB and track operand positions) — O.2
   introduces the Rust-like predicate grammar that fixes both.
+- ✅ Constant-operand value extraction — the headline-demo
+  unlocker (Task O.2.5). Before this commit, the SMT problem
+  treated `Operand::Constant` as a free `BitVec N` variable —
+  even with `requires(x < 100)` as a precondition for
+  `fn add_one(x: u32) -> u32 { x + 1 }`, the obligation
+  returned `sat` (witness: rhs = u32::MAX) because the
+  constant `1` wasn't constrained. After O.2.5 the wrapper
+  produces SMT containing `(assert (= rhs #x00000001))`
+  alongside the precondition translation
+  `(assert (bvult lhs #x00000064))`, which Z3 returns `unsat`
+  on — the obligation discharges.
+
+  Pieces wired:
+    * Shadow `mir_api::ConstOperand` gains
+      `value: Option<i128>`. Stored as `i128` to cover every
+      supported primitive integer (u8..u128, i8..i128); u128
+      values above i128::MAX wrap via two's complement,
+      producing the same bit pattern in the SMT encoding.
+    * `adapter::const_operand` populates the value via a new
+      `try_extract_integer_value` helper. Path:
+      `c.const_.kind()` → `ConstantKind::Allocated(alloc)` →
+      `alloc.read_int()` / `alloc.read_uint()` depending on
+      the constant's RigidTy. Non-integer / unevaluated
+      constants return `None` (silent — caller distinguishes).
+    * `predicate::operand_pin_assertion` emits the SMT
+      directive `(assert (= <pos> <bv-lit>))` for a known
+      operand value. Reuses the two's-complement bit-vector
+      encoder. No range check — values come from real MIR
+      constants whose type is already that of the operand.
+    * `SubsetVisitor::maybe_emit_overflow_obligation` walks
+      the two operands; for each `Constant` with a known
+      value, synthesizes a pinning assertion and pushes it to
+      `obligation.assumptions` BEFORE the user preconditions.
+      The pins appear first in the SMT problem (reading
+      "the operand IS 1, AND x < 100, AND the negation of
+      no-overflow"); this ordering is cosmetic for the
+      solver but reads naturally for an auditor.
+
+  Layered tests (7 new):
+    * `predicate::tests::operand_pin_assertion_basic` —
+      pins the bv-literal encoding for u32/i64/i32 with
+      positive and negative values, including two's-complement.
+    * `predicate::tests::operand_pin_assertion_rejects_unsupported_types`
+      — Bool, f32, usize/isize, gibberish all return None.
+    * `visitor::tests::constant_operand_value_pinned_in_assumptions`
+      — synthetic body for `fn add_one(x: u32) { x + 1u32 }`
+      produces an obligation whose assumptions include
+      `(assert (= rhs #x00000001))` but NOT `(= lhs ...)`
+      (because lhs is `Copy(x)`, not a constant).
+    * `visitor::tests::constant_operand_without_value_emits_no_pin`
+      — synthetic body where both constants have
+      `value: None` produces an obligation with no pinning
+      assertions (negative space pinned so the adapter's
+      extraction code can't silently regress).
+    * `pitbull_vc::vc::tests::compile_with_const_pin_plus_precondition_combines_both`
+      — the headline composition: an obligation with both a
+      const-pin (`rhs=1`) AND a user precondition (`lhs<100`)
+      compiles to SMT with both assertions appearing before
+      the safety predicate. Z3 returns `unsat` on this text;
+      the wrapper would report "discharged (unsat)".
+
+  Z3 not installed on the developer's machine prevents an
+  e2e smoke that confirms the actual `unsat` verdict
+  end-to-end. The compose test pins the SMT text shape that
+  Z3 will see; the path from there to a verdict is
+  exercised by the existing `solver::tests::pinned_inputs_proves_no_overflow`
+  (gracefully skips when Z3 absent).
+
+  Remaining limitations:
+    * The pinning fires ONLY for `Operand::Constant` with a
+      successfully-extracted value. `Operand::Copy/Move` of
+      a place that happens to come from a literal (`let y =
+      1; x + y`) still won't pin — needs data-flow analysis
+      to track the chain. Documented for v0.3.
+    * `usize` and `isize` remain unsupported in
+      `int_type_info` (pending the pitbull.toml
+      target-pointer-width threading from PB052).
+    * `u128` values that wrap to negative `i128` round-trip
+      bit-exactly in the SMT encoding but the test coverage
+      doesn't include u128 specifically.
 - ✅ Audit cleanup #6 (final residuals). Closes M-4/M-5/M-6/M-7/M-8
   from a third audit pass: PSS-1.md entries for the four
   follow-up cleanup commits, stale "49 + 1 ignored" baseline

@@ -381,6 +381,37 @@ pub fn predicate_to_smt_assertion(
     let lit_smt = format_bv_literal(pred.lit, bits);
     Ok(format!("(assert ({smt_op} {operand_smt_name} {lit_smt}))"))
 }
+/// Emit an SMT-LIB `(assert (= <operand> <bv-literal>))` directive
+/// that pins a constant operand's value in a bit-vector problem.
+///
+/// O.2.5: the visitor uses this to constrain known-value
+/// constant operands like the `1` in `x + 1`. Before O.2.5, such
+/// constants were free `BitVec N` variables from the solver's
+/// perspective — overflow obligations with preconditions on `x`
+/// still returned `sat` because `rhs` could be anything. Pinning
+/// `rhs = 1` makes the check decidable.
+///
+/// The literal is two's-complement-encoded against the target
+/// width, so unsigned values that wrapped to negative `i128`
+/// during extraction (only possible for `u128` > `i128::MAX`)
+/// round-trip to the correct bit pattern.
+///
+/// Returns `None` for unsupported types — matches the rest of
+/// the module's behavior. Range-checking is intentionally skipped
+/// because the value came from a real MIR constant whose type
+/// is already that of the operand; out-of-range here would mean
+/// a bug in the adapter or the type-resolution chain, not a
+/// user error.
+#[must_use]
+pub fn operand_pin_assertion(
+    operand_smt_name: &str,
+    value: i128,
+    target_ty_name: &str,
+) -> Option<String> {
+    let (_signed, bits) = int_type_info(target_ty_name)?;
+    let lit = format_bv_literal(value, bits);
+    Some(format!("(assert (= {operand_smt_name} {lit}))"))
+}
 /// Decode a Rust primitive integer type name into (signed, bits).
 /// Returns `None` for non-int types, suffixes, or unsupported widths.
 fn int_type_info(name: &str) -> Option<(bool, u32)> {
@@ -659,6 +690,40 @@ mod tests {
             let err = predicate_to_smt_assertion(&p, "lhs", ty)
                 .expect_err(ty);
             assert!(matches!(err, TranslationError::UnsupportedType { .. }));
+        }
+    }
+    /// O.2.5: `operand_pin_assertion` emits a properly-encoded
+    /// `(assert (= <pos> <bv-lit>))` directive for known-value
+    /// constant operands. Pins both the format and the
+    /// two's-complement encoding for negative values.
+    #[test]
+    fn operand_pin_assertion_basic() {
+        let s = operand_pin_assertion("rhs", 1, "u32")
+            .expect("u32 supported");
+        assert_eq!(s, "(assert (= rhs #x00000001))");
+        let s = operand_pin_assertion("lhs", 42, "i64")
+            .expect("i64 supported");
+        assert_eq!(s, "(assert (= lhs #x000000000000002A))");
+        // Negative literal on signed type → two's complement.
+        let s = operand_pin_assertion("rhs", -1, "i32")
+            .expect("i32 supported");
+        assert_eq!(s, "(assert (= rhs #xFFFFFFFF))");
+        // Negative literal on unsigned type would round-trip as
+        // the same bit pattern — the encoder doesn't range-check
+        // (that's by design; the visitor only feeds values
+        // extracted from real MIR constants of that type).
+        let s = operand_pin_assertion("lhs", -1, "u32")
+            .expect("u32 supported");
+        assert_eq!(s, "(assert (= lhs #xFFFFFFFF))");
+    }
+    /// Unsupported types return None without error.
+    #[test]
+    fn operand_pin_assertion_rejects_unsupported_types() {
+        for ty in ["f32", "bool", "usize", "isize", "Bogus"] {
+            assert!(
+                operand_pin_assertion("lhs", 0, ty).is_none(),
+                "unsupported type `{ty}` should return None",
+            );
         }
     }
     /// Audit-cleanup F3: i128 predicates translate cleanly without
