@@ -27,6 +27,11 @@
 //!
 //! These map to the SARIF-consumer conventions used by GitHub
 //! code-scanning and similar tools.
+// Defense-in-depth (red-team F8): no unsafe in the cargo
+// subcommand. It only orchestrates rustc, parses configs, and
+// renders reports — all of which is safe Rust. Forbidding here
+// makes a future refactor that adds unsafe a hard compile error.
+#![forbid(unsafe_code)]
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

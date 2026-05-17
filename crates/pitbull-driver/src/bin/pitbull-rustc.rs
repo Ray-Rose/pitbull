@@ -32,6 +32,14 @@
 //! `pitbull_subset::mir_api::adapter` is the next chunk of Milestone 2
 //! implementation work.
 #![cfg_attr(rustc_public_real, feature(rustc_private))]
+// Defense-in-depth (red-team F8): the wrapper is part of the
+// Pitbull TCB. No unsafe is needed at the Rust language level —
+// every API we use (rustc_driver, rustc_public, rustc_middle,
+// rustc_hir, rustc_span) is safe Rust. Forbidding `unsafe_code`
+// here makes a future refactor that adds `unsafe { ... }` for a
+// "tiny optimization" a hard compile error instead of a silent
+// soundness-relevant addition.
+#![forbid(unsafe_code)]
 // Stable / no-opt-in path: print a diagnostic and exit. Reached when the
 // wrapper is somehow invoked despite not being on a nightly build with
 // the opt-in env var set. We do not silently passthrough to rustc here
@@ -121,10 +129,38 @@ fn main() {
     // process exit code. Earlier rustc versions had `impl Callbacks for ()`
     // for convenience but the current trait requires an explicit type.
     let mut callbacks = PitbullCallbacks::default();
-    let exit_code = rustc_driver::catch_with_exit_code(|| {
+    let rustc_exit_code = rustc_driver::catch_with_exit_code(|| {
         rustc_driver::run_compiler(&args, &mut callbacks);
     });
-    std::process::exit(exit_code);
+    // Audit-cleanup #5 / red-team F10: the wrapper's exit code
+    // now reflects Pitbull's findings, not just rustc's. Earlier
+    // behavior: rustc compiled cleanly ⇒ exit 0 even with 47
+    // subset violations and undischarged VC obligations. A
+    // direct-invocation user (or `cargo pitbull check` once
+    // wired) couldn't tell verification failed from the exit
+    // status alone.
+    //
+    // Policy:
+    //   - If rustc itself failed (non-zero) ⇒ propagate that
+    //     code — rustc errors take precedence.
+    //   - Else if Pitbull found subset violations ⇒ exit 1.
+    //   - Else if there are undischarged VC obligations ⇒ exit 1.
+    //   - Else ⇒ exit 0 (clean verification).
+    //
+    // Why a single non-zero code regardless of cause: per the
+    // cargo-pitbull `--exit-codes` doc, exit 1 means
+    // "verification did not pass." Distinguishing
+    // "subset-violation vs. undischarged-obligation" lives in
+    // the cargo subcommand's report rendering, not the wrapper's
+    // exit status.
+    let pitbull_exit_code = if callbacks.violations > 0
+        || callbacks.undischarged_obligations > 0
+    {
+        1
+    } else {
+        0
+    };
+    std::process::exit(rustc_exit_code.max(pitbull_exit_code));
 }
 /// Pitbull's rustc_driver callback. State lives across compile units
 /// when invoked per-crate; for the v0.2 scaffold we accumulate counts
@@ -145,6 +181,12 @@ struct PitbullCallbacks {
     hir_unsafe_blocks: usize,
     /// Total subset violations found across all bodies.
     violations: usize,
+    /// VC obligations that the dispatcher could NOT discharge
+    /// (sat, unknown, timeout, error, not-installed, contradictory
+    /// preconditions, pending compilation, etc.). Combined with
+    /// `violations` to determine the wrapper's exit code per the
+    /// F10 audit fix.
+    undischarged_obligations: usize,
 }
 #[cfg(rustc_public_real)]
 impl rustc_driver::Callbacks for PitbullCallbacks {
@@ -398,7 +440,7 @@ impl PitbullCallbacks {
         // PanicReachability) surfaces as "pending" — the obligation
         // is recorded but no SMT was generated.
         if !report.vc_obligations.is_empty() {
-            dispatch_vc_obligations(&report);
+            self.undischarged_obligations += dispatch_vc_obligations(&report);
         }
         // Optional SARIF emission. When `PITBULL_SARIF_OUT` is set,
         // write the (minimal) SARIF report to that path. Each wrapper
@@ -443,10 +485,15 @@ impl PitbullCallbacks {
 /// `pitbull-vc::solver::invoke_z3`, and surface the verdict on
 /// stderr. Logs a summary line at the end.
 ///
+/// Returns the number of undischarged obligations so the caller
+/// can fold them into the wrapper's exit-code calculation
+/// (audit-cleanup F10).
+///
 /// Free function (not a method on `PitbullCallbacks`) because it
-/// only reads the report — no callback state mutation needed.
+/// only reads the report and accumulates a result — no callback
+/// state mutation needed.
 #[cfg(rustc_public_real)]
-fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) {
+fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
     let mut solver_missing_announced = false;
     let mut discharged = 0usize;
     let mut undischarged = 0usize;
@@ -572,6 +619,7 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) {
         discharged,
         undischarged,
     );
+    undischarged
 }
 /// Load pitbull.toml from `$PITBULL_TOML` (if set) or from `./pitbull.toml`
 /// in the current working directory. Falls back to the default test
@@ -789,12 +837,28 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for UnsafeBlockVisitor<'tcx> {
         self.tcx
     }
     fn visit_block(&mut self, b: &'tcx rustc_hir::Block<'tcx>) {
-        if matches!(
+        // Audit-cleanup #5 / red-team F7: skip `unsafe { ... }`
+        // blocks that came from macro expansion. `vec![1,2,3]`,
+        // `format!()`, `println!()`, and many std macros expand
+        // to bodies containing `unsafe { ... }`. After expansion
+        // those blocks live in the user crate's HIR with
+        // `UnsafeSource::UserProvided` (because the macro AUTHOR
+        // wrote `unsafe`), but the user of the verified crate
+        // didn't author that unsafe — and can't fix it without
+        // rewriting their code in ways no Rust programmer would
+        // accept.
+        //
+        // `Span::from_expansion()` returns true if the span was
+        // introduced by ANY macro expansion (proc-macro, decl-macro,
+        // or `#[derive]`). PB001 fires only on
+        // user-source-positioned blocks.
+        let is_unsafe_user_block = matches!(
             b.rules,
             rustc_hir::BlockCheckMode::UnsafeBlock(
                 rustc_hir::UnsafeSource::UserProvided,
-            )
-        ) {
+            ),
+        );
+        if is_unsafe_user_block && !b.span.from_expansion() {
             let span =
                 rustc_span_to_shadow(self.tcx, b.span, &mut self.filename_table);
             self.violations.push(pitbull_subset::SubsetError {
