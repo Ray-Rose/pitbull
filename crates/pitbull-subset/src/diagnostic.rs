@@ -42,6 +42,34 @@ impl fmt::Display for SubsetError {
         )
     }
 }
+/// A non-violation diagnostic recorded by the visitor when it
+/// encounters a code shape it cannot fully classify but that does
+/// not itself violate PSS-1.
+///
+/// Use case: when `classify_called_function` sees a callee whose path
+/// it cannot extract (e.g. a non-FnDef-typed constant operand), it
+/// would silently fall through with no rule firing. Audit posture
+/// rejects silent skips, so the visitor records an audit note
+/// instead. An auditor reviewing the SARIF / stderr output sees
+/// "this call wasn't classified" and can investigate whether a
+/// real PB rule should have fired.
+///
+/// Audit notes are informational, never block verification, and do
+/// not count toward the violation total. They are surfaced alongside
+/// errors in the wrapper's stderr and (future) in SARIF as
+/// `result.kind = "informational"`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditNote {
+    /// Source location of the unclassifiable construct.
+    pub span: Span,
+    /// Why the note exists.
+    pub message: String,
+}
+impl fmt::Display for AuditNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "audit-note: {}", self.message)
+    }
+}
 /// Phase the visitor reached before terminating.
 ///
 /// Reported to distinguish "verified" from "we did not finish" — the latter
@@ -58,6 +86,11 @@ pub enum PhaseCompleted {
 pub struct SubsetReport {
     /// All recorded violations, in encounter order.
     pub errors: Vec<SubsetError>,
+    /// Non-violation diagnostics: code shapes the visitor saw but
+    /// could not fully classify. Audit-trail signal; never blocks
+    /// verification. See `AuditNote`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_notes: Vec<AuditNote>,
     /// What phase the visitor reached.
     pub phase_completed: PhaseCompleted,
     /// PSS version this report was produced against.
@@ -80,6 +113,7 @@ impl SubsetReport {
     pub fn new(errors: Vec<SubsetError>) -> Self {
         Self {
             errors,
+            audit_notes: Vec::new(),
             phase_completed: PhaseCompleted::SubsetCheckComplete,
             pss_version: crate::PSS_VERSION.to_string(),
             filenames: None,
@@ -90,6 +124,7 @@ impl SubsetReport {
     pub fn aborted() -> Self {
         Self {
             errors: Vec::new(),
+            audit_notes: Vec::new(),
             phase_completed: PhaseCompleted::Aborted,
             pss_version: crate::PSS_VERSION.to_string(),
             filenames: None,

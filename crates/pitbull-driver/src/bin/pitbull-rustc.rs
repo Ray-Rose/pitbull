@@ -357,6 +357,14 @@ impl PitbullCallbacks {
         for err in &report.errors {
             eprintln!("pitbull-rustc: {err}");
         }
+        // Audit notes are non-violations the visitor flagged for
+        // auditor review (e.g. an unclassifiable callee at a Call
+        // terminator — see classify_called_function in visitor.rs).
+        // They never block verification but surface here so the gap
+        // is visible.
+        for note in &report.audit_notes {
+            eprintln!("pitbull-rustc: {note}");
+        }
         // Optional SARIF emission. When `PITBULL_SARIF_OUT` is set,
         // write the (minimal) SARIF report to that path. Each wrapper
         // invocation overwrites the file — fine for single-crate

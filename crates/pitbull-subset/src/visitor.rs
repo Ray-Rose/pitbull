@@ -88,6 +88,13 @@ const MAX_PROJECTION_DEPTH: usize = 16;
 pub struct SubsetVisitor<'cfg> {
     config: &'cfg SubsetConfig,
     errors: Vec<SubsetError>,
+    /// Non-violation diagnostics — see `AuditNote` in diagnostic.rs.
+    /// Populated when the visitor encounters constructs it can see
+    /// but cannot classify (e.g. a Call terminator whose callee path
+    /// cannot be extracted from the const operand). Surfaced via
+    /// `into_report()` so auditors see the gap rather than the
+    /// silent fall-through that was C2 in the v0.1 audit.
+    audit_notes: Vec<crate::diagnostic::AuditNote>,
     /// Whether the current body has been declared `#[pitbull::trusted]`.
     /// Trusted bodies are exempt from body-level checks but their *signatures*
     /// are still subject to PSS-1.
@@ -103,14 +110,28 @@ impl<'cfg> SubsetVisitor<'cfg> {
         Self {
             config,
             errors: Vec::new(),
+            audit_notes: Vec::new(),
             current_body_trusted: false,
             in_spec_context: false,
         }
     }
-    /// Finalize the visit, producing a report.
+    /// Finalize the visit, producing a report. Transfers both errors
+    /// (subset violations) and audit notes (informational gaps the
+    /// visitor flagged but did not reject) into the report.
     #[must_use]
     pub fn into_report(self) -> SubsetReport {
-        SubsetReport::new(self.errors)
+        let mut report = SubsetReport::new(self.errors);
+        report.audit_notes = self.audit_notes;
+        report
+    }
+    /// Record a non-violation audit note. The note is informational
+    /// (does not block verification) but appears in `SubsetReport.audit_notes`
+    /// for an auditor's review.
+    pub fn audit_note(&mut self, span: Span, message: impl Into<String>) {
+        self.audit_notes.push(crate::diagnostic::AuditNote {
+            span,
+            message: message.into(),
+        });
     }
     /// Number of errors recorded so far.
     #[must_use]
@@ -468,9 +489,33 @@ impl<'cfg> SubsetVisitor<'cfg> {
             Some(p) if p == "std::thread::spawn" || p.starts_with("std::thread::Builder::spawn") => {
                 self.reject(rules::PB028, span, "thread spawn");
             }
-            Some(_) | None => {
-                // Fall through. Most calls are user code; they are visited
-                // by the reachability driver as separate bodies.
+            Some(_) => {
+                // Known callee, not in the std-classifier set: assume
+                // user code. The reachability driver walks the callee's
+                // body as a separate verification subject; rules fire
+                // there if needed.
+            }
+            None => {
+                // We saw a Call terminator whose const operand has no
+                // extractable path. Today this happens when the const's
+                // type is not `RigidTy::FnDef` (the adapter's
+                // `const_operand` only populates `path` for that case).
+                // Real-world MIR rarely produces this shape, but a
+                // future rustc lowering of `panic!` / `transmute` /
+                // atomic / thread-spawn calls through a non-FnDef
+                // intermediate would slip past every classifier above.
+                //
+                // Audit posture rejects silent fall-throughs (v0.1
+                // audit finding C2). Record an audit note so an
+                // auditor sees the gap, even though it isn't a
+                // PSS-1 violation per se. The reachability driver
+                // still walks any downstream body normally.
+                self.audit_note(
+                    span,
+                    "callee not classified (non-FnDef const operand); \
+                     reachability driver continues but no path-specific \
+                     rule was applied at this call site",
+                );
             }
         }
     }
@@ -1204,6 +1249,68 @@ mod tests {
         );
     }
     // ----- strict_panic_acceptance toggle (PB043) ----------------------
+    /// Build a single-block body whose terminator is a Call with a
+    /// constant operand whose `path` is None. Models the rare MIR
+    /// shape where the callee is a non-FnDef-typed constant — the
+    /// adapter cannot extract a path so `classify_called_function`
+    /// records an audit note instead of falling through silently
+    /// (v0.1 audit finding C2).
+    fn body_calling_unclassifiable() -> Body {
+        use crate::mir_api::*;
+        Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            return_ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![],
+            blocks: vec![BasicBlockData {
+                statements: vec![],
+                terminator: Terminator {
+                    kind: TerminatorKind::Call {
+                        func: Operand::Constant(ConstOperand {
+                            ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
+                            def_id: None,
+                            path: None,
+                        }),
+                        args: vec![],
+                        destination: Place { local: Local(0), projection: vec![] },
+                        target: None,
+                    },
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        }
+    }
+    /// C2 regression: a Call with `path: None` must record an audit
+    /// note (not silently fall through). Pins the audit posture that
+    /// every unclassified call site at least surfaces a diagnostic
+    /// for an auditor to review.
+    #[test]
+    fn unclassifiable_callee_records_audit_note() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = body_calling_unclassifiable();
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert!(
+            report.errors.is_empty(),
+            "unclassifiable callee must not fire a hard violation; got {:?}",
+            report.errors,
+        );
+        assert_eq!(
+            report.audit_notes.len(),
+            1,
+            "expected exactly one audit note for the unclassifiable callee; got {:?}",
+            report.audit_notes,
+        );
+        assert!(
+            report.audit_notes[0].message.contains("callee not classified"),
+            "audit note message should explain the gap; got {:?}",
+            report.audit_notes[0].message,
+        );
+    }
     /// Build a single-block body whose terminator is `Call(path)`. Used
     /// by the panic-toggle tests to construct a synthetic panic call site.
     fn body_calling(path: &str) -> Body {
