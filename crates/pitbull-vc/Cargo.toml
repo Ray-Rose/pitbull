@@ -1,0 +1,22 @@
+[package]
+name        = "pitbull-vc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Verification-condition generation and SMT dispatch for the Pitbull deductive verifier"
+
+[dependencies]
+# Shadow types from pitbull-subset (Span, etc.) so VC goals can point
+# back at the same source-location representation the visitor uses.
+pitbull-subset = { path = "../pitbull-subset" }
+
+# Serialization for the on-disk SMT-LIB problem files and the
+# proof-certificate format (v0.3 work; the field is here today so
+# the format can be extended without API breaks).
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+[lints]
+workspace = true

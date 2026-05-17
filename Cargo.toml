@@ -1,27 +1,32 @@
 ################################################################################
 # Pitbull — a SPARK-style deductive verifier for Rust
 #
-# Workspace manifest. The three crates here form the v0.1 spine:
+# Workspace manifest. The crates here cover the v0.1 + v0.2-scaffold spine:
 #
 #   pitbull-spec       — attribute proc-macros (requires/ensures/trusted/etc.)
 #                        that rustc treats as no-ops and Pitbull consumes.
 #   pitbull-subset     — the PSS-1 subset enforcer: exhaustive MIR visitor that
 #                        rejects every construct outside the verifiable subset.
+#   pitbull-vc         — v0.2 scaffold: verification-condition types, SMT-LIB
+#                        emission, and external SMT solver invocation (Z3
+#                        today, CVC5/Alt-Ergo to follow). Not yet wired into
+#                        the driver; the next milestone integrates.
 #   pitbull-driver     — `cargo pitbull` subcommand. Orchestrates compilation,
 #                        subset checking, translation, and SMT dispatch.
 #
-# Translation (MIR → Coma → Why3 → SMT), proof caching, and counterexample
-# rendering live in separate crates added in later milestones.
+# Translation (MIR → Coma → Why3) for functional-correctness predicates and
+# proof-certificate format live in further crates added in v0.3+.
 #
 # Toolchain pinning. We track Creusot's nightly to stay compatible with the
-# upstream we fork pitbull-translate from. Update in lockstep with Creusot
-# releases; the cadence is roughly quarterly.
+# upstream we fork the (planned) MIR → Coma layer from. Update in lockstep
+# with Creusot releases; the cadence is roughly quarterly.
 ################################################################################
 [workspace]
 resolver = "2"
 members = [
     "crates/pitbull-spec",
     "crates/pitbull-subset",
+    "crates/pitbull-vc",
     "crates/pitbull-driver",
 ]
 [workspace.package]
