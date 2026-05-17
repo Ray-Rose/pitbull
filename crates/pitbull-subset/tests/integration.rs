@@ -302,6 +302,16 @@ fn run_one_corpus_file_with_env(
     path: &Path,
     extra_env: &[(&str, &std::ffi::OsStr)],
 ) -> Result<String, String> {
+    run_one_corpus_file_full(env, path, extra_env).map(|(stderr, _)| stderr)
+}
+/// Same as `run_one_corpus_file_with_env` but also returns the
+/// wrapper's exit code. Used by tests that need to confirm the
+/// wrapper hard-exits on misconfiguration (audit finding H1).
+fn run_one_corpus_file_full(
+    env: &E2eEnv,
+    path: &Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> Result<(String, Option<i32>), String> {
     let source =
         fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let stripped = strip_pitbull_attrs(&source);
@@ -346,12 +356,105 @@ fn run_one_corpus_file_with_env(
     let _ = fs::remove_file(&temp_dir);
     let _ = fs::remove_file(&output_artifact);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let code = output.status.code();
     // We don't require exit code 0 — pitbull-rustc continues compilation
     // even when violations are found, so success means rustc completed.
     // A non-zero exit could mean the file itself doesn't compile (e.g.,
     // unknown crate `pitbull`) — surface that as part of stderr for the
-    // assertion to handle.
-    Ok(stderr)
+    // assertion to handle. The exit code is returned for tests that
+    // need it (H1 hard-error regression).
+    Ok((stderr, code))
+}
+/// Regression test for audit finding H1: when `PITBULL_TOML` points
+/// at a path that exists but contains malformed TOML, the wrapper
+/// must hard-error (exit code 2) rather than silently fall back to
+/// the test default config. The earlier behavior would let a typo'd
+/// config produce a "successful" verification under permissive
+/// defaults — the silent-skip anti-pattern.
+#[test]
+fn malformed_pitbull_toml_hard_errors() {
+    let Some(env) = E2eEnv::probe() else {
+        let require = std::env::var_os("PITBULL_REQUIRE_E2E").is_some();
+        if require {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "malformed_pitbull_toml_hard_errors: SKIPPED — prerequisites missing.",
+        );
+        return;
+    };
+    // Write a syntactically broken pitbull.toml. The TOML parser
+    // will reject `not = valid = toml = ===` outright.
+    let mut config_path = std::env::temp_dir();
+    config_path.push(format!("pitbull-h1-malformed-{}.toml", std::process::id()));
+    let broken_text = "not = valid = toml = ===\n";
+    fs::write(&config_path, broken_text)
+        .expect("write temp malformed pitbull.toml");
+    let corpus = Path::new("tests")
+        .join("corpus")
+        .join("reject")
+        .join("PB018_static_mut.rs");
+    let result = run_one_corpus_file_full(
+        &env,
+        &corpus,
+        &[("PITBULL_TOML", config_path.as_os_str())],
+    );
+    let _ = fs::remove_file(&config_path);
+    let (stderr, code) = result.expect("wrapper should spawn");
+    assert_eq!(
+        code,
+        Some(2),
+        "H1: malformed pitbull.toml must exit 2 (config error); \
+         got exit code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("config error"),
+        "H1: stderr should mention 'config error' to make the failure \
+         mode clear; got:\n{stderr}",
+    );
+}
+/// Regression test for audit finding H1 (companion): when
+/// `PITBULL_TOML` is set to a path that does not exist, the wrapper
+/// must hard-error rather than silently fall back.
+#[test]
+fn nonexistent_pitbull_toml_path_hard_errors() {
+    let Some(env) = E2eEnv::probe() else {
+        let require = std::env::var_os("PITBULL_REQUIRE_E2E").is_some();
+        if require {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "nonexistent_pitbull_toml_path_hard_errors: SKIPPED — prerequisites missing.",
+        );
+        return;
+    };
+    let mut nonexistent = std::env::temp_dir();
+    nonexistent.push(format!(
+        "pitbull-h1-nonexistent-{}-does-not-exist.toml",
+        std::process::id(),
+    ));
+    // Ensure it really doesn't exist.
+    let _ = fs::remove_file(&nonexistent);
+    let corpus = Path::new("tests")
+        .join("corpus")
+        .join("reject")
+        .join("PB018_static_mut.rs");
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &corpus,
+        &[("PITBULL_TOML", nonexistent.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    assert_eq!(
+        code,
+        Some(2),
+        "H1: PITBULL_TOML pointing at nonexistent path must exit 2; \
+         got exit code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("does not exist"),
+        "H1: stderr should mention 'does not exist'; got:\n{stderr}",
+    );
 }
 /// Regression test for audit finding C1: when `pitbull.toml` sets
 /// `verify_roots` to a pattern that does not match any item in the

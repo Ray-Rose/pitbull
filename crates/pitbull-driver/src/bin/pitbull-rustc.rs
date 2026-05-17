@@ -401,10 +401,39 @@ impl PitbullCallbacks {
 /// the user's pitbull.toml so dependency compiles see the same config.
 #[cfg(rustc_public_real)]
 fn load_config() -> pitbull_subset::SubsetConfig {
-    let path = std::env::var_os("PITBULL_TOML")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("pitbull.toml"));
+    // Two sources, both optional:
+    //   1. `PITBULL_TOML` env var (preferred — `cargo-pitbull check`
+    //      sets it to the absolute path of the user's config so
+    //      dependency compiles, which run with a different cwd, see
+    //      the same configuration).
+    //   2. `./pitbull.toml` in the wrapper's cwd.
+    //
+    // Hard-error posture (audit finding H1): the wrapper REFUSES to
+    // proceed when a config was named but cannot be loaded, rather
+    // than silently substituting `default_for_test()`. Earlier behavior
+    // would let a typo'd path or a malformed file produce a
+    // "successful" verification under test defaults — exactly the
+    // silent-skip anti-pattern PSS-1 §17 says to avoid.
+    //
+    // The one permissive path that remains: PITBULL_TOML unset AND
+    // ./pitbull.toml absent → fall back to `default_for_test()` so
+    // ad-hoc smoke tests against an unconfigured crate still work
+    // (documented v0.1 demo posture). Set PITBULL_TOML to a real path
+    // for production use.
+    let (path, source_was_env) = match std::env::var_os("PITBULL_TOML") {
+        Some(p) => (std::path::PathBuf::from(p), true),
+        None => (std::path::PathBuf::from("pitbull.toml"), false),
+    };
     if !path.exists() {
+        if source_was_env {
+            eprintln!(
+                "pitbull-rustc: config error: PITBULL_TOML={} does not exist",
+                path.display(),
+            );
+            std::process::exit(2);
+        }
+        // No config file and no env var — open-walk fallback for
+        // ad-hoc smoke tests. Production should set PITBULL_TOML.
         return pitbull_subset::SubsetConfig::default_for_test();
     }
     match pitbull_subset::SubsetConfig::load_and_validate(&path) {
@@ -422,10 +451,10 @@ fn load_config() -> pitbull_subset::SubsetConfig {
         }
         Err(e) => {
             eprintln!(
-                "pitbull-rustc: could not load {}: {e}; using default config",
-                path.display()
+                "pitbull-rustc: config error: could not load {}: {e}",
+                path.display(),
             );
-            pitbull_subset::SubsetConfig::default_for_test()
+            std::process::exit(2);
         }
     }
 }
