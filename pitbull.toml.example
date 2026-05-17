@@ -42,8 +42,36 @@ vc_timeout_seconds = 60
 # [verification.preconditions]
 # "my_crate::add_two" = ["x < 100", "y < 100"]
 #
-# Raw SMT-LIB escape hatch (still works):
+# Raw SMT-LIB escape hatch (still works, with lex-validation):
 # "my_crate::weird" = ["(assert (= lhs #x00000007))"]
+#
+# ## Audit posture (post-O.2 hardening)
+#
+# Each precondition string is processed through three checks. The
+# rejection path produces a loud `audit-note` in the wrapper's
+# stderr — silent skips are forbidden:
+#
+#   1. Lex-validation (F2): a raw-SMT-LIB string must be exactly
+#      one balanced `(assert ...)` form. String literals (`"..."`),
+#      comments (`;...`), multi-directive injections
+#      (`(check-sat) (assert false)`), and unbalanced parens are
+#      all refused.
+#
+#   2. Translation range (F3): predicate-form preconditions whose
+#      literal doesn't fit the operand type (`x < 1_000_000`
+#      against a `u8` parameter) produce an audit note rather
+#      than silent truncation.
+#
+#   3. Consistency check (F1, CRITICAL): before discharging any
+#      obligation that carries assumptions, Pitbull runs a
+#      satisfiability check on the assumption set alone. If the
+#      assumptions are contradictory (`(assert false)` or
+#      mutually exclusive constraints like `["x < 10", "x > 100"]`),
+#      the wrapper logs "REFUSED — preconditions are
+#      contradictory" and treats the obligation as undischarged.
+#      Without this check, a contradictory hypothesis would make
+#      Z3 return `unsat` for any safety property — silently
+#      "verifying" unsafe code via vacuous implication.
 # Solver agreement threshold. PSS-1 design: require 2-of-3 solvers to return
 # UNSAT before accepting a proof obligation. Increase to 3 for highest-assurance
 # builds. Decrease only with documented justification.

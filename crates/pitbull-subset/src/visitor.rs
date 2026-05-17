@@ -20,14 +20,15 @@
 //! Soundness-relevant gaps documented for auditors. Each one is referenced
 //! in the Safety Manual and tracked in the v0.2 milestone:
 //!
-//! - **PB001 (unsafe block syntax):** The visitor runs on MIR, which has
-//!   already discarded HIR-level `unsafe { }` block markers. Detection is
-//!   indirect: every operation that an unsafe block can host (raw pointer
-//!   deref, transmute, intrinsic call, retag, inline asm) is caught by
-//!   its own rule (PB004, PB007, PB009, PB006, etc.). An empty
-//!   `unsafe { }` block is therefore accepted, which is sound (it does
-//!   nothing) though it does miss the syntactic intent signal. A
-//!   pre-MIR HIR pass added in v0.2 closes the gap.
+//! - **PB001 (unsafe block syntax):** *Closed in v0.2.* The visitor runs
+//!   on MIR, which has discarded HIR-level `unsafe { }` markers. The
+//!   `pitbull-rustc` wrapper now adds a HIR pre-pass (`UnsafeBlockVisitor`,
+//!   driven by `tcx.hir_visit_all_item_likes_in_crate`) that emits PB001
+//!   on every `BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided)`
+//!   whose span isn't macro-expanded (the macro filter is the F7 audit
+//!   fix — `vec![1,2,3]` etc. no longer false-positives). Operations
+//!   inside the block also still fire their MIR-level rules
+//!   (PB004/PB007/PB009/PB006), so the audit trail is complete.
 //!
 //! - **PB018 (static mut and interior-mutable statics):** *Closed.* The
 //!   reachability driver now visits item declarations via
@@ -44,12 +45,21 @@
 //!   on user types with huge inline arrays. Real layout-aware detection
 //!   for those cases lands with the rustc_public wiring.
 //!
-//! - **PB043 (panic unreachability):** v0.1 has no VC backend, so panic
-//!   call sites cannot be discharged as unreachable. By default the
-//!   visitor tags them and the driver's `verify` command warns. Set
-//!   `verification.strict_panic_acceptance = true` in `pitbull.toml` to
-//!   reject all reachable panic calls at the subset level — the
-//!   conservative v0.1 posture.
+//! - **PB043 (panic unreachability):** *VC obligation emitted in v0.2.*
+//!   Default mode now emits a `VcObligationKind::PanicReachability`
+//!   for every reachable panic call site (`is_panic_call_path`
+//!   covers `core::panicking::*`, `std::panicking::*`, `core::panic_any`,
+//!   `std::panic_any`, and the four `std::rt::*` entry points). The
+//!   `pitbull-vc` compiler returns `None` for the kind today — the
+//!   wrapper's dispatch loop reports each as "pending" so the gap is
+//!   visible in the VC summary rather than silently elided. When the
+//!   v0.3+ path-sensitive backend lands, the visitor change is
+//!   nothing: dispatch flips automatically.
+//!
+//!   Set `verification.strict_panic_acceptance = true` in `pitbull.toml`
+//!   to skip the obligation and reject all reachable panic calls at
+//!   the subset level — the conservative posture for users without
+//!   the v0.3+ backend.
 //!
 //! - **`in_spec_context` is always false in v0.1:** Spec-mode rules
 //!   (PB064, PB066, PB069) require the visitor to track whether an
@@ -175,12 +185,6 @@ impl<'cfg> SubsetVisitor<'cfg> {
             span,
             message: message.into(),
         });
-    }
-    /// Record a VC obligation for `pitbull-vc` to discharge. The
-    /// obligation captures what needs to be proven (and where);
-    /// SMT-LIB encoding happens downstream.
-    pub fn vc_obligation(&mut self, obligation: crate::vc::VcObligation) {
-        self.vc_obligations.push(obligation);
     }
     /// Number of errors recorded so far.
     #[must_use]

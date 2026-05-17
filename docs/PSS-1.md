@@ -633,6 +633,78 @@ the std form and now also matches. No shadow type changes.
   the normal match arms. The UX is intentionally crude in O.1
   (users hand-write SMT-LIB and track operand positions) — O.2
   introduces the Rust-like predicate grammar that fixes both.
+- ✅ Audit cleanup #6 (final residuals). Closes M-4/M-5/M-6/M-7/M-8
+  from a third audit pass: PSS-1.md entries for the four
+  follow-up cleanup commits, stale "49 + 1 ignored" baseline
+  updated to current "120 passing, 0 ignored",
+  `pitbull.toml.example` documents F1/F2/F3 behavior changes,
+  visitor module-doc updated to reflect that PB001's HIR
+  pre-pass and PB043's VC obligation emission are live (not
+  future). Removed dead `pub fn vc_obligation` method
+  (replaced by direct field push within the visitor since the
+  emission helpers were inlined). Added two new regression
+  tests: `dispatch_refuses_contradictory_preconditions` (F1
+  REFUSED path) and `wrapper_exits_nonzero_on_violation` (F10
+  exit code policy). The F7 macro-filter regression test is
+  documented as remaining work (requires a real-nightly e2e
+  fixture).
+- ✅ Audit cleanup #5: F7 + F8 + F10 (red-team finding cluster).
+  HIR pre-pass now skips macro-expanded `unsafe` blocks via
+  `Span::from_expansion()` — `vec![1,2,3]`, `format!()`,
+  `println!()` no longer trigger PB001 false positives.
+  `pitbull-driver` (both `main.rs` and `bin/pitbull-rustc.rs`)
+  gets `#![forbid(unsafe_code)]` for defense in depth — every
+  TCB crate root now refuses unsafe at the language level.
+  Wrapper exit code now reflects Pitbull's findings: `rustc_exit_code.max(pitbull_exit_code)`
+  where pitbull_exit_code is 1 if violations > 0 OR
+  undischarged obligations > 0. `dispatch_vc_obligations` now
+  returns the undischarged count for the caller to fold.
+- ✅ Audit cleanup #4: F3 + H-1/H-2/H-3 + specific audit
+  messages for translation failures. `legal_range_i128`
+  special-cases `(true, 128)` to return `(i128::MIN, i128::MAX)`
+  — the off-by-one overflow on `1i128.checked_shl(127)` is
+  closed. The classifier `is_panic_call_path` adds
+  `core::panic_any` and `std::panic_any` (top-level panic API
+  that isn't under `panicking::*`). PB007 transmute arm adds
+  `core::intrinsics::transmute_unchecked` and the `std::*`
+  re-export. PB011 alloc arm adds `core::alloc::Allocator::*`
+  and `std::alloc::Allocator::*` prefixes for trait-method
+  allocator calls. The visitor's precondition processing
+  restructured into three explicit outcomes with
+  path-specific audit messages (predicate-parsed + bound +
+  translated; predicate parsed + bound + translation failed
+  with translator's error; predicate doesn't parse or doesn't
+  bind, then raw-splice with lex validation).
+- ✅ Audit cleanup #3: F1 (consistency-check guard against
+  contradictory preconditions). CRITICAL soundness fix. A
+  pitbull.toml precondition like `"(assert false)"` would
+  otherwise make Z3 return `unsat` for any safety property,
+  which the wrapper interprets as "discharged" — silently
+  "verifying" unsafe code under vacuous truth. The fix runs a
+  sat-check-only SMT problem (declarations + assumptions +
+  `check-sat`, no safety predicate) BEFORE the main check.
+  If the consistency check returns `Unsat`, the wrapper logs
+  "REFUSED — preconditions are contradictory" and treats the
+  obligation as undischarged. `VcGoal` gains
+  `consistency_check: Option<String>` (None when no
+  assumptions — trivially consistent, skip the extra solver
+  call). Cost: one extra solver call per obligation with
+  assumptions.
+- ✅ Audit cleanup #2: F2 + F9 (assumption lex-validation +
+  verdict-parser hardening). Both are CRITICAL soundness
+  fixes from the second-pass red-team. F2: a maliciously
+  crafted assumption could carry multiple SMT-LIB directives
+  (`"(check-sat) (assert false)"`) that subvert the wrapper's
+  verdict interpretation. The new `predicate::validate_assertion_form`
+  function requires every raw assumption to be exactly one
+  `(assert ...)` form with balanced parens, no string
+  literals, no comments. Anything else is refused with an
+  audit note rather than spliced verbatim. F9: defense in
+  depth at the solver layer — the verdict parser now
+  collects ALL verdict lines and refuses output with more
+  than one verdict (returns `SolverResult::Error`). The
+  wrapper's dispatch already maps `Error` to "undischarged",
+  so a multi-verdict response cannot be silently misread.
 - ✅ Audit cleanup after O.2 (Task O.2-cleanup). Three findings
   from a deep audit landed as a single commit:
 
@@ -803,7 +875,8 @@ the std form and now also matches. No shadow type changes.
   a known `rustc_private` mechanism limitation; tools like Kani and
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
-  unit tests work fine on stable Rust (49 + 1 ignored, the v0.1
+  unit tests work fine on stable Rust (post-audit-cleanup baseline:
+  120 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline). The driver-side test harness is the right home for tests
   that exercise the adapter against real MIR.
 **Verification today:**
