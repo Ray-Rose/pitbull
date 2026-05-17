@@ -150,16 +150,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// `pitbull.toml`'s `[verification.preconditions]` map and
     /// passes the result here.
     ///
-    /// Pass an empty vec (or call `clear_current_preconditions`)
-    /// between bodies that aren't in the config; otherwise the
-    /// previous body's preconditions leak across.
+    /// Pass an empty `Vec` between bodies that aren't in the
+    /// config; otherwise the previous body's preconditions leak
+    /// across.
     pub fn set_current_preconditions(&mut self, preconditions: Vec<String>) {
         self.current_body_preconditions = preconditions;
-    }
-    /// Companion to `set_current_preconditions` for callers that
-    /// want to make the empty-state explicit at the call site.
-    pub fn clear_current_preconditions(&mut self) {
-        self.current_body_preconditions.clear();
     }
     /// Finalize the visit, producing a report. Transfers errors
     /// (subset violations), audit notes (informational gaps), and
@@ -521,32 +516,79 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // qualified path string via `rustc_public::CrateDef::name`.
         let path = self.path_of_const(c);
         // First, fully-qualified-path matches.
+        //
+        // ## std re-export normalization
+        //
+        // rustc resolves item paths through whichever prelude brought
+        // them into scope. For std-using crates the post-mono
+        // `name()` typically returns the `std::*` form (e.g.
+        // `std::panicking::panic_fmt`), NOT the canonical
+        // `core::*` / `alloc::*` form. The `classify_adt` site for
+        // PB011/PB012/PB015 already accepts both forms
+        // (visitor.rs::classify_adt). The call-classifier needs the
+        // same normalization or panic / alloc / transmute / volatile
+        // / atomic calls in std-using crates silently miss their
+        // rules.
+        //
+        // Discovered during the O.2 audit cleanup: PB043 default-mode
+        // obligations weren't firing on real code because
+        // `panic!("...")` resolves through `std::panicking::*`.
         match path.as_deref() {
-            Some(p) if p.starts_with("core::panicking::") || p == "core::panic" => {
-                // PB043 design: panic calls are tagged as VC obligations for
-                // the v0.2 verifier to discharge. The v0.1 driver has no VC
-                // backend, so a tagged-but-not-discharged panic would slip
-                // through. We support a strict-panic mode for users who
-                // want PSS-1 subset-level rejection of all reachable panic
-                // calls regardless of provability.
+            Some(p) if is_panic_call_path(p) => {
+                // PB043 has two postures:
                 //
-                // FIXME(pitbull v0.2): once the VC backend is online, switch
-                // the default to "tag for VC" and demote this branch to
-                // only fire under `strict_panic_acceptance = true`.
+                // - **Strict** (`verification.strict_panic_acceptance = true`):
+                //   any reachable panic call is rejected outright. The
+                //   v0.1 conservative posture for users running
+                //   `pitbull check` without a discharging backend who
+                //   want subset-level panic rejection.
+                //
+                // - **Default**: emit a `PanicReachability` VC obligation.
+                //   The expectation is that a v0.3+ path-sensitive
+                //   reasoner discharges these obligations (proves the
+                //   call site is dead, or that the panic guard's
+                //   precondition holds). Today,
+                //   `pitbull_vc::compile` returns `None` for the
+                //   `PanicReachability` kind — the dispatch loop in
+                //   the wrapper reports each as "pending" so the gap
+                //   is VISIBLE in the VC summary rather than silently
+                //   elided. This audit-trail posture matches the C2
+                //   fix for unclassifiable callees.
+                //
+                // Once the backend's PanicReachability arm lands,
+                // dispatch flips automatically — no visitor change needed.
                 if self.config.verification.strict_panic_acceptance {
                     self.reject(rules::PB043, span, format!("panic call `{p}` (strict mode)"));
+                } else {
+                    self.emit_panic_reachability_obligation(p, span);
                 }
             }
-            Some(p) if p.starts_with("alloc::alloc::") => {
+            Some(p)
+                if p.starts_with("alloc::alloc::")
+                    || p.starts_with("std::alloc::") =>
+            {
                 self.reject(rules::PB011, span, format!("call to allocator API `{p}`"));
             }
-            Some(p) if p == "core::mem::transmute" || p == "core::intrinsics::transmute" => {
+            Some(p)
+                if p == "core::mem::transmute"
+                    || p == "std::mem::transmute"
+                    || p == "core::intrinsics::transmute"
+                    || p == "std::intrinsics::transmute" =>
+            {
                 self.reject(rules::PB007, span, "`transmute` call");
             }
-            Some(p) if p == "core::ptr::read_volatile" || p == "core::ptr::write_volatile" => {
+            Some(p)
+                if p == "core::ptr::read_volatile"
+                    || p == "std::ptr::read_volatile"
+                    || p == "core::ptr::write_volatile"
+                    || p == "std::ptr::write_volatile" =>
+            {
                 self.reject(rules::PB025, span, format!("volatile op `{p}`"));
             }
-            Some(p) if p.starts_with("core::sync::atomic::") => {
+            Some(p)
+                if p.starts_with("core::sync::atomic::")
+                    || p.starts_with("std::sync::atomic::") =>
+            {
                 self.reject(rules::PB023, span, format!("atomic op `{p}`"));
             }
             Some(p) if p == "std::thread::spawn" || p.starts_with("std::thread::Builder::spawn") => {
@@ -1150,6 +1192,34 @@ impl<'cfg> SubsetVisitor<'cfg> {
             assumptions,
         });
     }
+    /// Emit a `PanicReachability` VC obligation for a panic call
+    /// site. The visitor itself cannot prove unreachability —
+    /// that's a path-sensitive backend task — so we push the
+    /// typed obligation and let `pitbull-vc` report "pending"
+    /// until the encoding arm lands. The point is to make the
+    /// gap visible in the report rather than silently accepting
+    /// the call as safe (audit posture).
+    ///
+    /// `_panic_path` is reserved for richer diagnostics once the
+    /// backend can attach the path to a counterexample trace; it
+    /// isn't read today.
+    fn emit_panic_reachability_obligation(&mut self, _panic_path: &str, span: Span) {
+        let seq = self.vc_obligations.len();
+        let id = format!("pb043-panic-{seq}");
+        // Carry the current body's preconditions through. They
+        // don't have a natural binding for PanicReachability today
+        // (no `lhs`/`rhs` like overflow obligations have), so the
+        // pitbull-vc compiler currently ignores them — but keeping
+        // them in the obligation means a future backend with a
+        // richer encoding inherits the context automatically.
+        let assumptions = self.current_body_preconditions.clone();
+        self.vc_obligations.push(crate::vc::VcObligation {
+            id,
+            span,
+            kind: crate::vc::VcObligationKind::PanicReachability,
+            assumptions,
+        });
+    }
     /// Resolve an operand to its source-level parameter name when
     /// the operand is a direct read of a function argument (no
     /// projections, base local is one of the arg slots). Returns
@@ -1212,6 +1282,38 @@ impl<'cfg> SubsetVisitor<'cfg> {
         };
         primitive_int_name_from_ty(ty)
     }
+}
+/// Whether a fully-qualified callee path names a known panic
+/// entry point. The set is curated against rustc's actual lowering
+/// of `panic!()` and friends — discovered empirically via the
+/// audit cleanup smoke when `std::rt::panic_fmt` came back instead
+/// of the `core::panicking::*` paths the visitor originally
+/// expected.
+///
+/// Patterns covered (with rationale):
+/// - `core::panicking::*` / `core::panic` — direct panic from
+///   no_std / core code, and the older `panic!` lowering.
+/// - `std::panicking::*` / `std::panic` — std re-export forms.
+/// - `std::rt::panic_fmt` / `std::rt::panic_display` /
+///   `std::rt::begin_panic` / `std::rt::begin_panic_fmt` —
+///   actual runtime entry points rustc emits for `panic!("...")`
+///   in std-using crates (discovered: real path is via std::rt).
+///
+/// Free-standing so corpus tests can pin "this path counts as a
+/// panic" without going through the full visitor machinery.
+#[must_use]
+pub fn is_panic_call_path(p: &str) -> bool {
+    p.starts_with("core::panicking::")
+        || p.starts_with("std::panicking::")
+        || p == "core::panic"
+        || p == "std::panic"
+        || matches!(
+            p,
+            "std::rt::panic_fmt"
+                | "std::rt::panic_display"
+                | "std::rt::begin_panic"
+                | "std::rt::begin_panic_fmt",
+        )
 }
 /// Extract the canonical Rust type name (`"u32"`, `"i64"`, ...) from
 /// a shadow `Ty` when it represents a primitive integer; otherwise
@@ -1673,9 +1775,11 @@ mod tests {
             "obligation should carry the installed preconditions verbatim",
         );
     }
-    /// O.1 hygiene: `clear_current_preconditions` (and the equivalent
-    /// empty `set`) wipes any prior installation, so a body without
+    /// O.1 hygiene: calling `set_current_preconditions(vec![])`
+    /// wipes any prior installation, so a body without
     /// preconditions emits obligations with empty `assumptions`.
+    /// Pins the contract that the wrapper relies on for per-body
+    /// state isolation.
     #[test]
     fn clearing_preconditions_makes_assumptions_empty() {
         use crate::mir_api::*;
@@ -1724,8 +1828,9 @@ mod tests {
         // First body: with preconditions.
         v.set_current_preconditions(vec!["(assert true)".into()]);
         v.visit_body(&make_body(), false);
-        // Second body: cleared.
-        v.clear_current_preconditions();
+        // Second body: cleared via the canonical empty-vec
+        // "set" (the only path the wrapper uses too).
+        v.set_current_preconditions(vec![]);
         v.visit_body(&make_body(), false);
         let report = v.into_report();
         assert_eq!(report.vc_obligations.len(), 2);
@@ -2032,10 +2137,14 @@ mod tests {
             span: Span::default(),
         }
     }
-    /// PSS-1 PB043 default: a reachable call to `core::panicking::panic_fmt`
-    /// is accepted by the v0.1 subset checker because the VC backend (v0.2)
-    /// will discharge the unreachability proof. The driver's `verify`
-    /// command warns; subset check stays clean.
+    /// PSS-1 PB043 default: a reachable call to
+    /// `core::panicking::panic_fmt` is NOT rejected at the subset
+    /// level; instead the visitor emits a `PanicReachability` VC
+    /// obligation that a v0.3+ backend will eventually discharge.
+    /// pitbull-vc::compile returns None for the kind today, so
+    /// the wrapper reports the obligation as "pending" — the
+    /// audit trail is visible rather than the call being silently
+    /// accepted (which was the pre-audit-fix posture).
     #[test]
     fn default_accepts_panic_call_for_vc_discharge() {
         let cfg = SubsetConfig::default_for_test();
@@ -2043,9 +2152,158 @@ mod tests {
         let mut v = SubsetVisitor::new(&cfg);
         let body = body_calling("core::panicking::panic_fmt");
         v.visit_body(&body, false);
+        let report = v.into_report();
         assert!(
-            !v.errors.iter().any(|e| e.rule == rules::PB043),
-            "default mode: PB043 must NOT fire — the call is tagged for the VC generator"
+            !report.errors.iter().any(|e| e.rule == rules::PB043),
+            "default mode: PB043 must NOT fire as a violation \
+             (it becomes a VC obligation instead)",
+        );
+        let panic_obligations: Vec<_> = report
+            .vc_obligations
+            .iter()
+            .filter(|o| matches!(
+                o.kind,
+                crate::vc::VcObligationKind::PanicReachability,
+            ))
+            .collect();
+        assert_eq!(
+            panic_obligations.len(),
+            1,
+            "default mode: panic call must produce exactly one \
+             PanicReachability obligation; got {panic_obligations:?}",
+        );
+        assert!(
+            panic_obligations[0].id.starts_with("pb043-panic-"),
+            "obligation id should follow pb043-panic-{{seq}} format; \
+             got {:?}",
+            panic_obligations[0].id,
+        );
+    }
+    /// Audit-cleanup fix: panic calls resolved through std's
+    /// re-export (`std::panicking::*`) are caught by the same
+    /// PB043 logic as `core::panicking::*`. Pins the std-prefix
+    /// normalization the audit uncovered as missing.
+    #[test]
+    fn default_panic_call_via_std_re_export_emits_obligation() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = body_calling("std::panicking::panic_fmt");
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert!(
+            report.vc_obligations.iter().any(|o| matches!(
+                o.kind,
+                crate::vc::VcObligationKind::PanicReachability,
+            )),
+            "std::panicking::* must also emit PanicReachability \
+             (std re-export normalization); got {:?}",
+            report.vc_obligations,
+        );
+    }
+    /// Audit-cleanup discovery: `panic!("...")` in std-using crates
+    /// lowers to `std::rt::panic_fmt`, NOT the `core::panicking::*`
+    /// or `std::panicking::*` paths the visitor originally expected.
+    /// Pin each known runtime entry point so a future rustc lowering
+    /// change is loud (test breaks) rather than silent (panic missed).
+    #[test]
+    fn is_panic_call_path_recognizes_known_entry_points() {
+        let positive = [
+            "core::panicking::panic",
+            "core::panicking::panic_fmt",
+            "core::panicking::panic_explicit",
+            "std::panicking::begin_panic",
+            "core::panic",
+            "std::panic",
+            "std::rt::panic_fmt",
+            "std::rt::panic_display",
+            "std::rt::begin_panic",
+            "std::rt::begin_panic_fmt",
+        ];
+        for p in positive {
+            assert!(is_panic_call_path(p), "should classify as panic: {p}");
+        }
+        let negative = [
+            "core::ptr::read_volatile",   // a real classified path, but for PB025
+            "core::sync::atomic::AtomicU32::load",
+            "my_crate::helper",
+            "std::fmt::Arguments::<'a>::from_str",  // the OTHER unmatched path we observed
+            "",
+        ];
+        for p in negative {
+            assert!(!is_panic_call_path(p), "should NOT classify as panic: {p}");
+        }
+    }
+    #[test]
+    fn std_rt_panic_fmt_emits_panic_reachability_obligation() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = body_calling("std::rt::panic_fmt");
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        let panic_obligations: Vec<_> = report
+            .vc_obligations
+            .iter()
+            .filter(|o| matches!(
+                o.kind,
+                crate::vc::VcObligationKind::PanicReachability,
+            ))
+            .collect();
+        assert_eq!(
+            panic_obligations.len(),
+            1,
+            "std::rt::panic_fmt must produce a PanicReachability \
+             obligation (the actual lowering for `panic!()` in \
+             std-using crates); got {panic_obligations:?}",
+        );
+    }
+    /// Companion: PB011 (alloc), PB007 (transmute), PB025 (volatile),
+    /// PB023 (atomic) all need std re-export normalization too. Pin
+    /// each so the regression can't reappear silently.
+    #[test]
+    fn std_re_exports_match_for_all_classifier_rules() {
+        let cfg = SubsetConfig::default_for_test();
+        let cases = [
+            ("std::alloc::alloc", rules::PB011),
+            ("std::mem::transmute", rules::PB007),
+            ("std::ptr::read_volatile", rules::PB025),
+            ("std::ptr::write_volatile", rules::PB025),
+            ("std::sync::atomic::AtomicU32::load", rules::PB023),
+        ];
+        for (path, expected_rule) in cases {
+            let mut v = SubsetVisitor::new(&cfg);
+            let body = body_calling(path);
+            v.visit_body(&body, false);
+            assert!(
+                v.errors.iter().any(|e| e.rule == expected_rule),
+                "{path}: expected {expected_rule:?} to fire; got errors {:?}",
+                v.errors,
+            );
+        }
+    }
+    /// Strict mode preserves the v0.1-style hard reject. The
+    /// obligation is NOT emitted (no point — the violation
+    /// already terminates the user's check), so the report
+    /// surfaces a PB043 error and no PanicReachability obligation.
+    #[test]
+    fn strict_mode_panic_does_not_emit_obligation() {
+        let mut cfg = SubsetConfig::default_for_test();
+        cfg.verification.strict_panic_acceptance = true;
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = body_calling("core::panicking::panic_fmt");
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert!(
+            report.errors.iter().any(|e| e.rule == rules::PB043),
+            "strict mode: PB043 must fire as a violation",
+        );
+        assert!(
+            !report.vc_obligations.iter().any(|o| matches!(
+                o.kind,
+                crate::vc::VcObligationKind::PanicReachability,
+            )),
+            "strict mode: no PanicReachability obligation should be \
+             emitted (the reject is the verdict); got {:?}",
+            report.vc_obligations,
         );
     }
     /// PSS-1 PB043 strict: with `strict_panic_acceptance = true`, the

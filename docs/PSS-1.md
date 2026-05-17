@@ -633,6 +633,115 @@ the std form and now also matches. No shadow type changes.
   the normal match arms. The UX is intentionally crude in O.1
   (users hand-write SMT-LIB and track operand positions) — O.2
   introduces the Rust-like predicate grammar that fixes both.
+- ✅ Audit cleanup after O.2 (Task O.2-cleanup). Three findings
+  from a deep audit landed as a single commit:
+
+  (1) PSS-1.md doc-drift — Tasks I, J, K, L, M had no §17.1 entries
+      despite the code being live. Added.
+
+  (2) PB043 silent-skip in default mode — `classify_called_function`
+      did NOTHING when a panic call was found in default-acceptance
+      mode (only acted in strict mode). The same anti-pattern Task I
+      fixed for unclassifiable callees. Fix: default mode now emits
+      a `VcObligationKind::PanicReachability` obligation; the
+      wrapper's dispatch loop reports each as "pending" so the gap
+      is visible in the VC summary rather than silently accepted.
+      `pitbull_vc::compile` returns `None` for the kind today (the
+      backend encoding lands later); once it arrives the visitor
+      change requires no further code change.
+
+  (3) Classifier path-match coverage — the call classifier matched
+      `core::*` paths but not the `std::*` re-export forms rustc
+      actually emits for std-using crates. Discovered during O.2
+      audit smoke: `panic!("...")` resolves to `std::rt::panic_fmt`,
+      not `core::panicking::*`. Fixed:
+        - Panic: a new `is_panic_call_path` helper covers
+          `core::panicking::*`, `std::panicking::*`, `core::panic`,
+          `std::panic`, and the four std-runtime entry points
+          (`std::rt::panic_fmt`, `std::rt::panic_display`,
+          `std::rt::begin_panic`, `std::rt::begin_panic_fmt`).
+        - Alloc (PB011): also matches `std::alloc::*`.
+        - Transmute (PB007): also matches `std::mem::transmute`,
+          `std::intrinsics::transmute`.
+        - Volatile (PB025): also matches `std::ptr::*_volatile`.
+        - Atomic (PB023): also matches `std::sync::atomic::*`.
+
+      Same fix shape as the Box ADT path-normalization that landed
+      in 781b906. Now PB043 default obligations fire on real
+      panicking code: `panic!("boom")` produces
+      `pitbull-rustc: vc pb043-panic-0: pending (compilation not
+      yet supported for PanicReachability)` rather than silently
+      registering no diagnostic.
+
+  (4) `clear_current_preconditions` was a dead-API: it was added
+      in O.1 but only the test used it (the wrapper always passes
+      a fresh `Vec` via `set_current_preconditions(unwrap_or_default())`).
+      Removed; the test now uses `set_current_preconditions(vec![])`
+      to express the empty-state intent.
+
+  4 new tests pin these fixes: `is_panic_call_path_recognizes_known_entry_points`,
+  `std_rt_panic_fmt_emits_panic_reachability_obligation`,
+  `default_panic_call_via_std_re_export_emits_obligation`,
+  `std_re_exports_match_for_all_classifier_rules`.
+- ✅ Audit finding C2 fixed (Task I). The visitor's
+  `classify_called_function` previously bundled `Some(_)` and
+  `None` under the same fall-through arm — `None` (an unclassifiable
+  callee, e.g. a non-FnDef const operand) was silently elided. The
+  fix splits the arms; the `None` branch now records a new
+  `AuditNote` (`pitbull_subset::diagnostic::AuditNote`) so the
+  audit trail is visible without raising a violation. The wrapper
+  prints notes alongside errors. Regression test:
+  `visitor::tests::unclassifiable_callee_records_audit_note`.
+- ✅ Audit finding H1 fixed (Task J). `pitbull-rustc` no longer
+  silently falls back to `SubsetConfig::default_for_test()` when
+  `PITBULL_TOML` is set but the file is missing or malformed; it
+  exits 2 with a clear `config error: ...` message. Empty-config
+  fallback (PITBULL_TOML unset AND `./pitbull.toml` absent) is
+  preserved for ad-hoc smoke tests. Regression tests:
+  `integration::malformed_pitbull_toml_hard_errors`,
+  `integration::nonexistent_pitbull_toml_path_hard_errors`.
+- ✅ Audit finding H3 fixed (Task K). Defense-in-depth path
+  validation for env-supplied paths (`PITBULL_TOML`,
+  `PITBULL_SARIF_OUT`). The new `check_env_path` helper refuses
+  `..`-containing paths and paths whose extension isn't in the
+  whitelist for that variable. Defeats build-script env injection
+  (`cargo:rustc-env=PITBULL_TOML=$HOME/.ssh/id_rsa` leaking
+  content via TOML parse errors;
+  `cargo:rustc-env=PITBULL_SARIF_OUT=$HOME/.bashrc` overwriting a
+  config file). `PITBULL_ALLOW_UNSAFE_PATHS=1` is the explicit
+  opt-out for legitimate unconventional paths. Regression tests:
+  `integration::pitbull_toml_with_nontoml_extension_refused` (the
+  most important — asserts file content does NOT leak to stderr),
+  `pitbull_toml_with_traversal_refused`,
+  `pitbull_sarif_out_with_nonjson_extension_refused`.
+- ✅ CI workflow (Task L). `.github/workflows/ci.yml` with two
+  jobs matrix'd across Linux and Windows: `stable` runs
+  `cargo +stable test --workspace --all-features` (corpus e2e
+  tests gracefully skip without the nightly wrapper); `nightly-e2e`
+  installs `nightly-2026-01-29` with `rustc-dev` + `rust-src`,
+  builds the wrapper, then runs the suite with
+  `PITBULL_REQUIRE_E2E=1` so the e2e corpus tests are forced
+  rather than skipped. Concurrency group cancels in-progress runs
+  on the same ref. Intentionally NOT gated (today): `cargo fmt
+  --check` (source style is intentionally compact), `cargo clippy
+  -D warnings` (60+ pre-existing warnings), and the mutation-testing
+  harness (pending `cargo-mutants` integration).
+- ✅ `pitbull-vc` crate scaffold (Task M). New workspace member
+  holding the v0.2 deductive surface:
+    * `vc::VcGoal { obligation, smt }` — compiled VC (typed
+      obligation + SMT-LIB text).
+    * `vc::compile` — turns a `VcObligation` into a `VcGoal`.
+    * `smt::emit_overflow_problem_with_assumptions` — bit-vector
+      QF_BV problem for the seven `bvXaddo`/`bvXsubo`/`bvXmulo`
+      overflow predicates (signed + unsigned, u8..u128 + i8..i128).
+    * `solver::invoke_z3` — pipes SMT-LIB to `z3 -in`, returns
+      `SolverResult { Sat, Unsat, Unknown, NotInstalled, Timeout,
+      Error(String) }`. `NotInstalled` is observably distinct so
+      the wrapper degrades gracefully on developer machines
+      without Z3.
+    * Includes per-VC timeout via SMT-LIB `(set-option :timeout)`.
+    * 13 unit tests covering parser, translator, and a live Z3
+      round-trip that skips cleanly when Z3 isn't installed.
 - ✅ v0.2 deductive backend spine: end-to-end VC dispatch (Task N).
   Wires the visitor → `pitbull-vc` → external SMT solver loop that
   makes "deductive verifier" literally true for the first time:
