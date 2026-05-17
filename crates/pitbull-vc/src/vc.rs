@@ -1,117 +1,102 @@
-//! Verification-condition types.
+//! Compiled verification-condition goal.
 //!
-//! A `VcGoal` is one safety obligation Pitbull asks an SMT solver
-//! to discharge. The visitor (pitbull-subset) decides *which* sites
-//! generate obligations; this module describes the obligations
-//! themselves: where they came from, what they assert, and the
-//! SMT-LIB text that encodes them.
-use pitbull_subset::mir_api::Span;
+//! A `VcGoal` is a `pitbull_subset::VcObligation` that has been
+//! turned into concrete SMT-LIB by `compile`. The split between
+//! "obligation" (typed claim, produced by the visitor) and "goal"
+//! (concrete encoding, produced here) lets the visitor evolve
+//! independently of the SMT back-end — and lets one obligation
+//! be encoded multiple ways (Z3, CVC5, Alt-Ergo) without the
+//! visitor knowing.
+use pitbull_subset::{VcObligation, VcObligationKind};
 use serde::{Deserialize, Serialize};
-/// One verification condition. An auditor reviewing a Pitbull run
-/// should be able to read the goal's `kind`, `span`, and `smt`
-/// fields and reconstruct what was checked.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// A compiled obligation: the original typed claim plus the
+/// SMT-LIB 2 text that asks a solver to discharge it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VcGoal {
-    /// Stable identifier for cross-referencing solver output and
-    /// proof certificates. Format: `pb{rule_num}-{kind_tag}-{hash}`
-    /// where the hash makes the id unique within one run.
-    pub id: String,
-    /// Source location of the construct that generated this goal.
-    pub span: Span,
-    /// What's being checked.
-    pub kind: VcGoalKind,
-    /// SMT-LIB 2.6 problem text. Self-contained: pipe this directly
-    /// to a solver's stdin. Includes `(set-logic ...)`,
-    /// `(declare-const ...)`, `(assert ...)`, `(check-sat)`.
+    /// The typed obligation this goal compiles. Round-trip safe:
+    /// auditors can read the obligation alone to understand what's
+    /// being claimed, without parsing SMT-LIB.
+    pub obligation: VcObligation,
+    /// Self-contained SMT-LIB 2.6 problem text. Pipe directly to a
+    /// solver's stdin. `(check-sat)` is the last directive; the
+    /// solver's first non-empty output line is the verdict.
     pub smt: String,
 }
-/// Discriminator for VC goals. Used to route solver results back
-/// to PSS-1 rules and to render counterexamples appropriately.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum VcGoalKind {
-    /// Arithmetic operation that could overflow / underflow the
-    /// declared type. Maps to PSS-1 PB049 (overflow checks).
-    ArithmeticOverflow {
-        /// Which arithmetic operator.
-        op: ArithOp,
-        /// Operand type name (e.g. "u32", "i64").
-        ty_name: String,
-    },
-    /// Call to a panic function (e.g. `core::panicking::panic_fmt`)
-    /// that the verifier needs to prove unreachable. Maps to PB043.
-    /// v0.2 scaffold does not yet emit these — requires
-    /// path-sensitive symbolic execution.
-    PanicReachability,
-    /// Slice / array index that needs `idx < len` proven. Maps to
-    /// PB054.
-    IndexBound,
-    /// Recursive call where the `#[decreases(...)]` measure must
-    /// strictly decrease. Maps to PB041.
-    RecursionDecreases,
-}
-/// Arithmetic operators that have associated overflow obligations.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ArithOp {
-    /// `+`
-    Add,
-    /// `-`
-    Sub,
-    /// `*`
-    Mul,
-    /// `/` — division by zero is also an obligation, encoded as a
-    /// separate assertion in the same SMT problem.
-    Div,
-    /// `%`
-    Rem,
-    /// `<<` — over-shift (shift amount ≥ bit width) is the
-    /// obligation here.
-    Shl,
-    /// `>>` — same shape as `Shl`.
-    Shr,
-}
-impl ArithOp {
-    /// Short tag used in the VC goal id for cross-referencing.
-    #[must_use]
-    pub fn tag(self) -> &'static str {
-        match self {
-            ArithOp::Add => "add",
-            ArithOp::Sub => "sub",
-            ArithOp::Mul => "mul",
-            ArithOp::Div => "div",
-            ArithOp::Rem => "rem",
-            ArithOp::Shl => "shl",
-            ArithOp::Shr => "shr",
+/// Compile an obligation into a goal by generating SMT-LIB.
+///
+/// Returns `None` if the obligation can't be compiled today —
+/// either because the kind isn't yet supported (PanicReachability,
+/// IndexBound, RecursionDecreases) or because the SMT encoder
+/// rejected the specific instance (unsupported type, etc.). The
+/// caller treats `None` as "undischarged" — the obligation remains
+/// in the report so an auditor sees the gap.
+#[must_use]
+pub fn compile(obligation: &VcObligation) -> Option<VcGoal> {
+    let smt = match &obligation.kind {
+        VcObligationKind::ArithmeticOverflow { op, ty_name } => {
+            crate::smt::emit_overflow_problem(ty_name, *op)?
         }
-    }
+        // The following kinds need richer encodings than bit-vector
+        // arithmetic alone — path-sensitive symbolic execution,
+        // termination measures, or `idx < len` reasoning over MIR
+        // local state. Tracked as v0.2 follow-up work.
+        VcObligationKind::PanicReachability
+        | VcObligationKind::IndexBound
+        | VcObligationKind::RecursionDecreases => return None,
+    };
+    Some(VcGoal {
+        obligation: obligation.clone(),
+        smt,
+    })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pitbull_subset::{ArithOp, VcObligation, VcObligationKind};
+    use pitbull_subset::mir_api::Span;
     #[test]
-    fn vc_goal_round_trips_through_json() {
-        let g = VcGoal {
-            id: "pb049-add-abc123".into(),
+    fn compile_u32_add_produces_smt() {
+        let obligation = VcObligation {
+            id: "pb049-add-0".into(),
             span: Span::default(),
-            kind: VcGoalKind::ArithmeticOverflow {
+            kind: VcObligationKind::ArithmeticOverflow {
                 op: ArithOp::Add,
                 ty_name: "u32".into(),
             },
-            smt: "(check-sat)".into(),
         };
-        let s = serde_json::to_string(&g).expect("serialize");
-        let back: VcGoal = serde_json::from_str(&s).expect("deserialize");
-        assert_eq!(back, g);
+        let goal = compile(&obligation).expect("u32 + supported");
+        assert_eq!(goal.obligation, obligation);
+        assert!(goal.smt.contains("(set-logic QF_BV)"));
+        assert!(goal.smt.contains("(declare-const lhs (_ BitVec 32))"));
+        assert!(goal.smt.contains("(assert (bvuaddo lhs rhs))"));
     }
     #[test]
-    fn arith_op_tags_are_stable() {
-        // Cross-referenced by VC goal IDs and proof certificates;
-        // changing a tag is a breaking format change.
-        assert_eq!(ArithOp::Add.tag(), "add");
-        assert_eq!(ArithOp::Sub.tag(), "sub");
-        assert_eq!(ArithOp::Mul.tag(), "mul");
-        assert_eq!(ArithOp::Div.tag(), "div");
-        assert_eq!(ArithOp::Rem.tag(), "rem");
-        assert_eq!(ArithOp::Shl.tag(), "shl");
-        assert_eq!(ArithOp::Shr.tag(), "shr");
+    fn compile_unsupported_kind_returns_none() {
+        let obligation = VcObligation {
+            id: "pb043-panic-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::PanicReachability,
+        };
+        assert!(
+            compile(&obligation).is_none(),
+            "PanicReachability isn't compiled in v0.2 scaffold",
+        );
+    }
+    #[test]
+    fn compile_round_trips_through_json() {
+        let goal = VcGoal {
+            obligation: VcObligation {
+                id: "pb049-mul-7".into(),
+                span: Span::default(),
+                kind: VcObligationKind::ArithmeticOverflow {
+                    op: ArithOp::Mul,
+                    ty_name: "i64".into(),
+                },
+            },
+            smt: "(check-sat)".into(),
+        };
+        let s = serde_json::to_string(&goal).expect("serialize");
+        let back: VcGoal = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, goal);
     }
 }

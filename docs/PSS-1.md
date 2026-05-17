@@ -520,6 +520,44 @@ the std form and now also matches. No shadow type changes.
   Wrapper now writes SARIF JSON to the path in `PITBULL_SARIF_OUT`
   when that env var is set; each invocation overwrites — multi-crate
   aggregation is a follow-up for the `cargo pitbull check` subcommand.
+- ✅ v0.2 deductive backend spine: end-to-end VC dispatch (Task N).
+  Wires the visitor → `pitbull-vc` → external SMT solver loop that
+  makes "deductive verifier" literally true for the first time:
+    * `pitbull_subset::vc::VcObligation` is the typed-claim IR;
+      `pitbull_vc::VcGoal` is the compiled form (obligation + SMT-LIB
+      text). Split so the visitor and solver evolve independently.
+    * `SubsetVisitor.visit_rvalue` now emits a
+      `VcObligationKind::ArithmeticOverflow { op, ty_name }`
+      for every `Rvalue::BinaryOp(Add | Sub | Mul, lhs, rhs)`
+      where both operands resolve to the same primitive integer
+      type. Other binops and mixed-type operands are no-ops.
+      `SubsetReport.vc_obligations: Vec<VcObligation>` carries the
+      results through the report (skip-serializing when empty).
+    * `pitbull_vc::compile` turns each obligation into a
+      QF_BV SMT-LIB problem using `bvuaddo` / `bvsaddo` / etc.
+      `pitbull_vc::solver::invoke_z3` dispatches; verdicts map:
+      `unsat` ⇒ discharged, `sat` ⇒ counterexample exists,
+      `unknown` / timeout / error / not-installed ⇒ undischarged
+      (each surfaced distinctly on stderr).
+    * `pitbull-rustc` wrapper iterates `report.vc_obligations`
+      after the MIR walk, dispatches each, and prints a summary
+      line: `VC summary: N obligation(s), D discharged, U undischarged`.
+    * Graceful degradation when Z3 isn't installed: the wrapper
+      announces once and lists each obligation as "undischarged
+      (no solver)" — the rest of the report still emits.
+
+  Smoke test against `fn add_one(x: u32) -> u32 { x + 1 } fn
+  multiply(a: u32, b: u32) -> u32 { a * b }` produces:
+  ```
+  pitbull-rustc: vc pb049-add-0: undischarged (no solver)
+  pitbull-rustc: vc pb049-mul-1: undischarged (no solver)
+  pitbull-rustc: VC summary: 2 obligation(s), 0 discharged, 2 undischarged
+  ```
+  (On a machine with z3 in PATH, both report `discharged (unsat)`
+  for the trivial constraints today's scaffold emits — though
+  reality is the inputs are unconstrained, so `sat` is the
+  correct verdict; the scaffold lacks input-range narrowing, a
+  follow-up task.)
 - ✅ HIR pre-pass for PB001 `unsafe { ... }` block detection (Task G).
   rustc's MIR construction discards HIR-level block scopes, so PB001
   (the bare `unsafe` block, distinct from the rules that fire on

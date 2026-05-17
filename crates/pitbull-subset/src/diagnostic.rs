@@ -91,6 +91,14 @@ pub struct SubsetReport {
     /// verification. See `AuditNote`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audit_notes: Vec<AuditNote>,
+    /// VC obligations the visitor identified but did not itself
+    /// discharge. The driver hands these to `pitbull-vc` for
+    /// SMT-LIB compilation + solver dispatch. See
+    /// `crate::vc::VcObligation`. v0.2 work; the field is here
+    /// so the data flows through SARIF / report serialization
+    /// even before the driver wires up dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vc_obligations: Vec<crate::vc::VcObligation>,
     /// What phase the visitor reached.
     pub phase_completed: PhaseCompleted,
     /// PSS version this report was produced against.
@@ -114,6 +122,7 @@ impl SubsetReport {
         Self {
             errors,
             audit_notes: Vec::new(),
+            vc_obligations: Vec::new(),
             phase_completed: PhaseCompleted::SubsetCheckComplete,
             pss_version: crate::PSS_VERSION.to_string(),
             filenames: None,
@@ -125,6 +134,7 @@ impl SubsetReport {
         Self {
             errors: Vec::new(),
             audit_notes: Vec::new(),
+            vc_obligations: Vec::new(),
             phase_completed: PhaseCompleted::Aborted,
             pss_version: crate::PSS_VERSION.to_string(),
             filenames: None,

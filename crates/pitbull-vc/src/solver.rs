@@ -145,7 +145,7 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
 mod tests {
     use super::*;
     use crate::smt;
-    use crate::vc::ArithOp;
+    use pitbull_subset::ArithOp;
     /// `NotInstalled` is observably distinct from `Error(...)`.
     /// Calling code uses this to decide whether to retry, fall back,
     /// or surface a "please install Z3" message to the user.

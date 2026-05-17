@@ -33,6 +33,12 @@ path = "src/bin/pitbull-rustc.rs"
 # scaffold posture; once the driver reads `pitbull.toml` directly the
 # feature can come off.
 pitbull-subset = { path = "../pitbull-subset", features = ["test-helpers"] }
+# pitbull-vc compiles `VcObligation`s produced by the visitor into
+# SMT-LIB and dispatches them to an external solver (Z3 today). The
+# wrapper iterates `SubsetReport.vc_obligations` after the MIR walk
+# and surfaces each obligation's verdict on stderr alongside
+# violations and audit notes.
+pitbull-vc = { path = "../pitbull-vc" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 miette = { version = "7", features = ["fancy"] }

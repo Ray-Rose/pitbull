@@ -447,6 +447,7 @@ dependencies = [
  "clap",
  "miette",
  "pitbull-subset",
+ "pitbull-vc",
  "serde_json",
 ]
 

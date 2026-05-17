@@ -52,12 +52,14 @@ pub mod diagnostic;
 pub mod mir_api;
 pub mod reachability;
 pub mod rules;
+pub mod vc;
 pub mod visitor;
 #[cfg(feature = "mutation-testing")]
 pub mod mutation;
 pub use config::SubsetConfig;
 pub use diagnostic::{Severity, SubsetError, SubsetReport};
 pub use rules::{Category, Rule, RuleId, RULES};
+pub use vc::{ArithOp, VcObligation, VcObligationKind};
 pub use visitor::SubsetVisitor;
 /// Pitbull subset specification version this crate enforces.
 pub const PSS_VERSION: &str = "PSS-1";

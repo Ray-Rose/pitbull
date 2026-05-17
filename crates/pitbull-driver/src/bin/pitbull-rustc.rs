@@ -365,6 +365,26 @@ impl PitbullCallbacks {
         for note in &report.audit_notes {
             eprintln!("pitbull-rustc: {note}");
         }
+        // VC obligations: discharge each through pitbull-vc and
+        // surface the verdict on stderr. This is the v0.2 deductive
+        // step — the visitor identified what needs proving; here
+        // an SMT solver answers. Per-obligation breakdown:
+        //   - `unsat` ⇒ proven safe ⇒ no PSS-1 violation
+        //   - `sat`   ⇒ counterexample exists ⇒ obligation NOT
+        //               discharged ⇒ this becomes a (future) PB049
+        //               violation tied to the call site
+        //   - `unknown` / `timeout` / `error` ⇒ inconclusive ⇒
+        //               obligation reported as undischarged
+        //   - `not installed` ⇒ Z3 missing on PATH ⇒ surface once,
+        //               then list each obligation as undischarged
+        //               so the user knows the gap exists
+        //
+        // Compilation failure (kind not yet supported, e.g.
+        // PanicReachability) surfaces as "pending" — the obligation
+        // is recorded but no SMT was generated.
+        if !report.vc_obligations.is_empty() {
+            dispatch_vc_obligations(&report);
+        }
         // Optional SARIF emission. When `PITBULL_SARIF_OUT` is set,
         // write the (minimal) SARIF report to that path. Each wrapper
         // invocation overwrites the file — fine for single-crate
@@ -402,6 +422,87 @@ impl PitbullCallbacks {
             }
         }
     }
+}
+/// Compile each `VcObligation` in the report into SMT-LIB via
+/// `pitbull-vc::compile`, dispatch to Z3 via
+/// `pitbull-vc::solver::invoke_z3`, and surface the verdict on
+/// stderr. Logs a summary line at the end.
+///
+/// Free function (not a method on `PitbullCallbacks`) because it
+/// only reads the report — no callback state mutation needed.
+#[cfg(rustc_public_real)]
+fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) {
+    let mut solver_missing_announced = false;
+    let mut discharged = 0usize;
+    let mut undischarged = 0usize;
+    for obligation in &report.vc_obligations {
+        let Some(goal) = pitbull_vc::compile(obligation) else {
+            eprintln!(
+                "pitbull-rustc: vc {}: pending (compilation not yet supported for {:?})",
+                obligation.id, obligation.kind,
+            );
+            undischarged += 1;
+            continue;
+        };
+        match pitbull_vc::solver::invoke_z3(&goal.smt) {
+            pitbull_vc::SolverResult::Unsat => {
+                eprintln!(
+                    "pitbull-rustc: vc {}: discharged (unsat — safety property holds)",
+                    obligation.id,
+                );
+                discharged += 1;
+            }
+            pitbull_vc::SolverResult::Sat => {
+                eprintln!(
+                    "pitbull-rustc: vc {}: NOT DISCHARGED (sat — counterexample exists)",
+                    obligation.id,
+                );
+                undischarged += 1;
+            }
+            pitbull_vc::SolverResult::NotInstalled => {
+                if !solver_missing_announced {
+                    eprintln!(
+                        "pitbull-rustc: z3 not installed; VC obligations cannot \
+                         be discharged. Install z3 (https://github.com/Z3Prover/z3) \
+                         and add it to PATH.",
+                    );
+                    solver_missing_announced = true;
+                }
+                eprintln!(
+                    "pitbull-rustc: vc {}: undischarged (no solver)",
+                    obligation.id,
+                );
+                undischarged += 1;
+            }
+            pitbull_vc::SolverResult::Unknown => {
+                eprintln!(
+                    "pitbull-rustc: vc {}: undischarged (solver returned unknown)",
+                    obligation.id,
+                );
+                undischarged += 1;
+            }
+            pitbull_vc::SolverResult::Timeout => {
+                eprintln!(
+                    "pitbull-rustc: vc {}: undischarged (timeout)",
+                    obligation.id,
+                );
+                undischarged += 1;
+            }
+            pitbull_vc::SolverResult::Error(e) => {
+                eprintln!(
+                    "pitbull-rustc: vc {}: undischarged (solver error: {e})",
+                    obligation.id,
+                );
+                undischarged += 1;
+            }
+        }
+    }
+    eprintln!(
+        "pitbull-rustc: VC summary: {} obligation(s), {} discharged, {} undischarged",
+        report.vc_obligations.len(),
+        discharged,
+        undischarged,
+    );
 }
 /// Load pitbull.toml from `$PITBULL_TOML` (if set) or from `./pitbull.toml`
 /// in the current working directory. Falls back to the default test

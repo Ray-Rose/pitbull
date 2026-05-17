@@ -32,7 +32,7 @@
 //!   Requires a richer encoding than bit-vector arithmetic alone.
 //! - `emit_decreasing_measure_problem`: termination measures for
 //!   recursion (PB041).
-use crate::vc::ArithOp;
+use pitbull_subset::ArithOp;
 /// Information about a primitive integer type for SMT encoding.
 struct IntInfo {
     /// Bit width.

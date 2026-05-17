@@ -95,6 +95,16 @@ pub struct SubsetVisitor<'cfg> {
     /// `into_report()` so auditors see the gap rather than the
     /// silent fall-through that was C2 in the v0.1 audit.
     audit_notes: Vec<crate::diagnostic::AuditNote>,
+    /// VC obligations the visitor identified but did not itself
+    /// discharge. The driver hands these to `pitbull-vc` for
+    /// SMT-LIB compilation and solver dispatch.
+    vc_obligations: Vec<crate::vc::VcObligation>,
+    /// Locals of the currently-walked body. Set at the start of
+    /// `visit_body` so VC emission (e.g. `Rvalue::BinaryOp`) can
+    /// resolve `Operand::Copy(Place)` / `Operand::Move(Place)` to
+    /// a type. Cleared between bodies via the next `visit_body`
+    /// overwriting it.
+    current_body_locals: Vec<crate::mir_api::LocalDecl>,
     /// Whether the current body has been declared `#[pitbull::trusted]`.
     /// Trusted bodies are exempt from body-level checks but their *signatures*
     /// are still subject to PSS-1.
@@ -111,17 +121,21 @@ impl<'cfg> SubsetVisitor<'cfg> {
             config,
             errors: Vec::new(),
             audit_notes: Vec::new(),
+            vc_obligations: Vec::new(),
+            current_body_locals: Vec::new(),
             current_body_trusted: false,
             in_spec_context: false,
         }
     }
-    /// Finalize the visit, producing a report. Transfers both errors
-    /// (subset violations) and audit notes (informational gaps the
-    /// visitor flagged but did not reject) into the report.
+    /// Finalize the visit, producing a report. Transfers errors
+    /// (subset violations), audit notes (informational gaps), and
+    /// VC obligations (proof obligations for `pitbull-vc` to
+    /// discharge) into the report.
     #[must_use]
     pub fn into_report(self) -> SubsetReport {
         let mut report = SubsetReport::new(self.errors);
         report.audit_notes = self.audit_notes;
+        report.vc_obligations = self.vc_obligations;
         report
     }
     /// Record a non-violation audit note. The note is informational
@@ -132,6 +146,12 @@ impl<'cfg> SubsetVisitor<'cfg> {
             span,
             message: message.into(),
         });
+    }
+    /// Record a VC obligation for `pitbull-vc` to discharge. The
+    /// obligation captures what needs to be proven (and where);
+    /// SMT-LIB encoding happens downstream.
+    pub fn vc_obligation(&mut self, obligation: crate::vc::VcObligation) {
+        self.vc_obligations.push(obligation);
     }
     /// Number of errors recorded so far.
     #[must_use]
@@ -176,6 +196,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// monomorphized item in the call closure of `#[pitbull::verify]` roots.
     pub fn visit_body(&mut self, body: &Body, trusted: bool) {
         self.current_body_trusted = trusted;
+        // Cache locals so VC emission (e.g. operand-type resolution
+        // for Rvalue::BinaryOp) can look up types without threading
+        // the body through every visit method. Cleared on the next
+        // visit_body, so there's no cross-body leak.
+        self.current_body_locals.clone_from(&body.locals);
         // PB002: unsafe fn definitions are rejected outright. Even trusted
         // functions cannot be unsafe in v0.1; trust is for spec assumption,
         // not for `unsafe` admission.
@@ -558,6 +583,12 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 if matches!(binop, crate::mir_api::BinOp::Offset) {
                     self.reject(rules::PB004, span, "pointer offset operation");
                 }
+                // PB049: emit an overflow VC obligation when this is
+                // a checkable arithmetic op on a primitive integer.
+                // The visitor doesn't itself discharge the obligation
+                // — `pitbull-vc` compiles it to SMT-LIB and dispatches
+                // to a solver.
+                self.maybe_emit_overflow_obligation(*binop, lhs, rhs, span);
             }
             Rvalue::NullaryOp(_, ty) => self.visit_ty(ty, span),
             Rvalue::UnaryOp(_, op) => self.visit_operand(op, span),
@@ -987,6 +1018,109 @@ impl<'cfg> SubsetVisitor<'cfg> {
             in_spec: self.in_spec_context,
         });
     }
+    /// Emit a PB049 overflow obligation for `lhs <op> rhs` when both
+    /// operands resolve to the same primitive integer type and `op`
+    /// is one of `+`, `-`, `*` (the operators with a defined
+    /// SMT-LIB `bvXaddo` / `bvXsubo` / `bvXmulo` predicate).
+    ///
+    /// No-ops for unresolved operand types (projections, non-int
+    /// types, mismatched-type pairs) — the obligation is only
+    /// emitted when the visitor can stand behind the typed claim.
+    /// `pitbull-vc` is then free to compile and dispatch knowing
+    /// the obligation is well-formed.
+    fn maybe_emit_overflow_obligation(
+        &mut self,
+        binop: crate::mir_api::BinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        span: Span,
+    ) {
+        let arith_op = match binop {
+            crate::mir_api::BinOp::Add => crate::vc::ArithOp::Add,
+            crate::mir_api::BinOp::Sub => crate::vc::ArithOp::Sub,
+            crate::mir_api::BinOp::Mul => crate::vc::ArithOp::Mul,
+            // Div / Rem have division-by-zero obligations (different
+            // encoding shape); Shl / Shr have over-shift obligations
+            // (likewise). Both land in a follow-up commit. Bitwise
+            // and comparison ops have no overflow obligation.
+            _ => return,
+        };
+        let lhs_name = self.operand_primitive_int_name(lhs);
+        let rhs_name = self.operand_primitive_int_name(rhs);
+        let (Some(lhs_name), Some(rhs_name)) = (lhs_name, rhs_name) else {
+            return;
+        };
+        if lhs_name != rhs_name {
+            // Mixed-type arithmetic doesn't reach MIR post-coercion
+            // in normal Rust code; refuse to emit a goal we can't
+            // stand behind.
+            return;
+        }
+        let seq = self.vc_obligations.len();
+        let id = format!("pb049-{}-{}", arith_op.tag(), seq);
+        self.vc_obligations.push(crate::vc::VcObligation {
+            id,
+            span,
+            kind: crate::vc::VcObligationKind::ArithmeticOverflow {
+                op: arith_op,
+                ty_name: lhs_name,
+            },
+        });
+    }
+    /// Resolve an operand to a primitive integer type name (`"u32"`,
+    /// `"i64"`, …) when possible.
+    ///
+    /// Returns `None` for:
+    /// - Operands whose type is not a primitive integer.
+    /// - `Operand::Copy(place)` / `Operand::Move(place)` where the
+    ///   place has any projections (we'd need to thread the
+    ///   projected types — the v0.2 scaffold's first cut doesn't).
+    /// - Places whose local index is out of range (defensive; this
+    ///   should be impossible in well-formed MIR but the visitor
+    ///   doesn't trust its input).
+    fn operand_primitive_int_name(&self, op: &Operand) -> Option<String> {
+        let ty: &Ty = match op {
+            Operand::Constant(c) => &c.ty,
+            Operand::Copy(p) | Operand::Move(p) => {
+                if !p.projection.is_empty() {
+                    return None;
+                }
+                let idx = p.local.0 as usize;
+                &self.current_body_locals.get(idx)?.ty
+            }
+        };
+        primitive_int_name_from_ty(ty)
+    }
+}
+/// Extract the canonical Rust type name (`"u32"`, `"i64"`, ...) from
+/// a shadow `Ty` when it represents a primitive integer; otherwise
+/// `None`. Free-standing because it's a pure type-shape inspection
+/// — no visitor state needed.
+fn primitive_int_name_from_ty(ty: &Ty) -> Option<String> {
+    use crate::mir_api::{IntTy, RigidTy, TyKind, UintTy};
+    let TyKind::RigidTy(rigid) = &ty.kind else {
+        return None;
+    };
+    let name = match rigid {
+        RigidTy::Int(int_ty) => match int_ty {
+            IntTy::Isize => "isize",
+            IntTy::I8 => "i8",
+            IntTy::I16 => "i16",
+            IntTy::I32 => "i32",
+            IntTy::I64 => "i64",
+            IntTy::I128 => "i128",
+        },
+        RigidTy::Uint(uint_ty) => match uint_ty {
+            UintTy::Usize => "usize",
+            UintTy::U8 => "u8",
+            UintTy::U16 => "u16",
+            UintTy::U32 => "u32",
+            UintTy::U64 => "u64",
+            UintTy::U128 => "u128",
+        },
+        _ => return None,
+    };
+    Some(name.to_string())
 }
 #[cfg(test)]
 mod tests {
@@ -1282,6 +1416,131 @@ mod tests {
             }],
             span: Span::default(),
         }
+    }
+    /// Task N regression: a `Rvalue::BinaryOp(Add, u32_const, u32_const)`
+    /// must produce a PB049 ArithmeticOverflow VC obligation in the
+    /// report. The visitor itself doesn't discharge the obligation;
+    /// it just emits the typed claim for pitbull-vc to compile + send
+    /// to a solver.
+    #[test]
+    fn binary_op_on_u32_emits_overflow_obligation() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![LocalDecl {
+                ty: u32_ty.clone(),
+                span: Span::default(),
+                mutability: Mutability::Not,
+            }],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                            Operand::Constant(ConstOperand {
+                                ty: u32_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(
+            report.vc_obligations.len(),
+            1,
+            "expected exactly one VC obligation; got {:?}",
+            report.vc_obligations,
+        );
+        let crate::vc::VcObligationKind::ArithmeticOverflow { op, ty_name } =
+            &report.vc_obligations[0].kind
+        else {
+            panic!("expected ArithmeticOverflow obligation");
+        };
+        assert_eq!(*op, crate::vc::ArithOp::Add);
+        assert_eq!(ty_name, "u32");
+        assert!(
+            report.vc_obligations[0].id.starts_with("pb049-add-"),
+            "VC id should follow pb{{nnn}}-{{tag}}-{{seq}} format; got {:?}",
+            report.vc_obligations[0].id,
+        );
+    }
+    /// Task N negative: a `BinaryOp` on a non-integer (`bool`)
+    /// must NOT emit an overflow obligation — the SMT-LIB encoder
+    /// would have nothing meaningful to say.
+    #[test]
+    fn binary_op_on_bool_does_not_emit_obligation() {
+        use crate::mir_api::*;
+        let bool_ty = Ty { kind: TyKind::RigidTy(RigidTy::Bool) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            return_ty: bool_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![LocalDecl {
+                ty: bool_ty.clone(),
+                span: Span::default(),
+                mutability: Mutability::Not,
+            }],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::BitAnd,
+                            Operand::Constant(ConstOperand {
+                                ty: bool_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                            Operand::Constant(ConstOperand {
+                                ty: bool_ty.clone(),
+                                def_id: None,
+                                path: None,
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert!(
+            report.vc_obligations.is_empty(),
+            "BitAnd on bool must not emit overflow obligations; got {:?}",
+            report.vc_obligations,
+        );
     }
     /// C2 regression: a Call with `path: None` must record an audit
     /// note (not silently fall through). Pins the audit posture that
