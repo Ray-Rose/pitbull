@@ -6,8 +6,8 @@ verifier where the previous session left off. Read top to
 bottom on first sit-down; refer back to individual sections
 during work.
 
-Last known-good commit at hand-off: **`7f6bdc2`** ("Audit
-O.2-cleanup #6"). Branch `main`, local repo only (no remote).
+Last known-good commit at hand-off: **`a66a1a4`** ("Milestone 2
+Task O.3"). Branch `main`, local repo only (no remote).
 
 ## TL;DR
 
@@ -18,9 +18,13 @@ O.2-cleanup #6"). Branch `main`, local repo only (no remote).
 - **State:** 122 tests passing, both lanes warning-clean. The
   Milestone-2 work (Tasks E through O.2 plus six audit-cleanup
   commits) is done.
-- **Next task:** **O.2.5** — extract numeric values from
-  `ConstOperand` so `fn add_one(x: u32) -> u32 { x + 1 }` with
-  `requires(x < 100)` proves `unsat`.
+- **Next task:** **Z3 verification** (5 min) — install Z3 and
+  run the headline-demo capstone test to confirm the v0.2
+  spec-context-narrowing series (O.1 → O.2 → O.2.5 → O.3)
+  actually produces `unsat` end-to-end. Then pick a strategic
+  direction from Section 5's menu (PB054 bound checks,
+  multi-solver agreement, attribute coverage expansion, corpus
+  growth, …).
 - **First commands to run in a fresh session:** see
   [Section 4: Smoke test in a fresh session](#4-smoke-test-in-a-fresh-session).
 
@@ -32,7 +36,7 @@ O.2-cleanup #6"). Branch `main`, local repo only (no remote).
 2. [Architecture overview](#2-architecture-overview)
 3. [Toolchain + system requirements](#3-toolchain--system-requirements)
 4. [Smoke test in a fresh session](#4-smoke-test-in-a-fresh-session)
-5. [Next task: O.2.5 — micro-step instructions](#5-next-task-o25--micro-step-instructions)
+5. [Next: verify the v0.2 demo, then pick a strategic direction](#5-next-verify-the-v02-demo-then-pick-a-strategic-direction)
 6. [Common commands cheat sheet](#6-common-commands-cheat-sheet)
 7. [Known limitations + remaining work](#7-known-limitations--remaining-work)
 8. [Common pitfalls + Windows quirks](#8-common-pitfalls--windows-quirks)
@@ -45,6 +49,10 @@ O.2-cleanup #6"). Branch `main`, local repo only (no remote).
 ### Recent commit log (newest first)
 
 ```
+a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
+808f5dd Audit O.2.5-followup: sign-extend narrow signed values + capstone test + doc fixes
+f18a3fa Milestone 2 Task O.2.5: constant-operand value extraction (headline demo unlocker)
+c535fe4 docs: HANDOFF.md — fresh-session instructions for the next contributor
 7f6bdc2 Audit O.2-cleanup #6: final residuals (doc drift, dead method, F1/F10 regression tests, integration-test race fix)
 99f975c Audit O.2-cleanup #5: F7 + F8 + F10 (defense-in-depth + UX correctness)
 9f6ce90 Audit O.2-cleanup #4: F3 + H-1/H-2/H-3 + specific audit messages for translation failures
@@ -78,11 +86,11 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **122 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **130 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The 122 breaks down: 1 (spec) + 93 (subset lib) + 12 (integration) + 16 (vc) = 122.
+The 130 breaks down: 1 (spec) + 97 (subset lib) + 15 (integration) + 17 (vc) = 130.
 
 ---
 
@@ -210,7 +218,7 @@ pwd
 # Expected: .../PLAYGROUND_pitbull/pitbull_official
 
 git log --oneline -1
-# Expected: 7f6bdc2 Audit O.2-cleanup #6: final residuals...
+# Expected: a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
 ```
 
 ### Step 4.2 — Stable test suite (the 122-test baseline)
@@ -257,129 +265,177 @@ PATH="$SYSROOT/bin:$PATH" \
 Expected stderr (Z3 not installed):
 ```
 pitbull-rustc: z3 not installed; VC obligations cannot be discharged. ...
-pitbull-rustc: vc pb049-add-0: undischarged (no solver)
+pitbull-rustc: vc pb049-add-0: undischarged (no solver) [1 assumption]
 pitbull-rustc: VC summary: 1 obligation(s), 0 discharged, 1 undischarged
 pitbull-rustc: crate analyzed: 1 items, 1 bodies walked, 0 non-fn items, 0 unsafe blocks, 0 subset violation(s)
 ```
 
 If Z3 IS installed:
 ```
-pitbull-rustc: vc pb049-add-0: NOT DISCHARGED (sat — counterexample exists)
+pitbull-rustc: vc pb049-add-0: NOT DISCHARGED (sat — counterexample exists) [1 assumption]
 pitbull-rustc: VC summary: 1 obligation(s), 0 discharged, 1 undischarged
 ```
-(The lone obligation reports sat because there's no precondition constraining `x`; `x = u32::MAX` is a witness.)
+(The lone obligation reports sat because there's no precondition constraining `x`; `x = u32::MAX` is a witness. The `[1 assumption]` is the O.2.5 const-pin for `rhs = 1`.
+
+With a `#[pitbull::requires("x < 100")]` attribute on the same function — and `#![feature(register_tool)]` + `#![register_tool(pitbull)]` at the crate root — the verdict flips:
+```
+pitbull-rustc: vc pb049-add-0: discharged (unsat — safety property holds) [2 assumptions]
+pitbull-rustc: VC summary: 1 obligation(s), 1 discharged, 0 undischarged
+```
+This is the v0.2 spec-context-narrowing headline demo. See Section 5 for verification details.)
 
 ### Step 4.6 — Optional: full e2e with PITBULL_REQUIRE_E2E
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 122 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 130 passing.
 ```
 
 If any of these steps fail, the project state is degraded. Don't proceed to new tasks until baseline is green.
 
 ---
 
-## 5. Next task: O.2.5 — micro-step instructions
+## 5. Next: verify the v0.2 demo, then pick a strategic direction
 
-**Goal:** Extract numeric values from `ConstOperand` so the SMT problem can constrain constant operands. Today, `fn add_one(x: u32) -> u32 { x + 1 }` with `requires(x < 100)` returns `sat` because `rhs` is unconstrained (the constant `1`'s value isn't pinned in SMT). After O.2.5, `rhs` will be pinned to `1` and the obligation discharges as `unsat`.
+The v0.2 spec-context-narrowing arc — O.1 (raw SMT) → O.2
+(predicate grammar) → O.2.5 (constant-pin) → O.3
+(`#[pitbull::requires]` attributes) — is complete. The natural
+first thing a fresh session should do is **verify the demo
+works end-to-end**, then choose from a menu of follow-ups.
 
-**Why this matters:** This is the headline demo of the v0.2 spec-context-narrowing work. Without O.2.5, even properly-annotated code can't be proven safe by the verifier.
+### Step 5.1 — Install Z3 (5 minutes)
 
-### Step 5.1 — Read the current adapter behavior
-
-Read `crates/pitbull-subset/src/mir_api/adapter.rs` lines 411-432 — the `const_operand` function. Today it:
-- Extracts `path` and `def_id` for `FnDef`-typed constants
-- Sets `def_id = None`, `path = None` for everything else
-
-The integer value of `1u32` (or any literal const) is NOT extracted into the shadow `ConstOperand`.
-
-### Step 5.2 — Decide on the shadow field
-
-Add `pub value: Option<i128>` to `mir_api::ConstOperand`. Rationale:
-- `i128` covers every supported primitive integer (u8..u128, i8..i128) with one slot, similar to how `predicate::Predicate.lit` works.
-- `Option` makes "not a known integer constant" explicit (e.g. a `FnDef` constant, a struct constant, etc.).
-- Don't try to support floats / non-primitive constants yet — the SMT encoder doesn't support them.
-
-Open `crates/pitbull-subset/src/mir_api.rs` and add the field to `pub struct ConstOperand`. Update doc comment.
-
-### Step 5.3 — Update every `ConstOperand` construction site
-
-Search for `ConstOperand {` in the workspace:
-```bash
-grep -rn "ConstOperand {" crates/ --include='*.rs' | grep -v target
-```
-
-Expected sites:
-- `crates/pitbull-subset/src/mir_api.rs` (the struct definition; add the field there).
-- `crates/pitbull-subset/src/mir_api/adapter.rs` (the `const_operand` function; populate from rustc_public).
-- All test bodies in `crates/pitbull-subset/src/visitor.rs` (~12 sites that construct synthetic ConstOperands).
-- `crates/pitbull-subset/src/reachability.rs` (helper construction sites).
-
-For each test site, default `value: None`. For the adapter, extract the value.
-
-### Step 5.4 — Implement value extraction in the adapter
-
-In `adapter::const_operand`, after the existing `(def_id_opt, path_opt)` match, add a new extraction block:
-
-```rust
-let value = extract_integer_value(c);
-```
-
-Where `extract_integer_value` does:
-1. Check `c.const_.ty()` is an integer primitive type.
-2. Use `c.const_.try_eval_target_usize(...)` or the appropriate const-eval API to get the value.
-3. Return `Some(i128)` if a value was extracted, else `None`.
-
-Look at rustc_public's `MirConst` API for the exact function — likely `try_to_uint()` returning `Option<u128>` or similar. The right path needs investigation; spawn an Explore agent to find the exact API.
-
-### Step 5.5 — Constrain constant operands in the SMT problem
-
-In `pitbull-vc/src/smt.rs::emit_overflow_problem_with_assumptions`, after the variable declarations, accept a new parameter `operand_values: &[(OperandPos, i128)]` (or similar) that pins constant operand values:
-
-```rust
-for (pos, value) in operand_values {
-    let label = pos.smt_label();  // "lhs" or "rhs"
-    let bv = format_bv_literal(*value, bits);
-    smt.push_str(&format!("(assert (= {label} {bv}))\n"));
-}
-```
-
-This is structurally the same as how user assumptions get spliced — just a new internally-generated set.
-
-### Step 5.6 — Plumb the values from the visitor
-
-The visitor's `maybe_emit_overflow_obligation` knows the operands. For each `Operand::Constant(c)` with `c.value.is_some()`, record `(position, value)`. Pass to `VcObligation` (new field? or fold into compile-time encoding via a method on the obligation).
-
-Two design options:
-- **A**: Add `pub operand_values: Vec<(OperandPos, i128)>` to `VcObligation`. Visitor populates. `compile()` uses.
-- **B**: Encode operand values DIRECTLY into the `assumptions` field as SMT-LIB strings. No new field. Visitor synthesizes the assertions.
-
-Option B is simpler (no new field, no new types) but mixes spec assumptions with operand pinning. Option A is cleaner architecturally but bigger surface area.
-
-**Recommendation: option B.** The `assumptions` field is already a Vec<String> of SMT-LIB assertions; adding operand-pinning assertions to it is the path of least friction. The visitor adds entries like `"(assert (= rhs #x00000001))"` alongside any spec-derived ones.
-
-### Step 5.7 — Tests
-
-Add at least:
-
-1. **Adapter unit test (or shadow test)**: a synthetic body with `Operand::Constant(ConstOperand { value: Some(1), ... })` flows through `maybe_emit_overflow_obligation` producing an obligation whose assumptions include `(assert (= rhs ...))`.
-2. **End-to-end smoke**: `fn add_one(x: u32) -> u32 { x + 1 }` with `[verification.preconditions] "corpus_test::add_one" = ["x < 100"]` produces a VC that — when Z3 is installed — returns `unsat`. The wrapper's stderr should contain "discharged (unsat — safety property holds)".
-
-### Step 5.8 — Verify
+Z3 isn't required to build/test, but it IS required to
+observe the actual `unsat` discharge verdict on the headline
+demo. Without it, the wrapper reports "undischarged (no
+solver)" everywhere.
 
 ```bash
-cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
-# Expected: ~125 passing (was 122; adding ~3 new tests)
+# Windows
+winget install Microsoft.Z3
+
+# macOS
+brew install z3
+
+# Debian/Ubuntu
+sudo apt install z3
+
+# Verify
+z3 --version  # any 4.x version is fine
 ```
 
-### Step 5.9 — Commit
+### Step 5.2 — Run the headline demo end-to-end
 
-Use the standard pattern (see Section 9). Suggested message: `"Milestone 2 Task O.2.5: constant-operand value extraction (proves add_one safe under preconditions)"`.
+With Z3 installed, the existing tests
+`solver::tests::pinned_inputs_proves_no_overflow` and
+`integration::wrapper_proves_add_one_safe_under_precondition`
+should exercise the actual solver path:
 
-### Step 5.10 — Update PSS-1.md
+```bash
+cargo +stable test --workspace --all-features
+# Expected: 130 passing (same as without Z3 — the new tests
+# also pass via graceful-skip if Z3 absent, but with Z3 they
+# exercise the real `unsat` verdict path).
+```
 
-Add a §17.1 entry for O.2.5. Mirror the existing audit-cleanup entry format.
+Additionally, run the direct smoke:
+
+```bash
+SYSROOT=$(rustup run nightly-2026-01-29 rustc --print sysroot)
+TMPDIR=$(mktemp -d)
+cat > "$TMPDIR/probe.rs" <<'RUST'
+#![feature(register_tool)]
+#![register_tool(pitbull)]
+
+#[pitbull::requires("x < 100")]
+pub fn add_one(x: u32) -> u32 { x + 1 }
+RUST
+PATH="$SYSROOT/bin:$PATH" \
+  ./target/debug/pitbull-rustc.exe --sysroot "$SYSROOT" \
+  --edition=2021 --crate-type=lib --emit=metadata "$TMPDIR/probe.rs" \
+  -o "$TMPDIR/probe.rmeta"
+```
+
+Expected stderr line with Z3 installed:
+```
+pitbull-rustc: vc pb049-add-0: discharged (unsat — safety property holds) [2 assumptions]
+pitbull-rustc: VC summary: 1 obligation(s), 1 discharged, 0 undischarged
+```
+
+If you see "discharged" here, the entire v0.2
+spec-context-narrowing pipeline works end-to-end. Pat
+yourself on the back.
+
+### Step 5.3 — Pick a strategic direction
+
+Several reasonable next steps. Listed in approximate
+impact-to-effort order:
+
+#### Option A — PB054 bound checks (~1 day, high impact)
+The next obligation kind after PB049 overflow. Same SMT
+bit-vector shape (`(assert (bvult idx len))` vs. `(assert
+(bvuaddo lhs rhs))`), similar visitor wiring. Concrete demo:
+`fn at(v: &[u32], i: usize) -> u32 { v[i] }` with
+`requires(i < v.len())` proves safe.
+
+Sketch:
+1. Identify slice/array index sites in the visitor's
+   `visit_projection` (`ProjectionElem::Index`).
+2. Emit a `VcObligationKind::IndexBound` obligation with the
+   index operand and the slice's length as SMT terms.
+3. Extend `pitbull-vc::compile`'s match to handle
+   `IndexBound`; emit `(declare-const idx ...)` /
+   `(declare-const len ...)` / `(assert (bvult idx len))`.
+4. Pin the operand values via O.2.5 if known constants.
+
+#### Option B — Multi-solver agreement (~2 days, high TCB impact)
+The SAFETY-MANUAL flags solver bugs as a real TCB hole; the
+defense is 2-of-3 agreement across Z3, CVC5, Alt-Ergo. Each
+solver adapter is similar shape (Command::new + stdin
+pipe + verdict parse). A dispatch coordinator runs all
+configured solvers in parallel, requires 2+ `unsat` votes
+to claim discharged.
+
+Sketch:
+1. Add `pitbull-vc::solver::invoke_cvc5` and
+   `invoke_alt_ergo` adapters (different SMT-LIB
+   command-line conventions but same protocol).
+2. Extend `dispatch_vc_obligations` to invoke all enabled
+   solvers (per `cfg.verification.solvers`) and apply the
+   voting rule.
+3. Cache per-solver versions against
+   `cfg.verification.solver_versions` so a binary swap is
+   loud.
+
+#### Option C — Extend O.3 attribute coverage (~half day)
+Today O.3 only extracts `#[pitbull::requires]` on top-level
+`ItemKind::Fn`. Extend to:
+1. `#[pitbull::ensures("...")]` postconditions (different
+   semantics — apply at return, model the return value as a
+   special SMT variable).
+2. `#[pitbull::trusted]` opt-out (mark a function so the
+   subset checker only checks its signature, not the body).
+3. Methods on impl blocks (`ItemKind::Impl` contains
+   `ImplItemKind::Fn`).
+4. Rust-expression-form arguments (`#[pitbull::requires(x < 100)]`
+   without quotes). Requires real attribute parsing — bigger.
+
+#### Option D — Corpus expansion (~half day per rule, mechanical)
+The `tests/corpus/` directory should have ≥10 reject + ≥5
+accept files per rule per PSS-1 §15. Currently most rules
+have 1 each. Hand-writing the examples is the bottleneck;
+this is the kind of task that scales with calendar time.
+
+#### Option E — `cargo pitbull check` subcommand wires verdict aggregation (~1 day)
+The cargo subcommand currently uses `status.success()` and
+loses per-crate Pitbull output. Should parse stderr / SARIF
+across all compile units and produce a unified report.
+
+### Step 5.4 — Update PSS-1.md and HANDOFF.md when done
+
+Whatever you pick, end the work with a §17.1 entry in
+`docs/PSS-1.md` and update this HANDOFF.md's commit pointer
+to the new tip.
 
 ---
 
@@ -474,7 +530,8 @@ git commit -m "..."
 |---|---|---|---|
 | z3 PATH trust | Z3 binary on PATH could be a hostile substitute always returning `unsat`. | `pitbull-vc/src/solver.rs::invoke_z3` | Mitigation is the planned multi-solver agreement gate (CVC5 + Alt-Ergo). v0.2 posture is "research-grade." |
 | u32 file-hash collisions | `Span::file` is a u32 hash. At ~65K files, 50% collision probability. | `pitbull-subset/src/mir_api/adapter.rs` (and `mir_api.rs::Span`) | Bumping to u64 ripples through the shadow IR. Tracked. |
-| Constant operand extraction (O.2.5) | The `1` in `x + 1` isn't constrained in SMT. | adapter::const_operand | **This is the next task** — see Section 5. |
+| Constant operand extraction (O.2.5) | ✅ DONE in `f18a3fa`. Adapter now extracts integer values via `try_extract_integer_value`; visitor synthesizes `(assert (= rhs #x...))` pinning assertions. Sign-extension fix in `808f5dd`. | — | Closed. |
+| `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `a66a1a4`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |
 | Path-sensitive symbolic exec | PB043 PanicReachability obligations are emitted but `pitbull-vc::compile` returns None for the kind. | `pitbull-vc/src/vc.rs::compile` | The SMT encoding for "panic site is unreachable" requires path-sensitive analysis — multi-week task. |
 | Termination measures (PB041) | Recursion-decreasing obligations not yet emitted. | visitor + vc | Needs call-graph SCC analysis, currently a documented gap. |
 | Bounds checks (PB054) | Index obligations emitted but not compiled. | vc compile | Needs `idx < len` reasoning over MIR local state. |
