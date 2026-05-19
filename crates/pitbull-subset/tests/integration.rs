@@ -322,9 +322,35 @@ fn run_one_corpus_file_full(
     path: &Path,
     extra_env: &[(&str, &std::ffi::OsStr)],
 ) -> Result<(String, Option<i32>), String> {
+    run_one_corpus_file_full_inner(env, path, extra_env, true)
+}
+/// Same as `run_one_corpus_file_full` but preserves
+/// `#[pitbull::...]` attributes in the source (rather than the
+/// default behavior of stripping them). O.3 tests need this so
+/// the wrapper's HIR pre-pass actually sees the attributes.
+/// The source must include `#![feature(register_tool)]` and
+/// `#![register_tool(pitbull)]` for rustc to accept the
+/// attributes.
+fn run_one_corpus_file_preserving_attrs(
+    env: &E2eEnv,
+    path: &Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> Result<(String, Option<i32>), String> {
+    run_one_corpus_file_full_inner(env, path, extra_env, false)
+}
+fn run_one_corpus_file_full_inner(
+    env: &E2eEnv,
+    path: &Path,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+    strip_attrs: bool,
+) -> Result<(String, Option<i32>), String> {
     let source =
         fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let stripped = strip_pitbull_attrs(&source);
+    let stripped = if strip_attrs {
+        strip_pitbull_attrs(&source)
+    } else {
+        source
+    };
     // Write to a unique temp file in the OS temp dir. The
     // per-process counter is what makes the path unique within
     // a single test binary process — many tests use the same
@@ -591,6 +617,97 @@ fn wrapper_exits_nonzero_on_violation() {
         code,
         Some(1),
         "F10: clean compile + Pitbull violation must exit 1. Got code {code:?}, stderr:\n{stderr}",
+    );
+}
+/// O.3 attribute extraction: when a function carries a
+/// `#[pitbull::requires("...")]` tool attribute, the wrapper's
+/// HIR pre-pass extracts it and attaches it to that function's
+/// obligations alongside (or instead of) any pitbull.toml
+/// `[verification.preconditions]` entry.
+///
+/// We can't easily inspect the assumption text without Z3, but
+/// the verdict line now carries an `[N assumptions]` suffix
+/// that exposes the count. With one `#[pitbull::requires]`
+/// attribute on `add_one`, the obligation has 2 assumptions
+/// (1 const-pin from O.2.5 + 1 attribute precondition).
+/// Without the attribute, the same function emits 1 assumption
+/// (just the const-pin). The differential is the signal that
+/// the attribute extraction fires.
+#[test]
+fn pitbull_requires_attribute_attaches_precondition() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_requires_attribute_attaches_precondition: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-o3-attr-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        // `#![feature(register_tool)]` is required because the
+        // tool attribute mechanism is still unstable on this
+        // nightly. Documented in HANDOFF.md.
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::requires(\"x < 100\")]\n\
+         pub fn add_one(x: u32) -> u32 {\n\
+             x + 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    // Use the preserving helper — default `run_one_corpus_file_full`
+    // strips `#[pitbull::*]` attributes (legacy corpus compatibility),
+    // which would defeat the entire O.3 mechanism we're testing.
+    let (stderr, _code) =
+        run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
+            .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    // Differential signal: the precondition attribute adds one
+    // assumption on top of the const-pin O.2.5 already adds.
+    // The wrapper now prints `[N assumptions]` per verdict line.
+    assert!(
+        stderr.contains("[2 assumptions]"),
+        "O.3: `#[pitbull::requires(...)]` should add a second \
+         assumption (one const-pin from O.2.5 + one precondition \
+         from the attribute). Expected `[2 assumptions]` in \
+         stderr; got:\n{stderr}",
+    );
+}
+/// O.3 control: the same body WITHOUT the attribute carries
+/// only the O.2.5 const-pin assumption. Pins the differential
+/// signal that the attribute-extraction test relies on.
+#[test]
+fn no_pitbull_requires_attribute_keeps_only_const_pin() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("no_pitbull_requires_attribute_keeps_only_const_pin: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-o3-no-attr-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "pub fn add_one(x: u32) -> u32 { x + 1 }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) = run_one_corpus_file_full(&env, &probe_rs, &[])
+        .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    assert!(
+        stderr.contains("[1 assumption]"),
+        "O.3 control: without the attribute, the obligation \
+         carries only the O.2.5 const-pin (1 assumption). Got:\n{stderr}",
     );
 }
 /// O.2.5 headline-demo capstone: when Z3 is installed, the

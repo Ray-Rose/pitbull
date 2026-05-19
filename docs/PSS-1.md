@@ -633,6 +633,68 @@ the std form and now also matches. No shadow type changes.
   the normal match arms. The UX is intentionally crude in O.1
   (users hand-write SMT-LIB and track operand positions) — O.2
   introduces the Rust-like predicate grammar that fixes both.
+- ✅ `#[pitbull::requires(...)]` attribute extraction (Task O.3).
+  Closes the v0.2 spec-context-narrowing series (O.1 → O.2 →
+  O.2.5 → O.3). Source-level annotations now work as a peer to
+  the existing `pitbull.toml`-based mechanism: the user adds
+  `#![feature(register_tool)]` + `#![register_tool(pitbull)]`
+  to their crate root and writes
+  `#[pitbull::requires("x < 100")]` on functions; the wrapper's
+  HIR pre-pass extracts the string-literal argument and feeds
+  it through the same predicate-translation pipeline as
+  pitbull.toml preconditions.
+
+  Pieces wired:
+    * `pitbull-rustc.rs` adds `extern crate rustc_ast` for the
+      `LitKind::Str` pattern match.
+    * `collect_hir_unsafe_blocks` becomes `collect_hir_pre_pass`
+      — now returns a third value, a
+      `HashMap<String, Vec<String>>` of HIR-derived preconditions
+      keyed by fully-qualified function path
+      (`"{crate_name}::{def_path_str(def_id)}"`).
+    * `UnsafeBlockVisitor` becomes `HirPreVisitor` with a new
+      `preconditions` field; gains a `visit_item` method that
+      filters `ItemKind::Fn { .. }`, reads `tcx.hir_attrs(hir_id)`,
+      matches `attr.path_matches(&[Symbol::intern("pitbull"),
+      Symbol::intern("requires")])`, and extracts each
+      `LitKind::Str` argument as a precondition string.
+    * Wrapper's `run_pitbull_subset_check` merges the
+      HIR-derived map with `cfg.verification.preconditions`
+      before calling `visitor.set_current_preconditions(...)`.
+      Both sources flow through the same downstream layers —
+      F2 lex validation, F1 consistency check, predicate
+      grammar parsing — so the security and soundness
+      guarantees are identical.
+    * Verdict lines in the dispatch loop now include an
+      `[N assumption(s)]` suffix that resolves the v0.2.5
+      audit's L-3 finding (assumptions previously invisible to
+      stderr).
+
+  Tests:
+    * `integration.rs::pitbull_requires_attribute_attaches_precondition`
+      — writes a probe with `#![register_tool(pitbull)]` and
+      `#[pitbull::requires("x < 100")]`, invokes the wrapper,
+      asserts stderr contains `[2 assumptions]` (1 const-pin
+      from O.2.5 + 1 attribute precondition from O.3).
+    * `integration.rs::no_pitbull_requires_attribute_keeps_only_const_pin`
+      — the control: same body without the attribute carries
+      `[1 assumption]`. The differential is the signal that
+      the attribute extraction fires.
+    * New helper `run_one_corpus_file_preserving_attrs` opts
+      out of the legacy `strip_pitbull_attrs` step so the
+      attribute survives to the wrapper.
+
+  Restrictions (deferred to v0.3+):
+    * Only string-literal arguments accepted:
+      `#[pitbull::requires("x < 100")]`. Rust-expression-form
+      `#[pitbull::requires(x < 100)]` requires a real attribute
+      parser; out of scope for this commit.
+    * Non-string-literal arguments silently skipped (no audit
+      note today — could be added if the format becomes
+      common).
+    * Only attributes on top-level `ItemKind::Fn` items
+      extracted. Methods on impls / trait items / nested fns
+      not yet covered.
 - ✅ Constant-operand value extraction — the headline-demo
   unlocker (Task O.2.5). Before this commit, the SMT problem
   treated `Operand::Constant` as a free `BitVec N` variable —

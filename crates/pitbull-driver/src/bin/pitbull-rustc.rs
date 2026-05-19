@@ -77,6 +77,8 @@ fn main() {
 //   - rustc_middle:    the TyCtxt we pass into rustc_internal::run
 //   - rustc_public:    StableMIR — the typed view we run analysis against
 #[cfg(rustc_public_real)]
+extern crate rustc_ast;
+#[cfg(rustc_public_real)]
 extern crate rustc_driver;
 #[cfg(rustc_public_real)]
 extern crate rustc_hir;
@@ -278,8 +280,8 @@ impl PitbullCallbacks {
         // before the MIR pass and emit PB001 violations directly into
         // the report. tcx.hir_visit_all_item_likes_in_crate is callable
         // here because tcx remains valid inside rustc_internal::run.
-        let (hir_pb001_errors, hir_filename_partials) =
-            collect_hir_unsafe_blocks(tcx);
+        let (hir_pb001_errors, hir_filename_partials, hir_preconditions) =
+            collect_hir_pre_pass(tcx);
         self.hir_unsafe_blocks = hir_pb001_errors.len();
         // CrateDef gives `name()`, `span()`, `def_id()` as trait methods.
         // `ty()` is exposed as an inherent method on CrateItem (via the
@@ -313,20 +315,40 @@ impl PitbullCallbacks {
                         pitbull_subset::mir_api::adapter::body(&real_body);
                     self.bodies_walked += 1;
                     walked += 1;
-                    // O.1: install spec-derived preconditions for
-                    // this body so VC obligations emitted from its
-                    // walk carry the assumptions. The lookup uses
-                    // the item's full path (via CrateDef::name)
-                    // against `[verification.preconditions]` in
-                    // pitbull.toml. Bodies not in the map get an
-                    // empty list — explicit "clear" so prior body's
+                    // O.1 + O.3: install spec-derived preconditions
+                    // for this body so VC obligations emitted from
+                    // its walk carry the assumptions. Two sources
+                    // merged, with config taking the first slot
+                    // (config is more deliberate; attribute is the
+                    // common dev path):
+                    //
+                    //   1. `pitbull.toml`'s `[verification.preconditions]`
+                    //      lookup by the item's full path (via
+                    //      `CrateDef::name`).
+                    //   2. `#[pitbull::requires("...")]` tool
+                    //      attributes extracted by the HIR pre-pass
+                    //      and keyed by `tcx.def_path_str(def_id)`.
+                    //
+                    // Bodies not in either map get an empty list
+                    // — explicit "clear" so prior body's
                     // preconditions don't leak across the loop.
-                    let preconditions = cfg
+                    //
+                    // Both paths produce the same kind of strings
+                    // (predicate-grammar or raw-SMT-LIB); the
+                    // visitor's downstream processing
+                    // (`maybe_emit_overflow_obligation`) is
+                    // source-agnostic.
+                    let mut preconditions = cfg
                         .verification
                         .preconditions
                         .get(&item_path)
                         .cloned()
                         .unwrap_or_default();
+                    if let Some(attr_preconds) =
+                        hir_preconditions.get(&item_path)
+                    {
+                        preconditions.extend(attr_preconds.iter().cloned());
+                    }
                     visitor.set_current_preconditions(preconditions);
                     // All bodies are walked as untrusted in v0.2. Trust
                     // marking requires the proc-macro / attribute plumbing
@@ -560,17 +582,37 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
                 }
             }
         }
+        // Build a "[N assumption(s)]" suffix so every verdict
+        // line carries visible audit-trail context: how many
+        // hypotheses (constant pins + user preconditions) the
+        // solver received. Empty when there are no assumptions
+        // — keeps verdict lines for unconstrained obligations
+        // terse.
+        //
+        // Resolves the v0.2.5 audit's L-3 finding ("assumptions
+        // not surfaced in stderr / SARIF") — at least the count
+        // is now visible. Verbose-mode full-text dump remains a
+        // future follow-up.
+        let n_assumptions = obligation.assumptions.len();
+        let assumption_suffix = if n_assumptions == 0 {
+            String::new()
+        } else {
+            format!(
+                " [{n_assumptions} assumption{}]",
+                if n_assumptions == 1 { "" } else { "s" },
+            )
+        };
         match pitbull_vc::solver::invoke_z3(&goal.smt) {
             pitbull_vc::SolverResult::Unsat => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: discharged (unsat — safety property holds)",
+                    "pitbull-rustc: vc {}: discharged (unsat — safety property holds){assumption_suffix}",
                     obligation.id,
                 );
                 discharged += 1;
             }
             pitbull_vc::SolverResult::Sat => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: NOT DISCHARGED (sat — counterexample exists)",
+                    "pitbull-rustc: vc {}: NOT DISCHARGED (sat — counterexample exists){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;
@@ -585,28 +627,28 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
                     solver_missing_announced = true;
                 }
                 eprintln!(
-                    "pitbull-rustc: vc {}: undischarged (no solver)",
+                    "pitbull-rustc: vc {}: undischarged (no solver){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;
             }
             pitbull_vc::SolverResult::Unknown => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: undischarged (solver returned unknown)",
+                    "pitbull-rustc: vc {}: undischarged (solver returned unknown){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;
             }
             pitbull_vc::SolverResult::Timeout => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: undischarged (timeout)",
+                    "pitbull-rustc: vc {}: undischarged (timeout){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;
             }
             pitbull_vc::SolverResult::Error(e) => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: undischarged (solver error: {e})",
+                    "pitbull-rustc: vc {}: undischarged (solver error: {e}){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;
@@ -782,59 +824,136 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
         pattern == path
     }
 }
-/// HIR pre-pass that emits PB001 for every user-authored
-/// `unsafe { ... }` block in the crate.
+/// HIR pre-pass: a single walk over the crate's HIR that
+/// extracts:
+///
+/// 1. **PB001 unsafe-block violations** — every user-authored
+///    `unsafe { ... }` block (filtered by `Span::from_expansion`
+///    so `vec![]`, `format!()`, etc. don't false-positive).
+/// 2. **`#[pitbull::requires("...")]` preconditions** — tool
+///    attributes on function items, indexed by fully-qualified
+///    function path. v0.2 Task O.3.
 ///
 /// ## Why HIR and not MIR
 ///
-/// rustc's MIR construction discards HIR-level block scopes — by the
-/// time the visitor sees a body, the `unsafe` keyword that wrapped a
-/// raw-pointer deref is gone. The deref itself fires PB004 from MIR,
-/// but PSS-1 also rejects the bare `unsafe` block (even if its body
-/// happens to be empty or trivially safe). So this is a separate
-/// HIR-only signal.
+/// MIR construction discards HIR-level scope information.
+/// PB001's "bare unsafe block" can't be reconstructed from MIR
+/// (operations inside fire their own rules — PB004/PB007/PB009 —
+/// but the syntactic block itself is gone). And attributes like
+/// `#[pitbull::requires(...)]` only exist as HIR `Attribute`s;
+/// they don't survive into MIR at all.
 ///
 /// ## How
 ///
-/// `tcx.hir_visit_all_item_likes_in_crate` enters every free item,
-/// trait item, impl item, and foreign item. With
-/// `NestedFilter = nested_filter::All`, the visitor recurses into
-/// nested items (including bodies). `visit_block` fires on every
-/// `hir::Block`, and we match its `rules` field for
-/// `BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided)` —
-/// `CompilerGenerated` covers e.g. `unsafe trait` method bodies that
-/// the compiler adds wrapping unsafety, which is not a user-written
-/// `unsafe { ... }` and not the PSS-1 PB001 target.
+/// `tcx.hir_visit_all_item_likes_in_crate` enters every free
+/// item, trait item, impl item, and foreign item. With
+/// `NestedFilter = nested_filter::All`, the visitor recurses
+/// into nested items (including bodies). Two hooks:
+///   - `visit_block` matches `BlockCheckMode::UnsafeBlock(
+///     UnsafeSource::UserProvided)` for PB001 emission.
+///   - `visit_item` filters for `ItemKind::Fn(...)` and reads
+///     `tcx.hir_attrs(item.hir_id())` to find
+///     `#[pitbull::requires("...")]`. The attribute path is
+///     matched via `attr.path_matches(&[pitbull, requires])`;
+///     the string argument is extracted via
+///     `meta_item_list().get(0).lit()`.
 ///
-/// Returns the violations and a partial filename table — the wrapper
-/// merges this with `adapter::take_filename_table()` so the SARIF
-/// emission's `artifactLocation.uri` resolves for HIR spans too.
+/// Returns the violations, a partial filename table (merged with
+/// `adapter::take_filename_table()` for SARIF URIs), and the
+/// HIR-derived precondition map (merged with
+/// `cfg.verification.preconditions` per call site).
 #[cfg(rustc_public_real)]
-fn collect_hir_unsafe_blocks<'tcx>(
+fn collect_hir_pre_pass<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
 ) -> (
     Vec<pitbull_subset::SubsetError>,
     std::collections::HashMap<u32, String>,
+    std::collections::HashMap<String, Vec<String>>,
 ) {
-    let mut visitor = UnsafeBlockVisitor {
+    let mut visitor = HirPreVisitor {
         tcx,
         violations: Vec::new(),
         filename_table: std::collections::HashMap::new(),
+        preconditions: std::collections::HashMap::new(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
-    (visitor.violations, visitor.filename_table)
+    (visitor.violations, visitor.filename_table, visitor.preconditions)
 }
 #[cfg(rustc_public_real)]
-struct UnsafeBlockVisitor<'tcx> {
+struct HirPreVisitor<'tcx> {
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     violations: Vec<pitbull_subset::SubsetError>,
     filename_table: std::collections::HashMap<u32, String>,
+    /// HIR-derived preconditions keyed by fully-qualified function
+    /// path (`tcx.def_path_str(def_id)`). The wrapper merges this
+    /// with `cfg.verification.preconditions` before each
+    /// `visit_body` so users can mix attribute-based and
+    /// config-based preconditions on the same function.
+    preconditions: std::collections::HashMap<String, Vec<String>>,
 }
 #[cfg(rustc_public_real)]
-impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for UnsafeBlockVisitor<'tcx> {
+impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
     type NestedFilter = rustc_middle::hir::nested_filter::All;
     fn maybe_tcx(&mut self) -> rustc_middle::ty::TyCtxt<'tcx> {
         self.tcx
+    }
+    /// O.3: extract `#[pitbull::requires("...")]` tool
+    /// attributes from function items. The user crate must have
+    /// `#![register_tool(pitbull)]` for rustc to preserve the
+    /// attribute through HIR; without it the parser rejects
+    /// `pitbull::*` paths entirely.
+    ///
+    /// Only string-literal arguments are accepted:
+    /// `#[pitbull::requires("x < 100")]`. Non-string arguments
+    /// (raw token streams, expressions, etc.) are silently
+    /// skipped — the v0.2 attribute extraction stays close to
+    /// the on-disk pitbull.toml format (also string-based).
+    /// Future work: accept Rust-expression-form arguments
+    /// `#[pitbull::requires(x < 100)]` via proper attribute
+    /// parsing.
+    fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) {
+        if let rustc_hir::ItemKind::Fn { .. } = item.kind {
+            // `path_matches` and `meta_item_list` are inherent
+            // methods on `rustc_hir::Attribute` on this nightly;
+            // no trait import needed (`AttributeExt` from
+            // rustc_ast is for `rustc_ast::Attribute`, a
+            // different type used pre-HIR).
+            let pitbull = rustc_span::Symbol::intern("pitbull");
+            let requires = rustc_span::Symbol::intern("requires");
+            let attrs = self.tcx.hir_attrs(item.hir_id());
+            let def_id = item.owner_id.to_def_id();
+            // Key the precondition map by the SAME string the
+            // wrapper's per-item lookup uses
+            // (`rustc_public::CrateDef::name()`), which is
+            // `<crate>::<path>`. `tcx.def_path_str` omits the
+            // crate name for local items, so prepend it.
+            let crate_name = self
+                .tcx
+                .crate_name(rustc_hir::def_id::LOCAL_CRATE)
+                .to_string();
+            let local_path = self.tcx.def_path_str(def_id);
+            let fn_path = format!("{crate_name}::{local_path}");
+            for attr in attrs {
+                if !attr.path_matches(&[pitbull, requires]) {
+                    continue;
+                }
+                let Some(meta_list) = attr.meta_item_list() else {
+                    continue;
+                };
+                for meta_inner in meta_list {
+                    let Some(lit) = meta_inner.lit() else {
+                        continue;
+                    };
+                    if let rustc_ast::ast::LitKind::Str(symbol, _style) = lit.kind {
+                        self.preconditions
+                            .entry(fn_path.clone())
+                            .or_default()
+                            .push(symbol.to_string());
+                    }
+                }
+            }
+        }
+        rustc_hir::intravisit::walk_item(self, item);
     }
     fn visit_block(&mut self, b: &'tcx rustc_hir::Block<'tcx>) {
         // Audit-cleanup #5 / red-team F7: skip `unsafe { ... }`
