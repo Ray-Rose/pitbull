@@ -671,7 +671,8 @@ the std form and now also matches. No shadow type changes.
       no-overflow"); this ordering is cosmetic for the
       solver but reads naturally for an auditor.
 
-  Layered tests (7 new):
+  Layered tests (5 new in commit f18a3fa, plus 1 e2e test
+  in the audit follow-up at integration.rs::wrapper_proves_add_one_safe_under_precondition):
     * `predicate::tests::operand_pin_assertion_basic` —
       pins the bv-literal encoding for u32/i64/i32 with
       positive and negative values, including two's-complement.

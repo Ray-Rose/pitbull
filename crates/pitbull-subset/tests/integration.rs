@@ -593,6 +593,82 @@ fn wrapper_exits_nonzero_on_violation() {
         "F10: clean compile + Pitbull violation must exit 1. Got code {code:?}, stderr:\n{stderr}",
     );
 }
+/// O.2.5 headline-demo capstone: when Z3 is installed, the
+/// wrapper proves `fn add_one(x: u32) -> u32 { x + 1 }` is safe
+/// under `requires(x < 100)` end-to-end. This pins the entire
+/// chain — visitor's const-pin synthesis, predicate translation,
+/// pitbull-vc::compile composition, solver dispatch, and verdict
+/// mapping — that the unit tests cover only piecewise.
+///
+/// Gated on Z3 availability: gracefully skips if Z3 isn't on
+/// PATH (most dev machines). CI with `PITBULL_REQUIRE_E2E=1`
+/// also needs Z3 installed for this specific test to run; the
+/// graceful-skip path is the same.
+#[test]
+fn wrapper_proves_add_one_safe_under_precondition() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_add_one_safe_under_precondition: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!(
+        "pitbull-o25-headline-{}.toml",
+        std::process::id(),
+    ));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-o25-headline-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(&probe_rs, "pub fn add_one(x: u32) -> u32 { x + 1 }\n")
+        .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        r#"
+[project]
+name = "corpus_test"
+toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
+
+[verification.preconditions]
+"corpus_test::add_one" = ["x < 100"]
+"#,
+    )
+    .expect("write headline pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if stderr.contains("z3 not installed") {
+        eprintln!(
+            "wrapper_proves_add_one_safe_under_precondition: SKIPPED \
+             (z3 not on PATH; install Z3 to exercise this end-to-end test)",
+        );
+        return;
+    }
+    // With Z3 installed, the dispatch should report discharged.
+    assert!(
+        stderr.contains("discharged (unsat")
+            && !stderr.contains("NOT DISCHARGED"),
+        "O.2.5 headline demo: `add_one(x){{ x + 1 }}` with \
+         `requires(x < 100)` must discharge under Z3. Got code \
+         {code:?}, stderr:\n{stderr}",
+    );
+    // Wrapper exit code should be 0 (no violations, no
+    // undischarged) per F10.
+    assert_eq!(
+        code,
+        Some(0),
+        "O.2.5: a fully-discharged obligation should exit 0 \
+         (rustc clean + Pitbull clean). Got {code:?}",
+    );
+}
 /// Regression test for audit finding H3: when a hostile build.rs
 /// sets `PITBULL_TOML` to a file without a `.toml` extension (the
 /// realistic attack target being key files like `~/.ssh/id_rsa`

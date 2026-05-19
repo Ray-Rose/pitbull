@@ -454,7 +454,7 @@ pub fn const_operand(c: &rp::mir::ConstOperand) -> shadow::ConstOperand {
 /// can ride along: the visitor uses the i128 directly, no
 /// range check needed at the operand-pinning site.)
 fn try_extract_integer_value(c: &rp::mir::ConstOperand) -> Option<i128> {
-    use rp::ty::{ConstantKind, RigidTy, TyKind};
+    use rp::ty::{ConstantKind, IntTy, RigidTy, TyKind};
     let kind = c.const_.kind();
     let allocated = match kind {
         ConstantKind::Allocated(alloc) => alloc,
@@ -466,12 +466,52 @@ fn try_extract_integer_value(c: &rp::mir::ConstOperand) -> Option<i128> {
     };
     let ty_kind = c.const_.ty().kind();
     match ty_kind {
-        TyKind::RigidTy(RigidTy::Int(_)) => allocated.read_int().ok(),
+        TyKind::RigidTy(RigidTy::Int(int_ty)) => {
+            // `Allocation::read_int` zero-pads the upper bytes
+            // rather than sign-extending narrow values. For
+            // `i32 = -1` (bytes `[0xFF; 4]`) it returns
+            // `+4_294_967_295i128`, not `-1i128`. The downstream
+            // `format_bv_literal` masks to width, so the SMT
+            // bit-vector pin is bit-exact either way — but a
+            // numeric consumer would get the wrong value. Audit
+            // posture: normalize HERE so the `i128` returned
+            // matches the source-level value (signed), not the
+            // raw byte representation. Catches future-caller
+            // footguns (third-pass audit finding M-1).
+            let raw = allocated.read_int().ok()?;
+            let bits: u32 = match int_ty {
+                IntTy::I8 => 8,
+                IntTy::I16 => 16,
+                IntTy::I32 => 32,
+                IntTy::I64 => 64,
+                IntTy::I128 => 128,
+                // isize is platform-dependent; the SMT encoder
+                // doesn't yet support it (PB052 target-pointer-
+                // width threading). Skip extraction; the
+                // obligation falls back to a free BV operand
+                // (cleaner than producing a wrong value).
+                IntTy::Isize => return None,
+            };
+            if bits == 128 {
+                // Full-width: no extension needed.
+                Some(raw)
+            } else {
+                // Sign-extend: shift the value left so the
+                // narrow-type sign bit becomes the i128 sign
+                // bit, then arithmetic-shift right to fill the
+                // upper bits with the sign.
+                let shift = 128 - bits;
+                Some((raw << shift) >> shift)
+            }
+        }
         // u64 / u32 / u16 / u8 fit i128 exactly; u128 values
         // above i128::MAX wrap to negative i128 (two's complement),
         // which is the same bit pattern the SMT encoder produces
         // for negative i128 literals — so the wrap is a no-op
-        // from the solver's perspective.
+        // from the solver's perspective. usize is skipped at
+        // the encoder layer; we don't gate here for symmetry
+        // with the Int arm above — the visitor's pin emitter
+        // will return None for unsupported types regardless.
         TyKind::RigidTy(RigidTy::Uint(_)) => {
             allocated.read_uint().ok().map(|u| u as i128)
         }

@@ -1213,8 +1213,13 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // this type" from "I wrote raw SMT but it's malformed".
         // Reserve room for: constant-pin assertions (at most 2, one
         // per operand) + user preconditions. The pins go FIRST so
-        // they read naturally in stderr / SARIF output (operand
-        // values are the most basic context for an obligation).
+        // they appear at the top of the SMT problem fed to Z3 —
+        // operand values are the most basic context for an
+        // obligation and read naturally when an auditor inspects
+        // the SMT text. (They don't yet appear in stderr / SARIF
+        // emission; both surface only the obligation's `id`,
+        // `kind`, and verdict. Verbose-dump of `assumptions` is
+        // a future follow-up.)
         let mut assumptions: Vec<String> = Vec::with_capacity(
             const_pin_assertions.len() + self.current_body_preconditions.len(),
         );
