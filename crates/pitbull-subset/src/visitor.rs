@@ -22,13 +22,15 @@
 //!
 //! - **PB001 (unsafe block syntax):** *Closed in v0.2.* The visitor runs
 //!   on MIR, which has discarded HIR-level `unsafe { }` markers. The
-//!   `pitbull-rustc` wrapper now adds a HIR pre-pass (`UnsafeBlockVisitor`,
+//!   `pitbull-rustc` wrapper now adds a HIR pre-pass (`HirPreVisitor`,
 //!   driven by `tcx.hir_visit_all_item_likes_in_crate`) that emits PB001
 //!   on every `BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided)`
 //!   whose span isn't macro-expanded (the macro filter is the F7 audit
 //!   fix — `vec![1,2,3]` etc. no longer false-positives). Operations
 //!   inside the block also still fire their MIR-level rules
-//!   (PB004/PB007/PB009/PB006), so the audit trail is complete.
+//!   (PB004/PB007/PB009/PB006), so the audit trail is complete. The
+//!   same HIR pre-pass also extracts `#[pitbull::requires("...")]`
+//!   attributes (Task O.3) used to seed VC obligation preconditions.
 //!
 //! - **PB018 (static mut and interior-mutable statics):** *Closed.* The
 //!   reachability driver now visits item declarations via
@@ -796,10 +798,25 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // Field access. Accepted.
             ProjectionElem::Field(_) => {}
             // PB054 *signal*: dynamic slice indexing. We accept here and
-            // emit a proof obligation; the VC generator proves the bound.
-            ProjectionElem::Index(_) => {}
-            // Constant slice index. Bound is statically known; VC trivial.
-            ProjectionElem::ConstantIndex { .. } | ProjectionElem::Subslice { .. } => {}
+            // emit a proof obligation; the VC generator proves `idx < len`.
+            // The obligation kind is `IndexBound` regardless of which of
+            // the three projection variants triggered it; the discharger
+            // in `pitbull-vc` reasons over the abstract claim, not the
+            // syntactic shape. v0.2 MVP: the discharger returns `None`
+            // for `IndexBound` so the wrapper surfaces each as "pending"
+            // — the gap is *visible*, which is the audit-posture point.
+            ProjectionElem::Index(_) => self.emit_index_bound_obligation(span),
+            // Constant slice index. The bound is statically known and the
+            // future SMT problem is trivial (constant offset vs. constant
+            // or symbolic length), but we still emit the obligation today
+            // so the v0.3+ backend can discharge it uniformly. Same for
+            // Subslice (a range of constant offsets). Skipping these now
+            // would create a silent-accept hole — an auditor reading the
+            // obligation log would see "no PB054 obligation" and assume
+            // the index was safe, when in fact the visitor never asked.
+            ProjectionElem::ConstantIndex { .. } | ProjectionElem::Subslice { .. } => {
+                self.emit_index_bound_obligation(span);
+            }
             // Enum variant downcast. Accepted.
             ProjectionElem::Downcast(_) => {}
             // Opaque-type cast (auto-trait, etc.). Visit the resulting type.
@@ -1329,6 +1346,39 @@ impl<'cfg> SubsetVisitor<'cfg> {
             id,
             span,
             kind: crate::vc::VcObligationKind::PanicReachability,
+            assumptions,
+        });
+    }
+    /// Emit an `IndexBound` VC obligation for a slice/array index
+    /// projection. Maps to PSS-1 PB054 (slice index without bound
+    /// proof). The visitor identifies the site; the v0.3+ backend
+    /// is responsible for proving `idx < len`. Until that backend
+    /// lands, `pitbull-vc::compile` returns `None` for
+    /// `IndexBound` and the wrapper reports each as "pending" —
+    /// the gap is *visible* in the report, which is the audit-
+    /// posture requirement.
+    ///
+    /// Obligation ID format: `pb054-idx-{seq}`. The `-idx-`
+    /// infix is mandatory: `PB054` is also used by the syntactic
+    /// projection-depth cap (see `visit_place`'s `reject(PB054,
+    /// ...)`), and the distinct obligation-ID prefixes are how
+    /// auditors disambiguate the two PB054 sites in trace output.
+    ///
+    /// Carries the current body's `current_body_preconditions`
+    /// list through verbatim. The compiler today ignores them
+    /// (same as for `PanicReachability` — the binding semantics
+    /// haven't been worked out for `IndexBound`'s eventual
+    /// declare-const shape), but plumbing them into the obligation
+    /// means the future backend inherits the spec context
+    /// automatically when its encoding arm is written.
+    fn emit_index_bound_obligation(&mut self, span: Span) {
+        let seq = self.vc_obligations.len();
+        let id = format!("pb054-idx-{seq}");
+        let assumptions = self.current_body_preconditions.clone();
+        self.vc_obligations.push(crate::vc::VcObligation {
+            id,
+            span,
+            kind: crate::vc::VcObligationKind::IndexBound,
             assumptions,
         });
     }
@@ -2841,5 +2891,274 @@ mod tests {
             v.errors.iter().any(|e| e.rule == rules::PB011),
             "allocator call must trigger PB011"
         );
+    }
+    // ----- PB054 MVP: IndexBound obligation emission -------------------
+    //
+    // Three sibling tests, one per projection variant that produces a
+    // PB054 obligation. Each builds a minimum body that exercises a
+    // single `ProjectionElem::{Index,ConstantIndex,Subslice}` and
+    // asserts:
+    //   (a) exactly one VC obligation is emitted,
+    //   (b) it's `VcObligationKind::IndexBound`,
+    //   (c) the obligation `id` matches the `pb054-idx-{seq}` format
+    //       (mandatory: PB054 is also used for the projection-depth cap
+    //       at `MAX_PROJECTION_DEPTH`, and the distinct ID prefix is
+    //       how auditors disambiguate the two PB054 sites — see
+    //       `emit_index_bound_obligation`'s doc).
+    /// Build a body containing a single `_0 = _1[<projection>]` statement,
+    /// where `<projection>` is supplied by the caller. Two locals: `_0`
+    /// (return slot) and `_1` (the indexed place). Used by the three PB054
+    /// MVP tests to vary only the projection kind.
+    fn body_with_index_projection(proj: ProjectionElem) -> Body {
+        let u8_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U8)) };
+        Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            arg_names: vec![],
+            return_ty: u8_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl {
+                    ty: u8_ty.clone(),
+                    span: Span::default(),
+                    mutability: Mutability::Not,
+                },
+                LocalDecl {
+                    ty: u8_ty,
+                    span: Span::default(),
+                    mutability: Mutability::Not,
+                },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::Use(Operand::Copy(Place {
+                            local: Local(1),
+                            projection: vec![proj],
+                        })),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        }
+    }
+    #[test]
+    fn projection_index_emits_index_bound_obligation() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = body_with_index_projection(ProjectionElem::Index(Local(1)));
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(
+            report.vc_obligations.len(),
+            1,
+            "Index projection must emit exactly one IndexBound obligation; got {:?}",
+            report.vc_obligations,
+        );
+        assert!(
+            matches!(
+                report.vc_obligations[0].kind,
+                crate::vc::VcObligationKind::IndexBound
+            ),
+            "expected IndexBound; got {:?}",
+            report.vc_obligations[0].kind,
+        );
+        assert!(
+            report.vc_obligations[0].id.starts_with("pb054-idx-"),
+            "VC id must follow pb054-idx-{{seq}} format to distinguish \
+             from the projection-depth PB054 site; got {:?}",
+            report.vc_obligations[0].id,
+        );
+    }
+    #[test]
+    fn projection_constant_index_emits_index_bound_obligation() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = body_with_index_projection(ProjectionElem::ConstantIndex { offset: 3 });
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        assert!(matches!(
+            report.vc_obligations[0].kind,
+            crate::vc::VcObligationKind::IndexBound
+        ));
+        assert!(report.vc_obligations[0].id.starts_with("pb054-idx-"));
+    }
+    #[test]
+    fn projection_subslice_emits_index_bound_obligation() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = body_with_index_projection(ProjectionElem::Subslice { from: 0, to: 4 });
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        assert!(matches!(
+            report.vc_obligations[0].kind,
+            crate::vc::VcObligationKind::IndexBound
+        ));
+        assert!(report.vc_obligations[0].id.starts_with("pb054-idx-"));
+    }
+    /// PB054 MVP regression: projections that are NOT index-related
+    /// (Deref, Field, Downcast, OpaqueCast, Subtype) must NOT emit any
+    /// IndexBound obligation. This pins the negative-space contract so
+    /// that future re-wiring of `visit_projection` can't silently start
+    /// emitting bogus obligations on benign projections.
+    #[test]
+    fn non_index_projections_do_not_emit_index_bound() {
+        let cfg = SubsetConfig::default_for_test();
+        let u8_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U8)) };
+        let non_index_projections = vec![
+            ProjectionElem::Deref,
+            ProjectionElem::Field(0),
+            ProjectionElem::Downcast(0),
+        ];
+        for proj in non_index_projections {
+            let mut v = SubsetVisitor::new(&cfg);
+            let body = Body {
+                def_id: DefId(0),
+                arg_tys: vec![],
+                arg_names: vec![],
+                return_ty: u8_ty.clone(),
+                is_unsafe: false,
+                is_async: false,
+                locals: vec![
+                    LocalDecl {
+                        ty: u8_ty.clone(),
+                        span: Span::default(),
+                        mutability: Mutability::Not,
+                    },
+                    LocalDecl {
+                        ty: u8_ty.clone(),
+                        span: Span::default(),
+                        mutability: Mutability::Not,
+                    },
+                ],
+                blocks: vec![BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: Local(1),
+                                projection: vec![proj.clone()],
+                            })),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator {
+                        kind: TerminatorKind::Return,
+                        span: Span::default(),
+                    },
+                }],
+                span: Span::default(),
+            };
+            v.visit_body(&body, false);
+            let report = v.into_report();
+            let index_bound_count = report
+                .vc_obligations
+                .iter()
+                .filter(|o| matches!(
+                    o.kind,
+                    crate::vc::VcObligationKind::IndexBound,
+                ))
+                .count();
+            assert_eq!(
+                index_bound_count, 0,
+                "{:?} projection must NOT emit an IndexBound obligation; got {:?}",
+                proj, report.vc_obligations,
+            );
+        }
+    }
+    /// O.1 propagation: IndexBound obligations carry the current body's
+    /// preconditions just like ArithmeticOverflow and PanicReachability
+    /// do. The compiler today ignores them (no encoding arm yet) but
+    /// the plumbing must already be in place so the v0.3+ backend
+    /// inherits the spec context automatically.
+    #[test]
+    fn index_bound_carries_body_preconditions() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_preconditions(vec![
+            "(assert (bvult idx #x00000064))".into(),
+        ]);
+        let body = body_with_index_projection(ProjectionElem::Index(Local(1)));
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        assert_eq!(
+            report.vc_obligations[0].assumptions,
+            vec!["(assert (bvult idx #x00000064))"],
+            "IndexBound obligation must carry installed preconditions verbatim",
+        );
+    }
+    /// Sequence numbering: each emit advances the `{seq}` suffix. Pins
+    /// that obligations across two distinct index sites get distinct
+    /// IDs, so an auditor reading a SARIF report can map each
+    /// "pending" line back to a unique location.
+    #[test]
+    fn multiple_index_bounds_get_distinct_ids() {
+        let cfg = SubsetConfig::default_for_test();
+        let u8_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U8)) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            arg_names: vec![],
+            return_ty: u8_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl {
+                    ty: u8_ty.clone(),
+                    span: Span::default(),
+                    mutability: Mutability::Not,
+                },
+                LocalDecl {
+                    ty: u8_ty.clone(),
+                    span: Span::default(),
+                    mutability: Mutability::Not,
+                },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![
+                    Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: Local(1),
+                                projection: vec![ProjectionElem::Index(Local(1))],
+                            })),
+                        ),
+                        span: Span::default(),
+                    },
+                    Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: Local(1),
+                                projection: vec![ProjectionElem::ConstantIndex { offset: 7 }],
+                            })),
+                        ),
+                        span: Span::default(),
+                    },
+                ],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 2);
+        assert_eq!(report.vc_obligations[0].id, "pb054-idx-0");
+        assert_eq!(report.vc_obligations[1].id, "pb054-idx-1");
     }
 }

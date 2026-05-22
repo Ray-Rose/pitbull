@@ -695,6 +695,86 @@ the std form and now also matches. No shadow type changes.
     * Only attributes on top-level `ItemKind::Fn` items
       extracted. Methods on impls / trait items / nested fns
       not yet covered.
+- ✅ PB054 MVP — slice/array index sites emit IndexBound
+  obligations (Task P). Visitor counterpart to the PB049
+  overflow obligations; the next step in turning v0.2 from
+  "deductive verifier with one obligation kind" into "verifier
+  with one kind discharged and one kind plumbed end-to-end and
+  visible". The wrapper now identifies every slice/array index
+  in the MIR walk and emits a `VcObligationKind::IndexBound`
+  obligation tagged with the source span.
+
+  Pieces wired:
+    * `SubsetVisitor::visit_projection` (visitor.rs) now calls
+      `emit_index_bound_obligation` for `ProjectionElem::Index`,
+      `ProjectionElem::ConstantIndex`, and `ProjectionElem::Subslice`.
+      Previously all three were silent no-ops — the rule-meta
+      registry advertised PB054 as "slice index without bound
+      proof" but no visitor path emitted an obligation.
+    * `emit_index_bound_obligation` is modeled on the existing
+      `emit_panic_reachability_obligation`: pushes a
+      `VcObligation { id: "pb054-idx-{seq}", kind: IndexBound,
+      span, assumptions: current_body_preconditions.clone() }`.
+      Preconditions are carried verbatim so the v0.3+ backend
+      inherits spec context automatically when the encoding
+      arm is written.
+    * Distinct obligation-ID prefix (`pb054-idx-`) is mandatory:
+      `rules::PB054` is also used by the projection-depth cap
+      at `MAX_PROJECTION_DEPTH` (via `reject(PB054, ...)` in
+      `visit_place`). The two PB054 sites are semantically
+      adjacent (both about "projection sanity") but distinct in
+      audit-trail terms — the syntactic depth-cap appears as a
+      `SubsetError`; the index-bound check appears as a
+      `VcObligation`. The ID prefix lets an auditor reading
+      stderr / SARIF disambiguate at a glance.
+    * `pitbull-vc::compile` still returns `None` for
+      `IndexBound`, so the wrapper reports each as "pending
+      (compilation not yet supported for IndexBound)". This is
+      intentional — the audit posture is "no silent skips" and
+      a "pending" line makes the gap visible. The SMT encoding
+      arm (~`(declare-const idx ...) (declare-const len ...)
+      (assert (bvult idx len))`) lands in a follow-up commit.
+    * Doc-drift cleanup: stale `UnsafeBlockVisitor` references
+      in `visitor.rs` and PSS-1.md updated to `HirPreVisitor`
+      (the rename happened in Task O.3 but two doc comments
+      were missed); HANDOFF.md Option A documents the rule-ID
+      overlap explicitly.
+
+  Tests:
+    * `visitor::tests::projection_index_emits_index_bound_obligation`
+      — Index(local) projection emits one IndexBound with the
+      `pb054-idx-` prefix.
+    * `visitor::tests::projection_constant_index_emits_index_bound_obligation`
+      — ConstantIndex { offset } same shape.
+    * `visitor::tests::projection_subslice_emits_index_bound_obligation`
+      — Subslice { from, to } same shape.
+    * `visitor::tests::non_index_projections_do_not_emit_index_bound`
+      — negative-space pin: Deref / Field / Downcast must NOT
+      emit. Future re-wiring can't silently start emitting
+      bogus obligations on benign projections.
+    * `visitor::tests::index_bound_carries_body_preconditions`
+      — O.1 plumbing: assumptions field is populated from
+      `current_body_preconditions` just like ArithmeticOverflow
+      and PanicReachability do.
+    * `visitor::tests::multiple_index_bounds_get_distinct_ids`
+      — sequence numbering: two index sites in one body produce
+      `pb054-idx-0` and `pb054-idx-1`, so an auditor can map
+      each "pending" line back to a distinct location.
+
+  E2e probe (real corpus file): the wrapper run against
+  `crates/pitbull-subset/tests/corpus/reject/PB054_unbounded_index.rs`
+  (a `fn first_byte_unsafe(s: &[u8], i: usize) -> u8 { s[i] }`)
+  produces:
+  ```
+  pitbull-rustc: vc pb054-idx-0: pending (compilation not yet supported for IndexBound)
+  pitbull-rustc: VC summary: 1 obligation(s), 0 discharged, 1 undischarged
+  ```
+  The integration test keeps PB054 in `KNOWN_UNIMPLEMENTED_REJECT`
+  because its current contains-check looks for the uppercase
+  "PB054" string (the subset-violation format), not the
+  lowercase "pb054-idx-" obligation ID — switching the
+  obligation discharge from "pending" to "sat (counterexample)"
+  in a future commit will let that exception be removed.
 - ✅ Constant-operand value extraction — the headline-demo
   unlocker (Task O.2.5). Before this commit, the SMT problem
   treated `Operand::Constant` as a free `BitVec N` variable —
@@ -1000,7 +1080,9 @@ the std form and now also matches. No shadow type changes.
   (the bare `unsafe` block, distinct from the rules that fire on
   operations *within* one — PB004/PB007/PB009) was previously
   undetectable in the wrapper. The wrapper now adds an `extern crate
-  rustc_hir; extern crate rustc_span;` and an `UnsafeBlockVisitor`
+  rustc_hir; extern crate rustc_span;` and a `HirPreVisitor`
+  (renamed from `UnsafeBlockVisitor` in Task O.3 to reflect that it
+  now also extracts `#[pitbull::requires]` attributes)
   implementing `rustc_hir::intravisit::Visitor` with
   `NestedFilter = nested_filter::All`, driven by
   `tcx.hir_visit_all_item_likes_in_crate`. Each block whose

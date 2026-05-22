@@ -378,9 +378,23 @@ bit-vector shape (`(assert (bvult idx len))` vs. `(assert
 `fn at(v: &[u32], i: usize) -> u32 { v[i] }` with
 `requires(i < v.len())` proves safe.
 
+Note on rule-ID overlap: `rules::PB054` is currently used for
+two distinct audit concerns in the visitor — (1) the projection
+depth cap at `visitor.rs` `MAX_PROJECTION_DEPTH` (via
+`reject(PB054, ...)`) and (2) the slice index bound obligation
+emitted from `visit_projection`. The first is a syntactic
+rejection that appears as a `SubsetError`; the second is a
+`VcObligation` whose `id` starts with `pb054-idx-` so an
+auditor can distinguish the two cases from output alone.
+Reusing the rule ID is acceptable — the depth cap is itself
+about "projection sanity" which the slice-index bound obligation
+is one facet of — but the distinct obligation ID prefixes are
+mandatory to keep traces unambiguous.
+
 Sketch:
 1. Identify slice/array index sites in the visitor's
-   `visit_projection` (`ProjectionElem::Index`).
+   `visit_projection` (`ProjectionElem::Index`,
+   `ProjectionElem::ConstantIndex`, `ProjectionElem::Subslice`).
 2. Emit a `VcObligationKind::IndexBound` obligation with the
    index operand and the slice's length as SMT terms.
 3. Extend `pitbull-vc::compile`'s match to handle
