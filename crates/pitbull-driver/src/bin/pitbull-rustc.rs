@@ -706,19 +706,34 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
 /// - Wrong file extension for the env-var's purpose. The realistic
 ///   attack targets are dotfiles and key files that don't end in
 ///   `.toml` / `.sarif` / `.json`.
+/// - Audit-cleanup (audit finding N2, 2026-05-26): symbolic links.
+///   A build.rs that creates `/tmp/x.json` → symlink to
+///   `~/.config/Code/User/settings.json` and sets
+///   `PITBULL_SARIF_OUT=/tmp/x.json` would defeat the extension
+///   filter — the path *is* a `.json`, but `std::fs::write` follows
+///   the symlink and overwrites the target. We refuse when the
+///   leaf-component is a symlink.
 ///
 /// What it doesn't catch
 /// ---------------------
 /// - A path with the right extension that points somewhere it
 ///   shouldn't (e.g. `~/.config/sneaky.toml`).
-/// - A symlink whose target is sensitive (the wrapper doesn't yet
-///   refuse symlinks; that's a follow-up if real-world abuse appears).
+/// - A symlink to a symlink to a sensitive file *via intermediate
+///   non-symlink components* — e.g. `/a/b/c.toml` where `b` is a
+///   symlink to `~/.ssh/` and `c.toml` exists in the target. We
+///   only `symlink_metadata` the leaf path; intermediate-component
+///   resolution would require walking `path.canonicalize` and
+///   comparing each step, which is more invasive and less
+///   immediately useful. The remaining attack surface is narrow:
+///   the build.rs would have to create the intermediate symlink
+///   itself, which it can also do without the leaf-symlink trick.
 ///
 /// Escape hatch
 /// ------------
-/// `PITBULL_ALLOW_UNSAFE_PATHS=1` disables both checks for the
+/// `PITBULL_ALLOW_UNSAFE_PATHS=1` disables all checks for the
 /// rare user whose legitimate config path doesn't match the
-/// extension whitelist. Production should leave this unset.
+/// extension whitelist (e.g. a deliberately-symlinked config
+/// shared across projects). Production should leave this unset.
 #[cfg(rustc_public_real)]
 fn check_env_path(
     var_name: &str,
@@ -749,6 +764,24 @@ fn check_env_path(
             path.display(),
             allowed_extensions,
         ));
+    }
+    // Symlink check (audit finding N2). `symlink_metadata` doesn't
+    // follow the link — it returns metadata about the link itself.
+    // If the path doesn't exist yet (common for PITBULL_SARIF_OUT
+    // — the wrapper creates it), `symlink_metadata` returns Err,
+    // which we treat as "no symlink to worry about, the wrapper
+    // will create a fresh file".
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "{var_name}={} is a symbolic link; refusing as defense \
+                 against build-script symlink-redirect attacks (a path-dep \
+                 could create a symlink with a whitelisted extension that \
+                 points at a sensitive file). Set \
+                 PITBULL_ALLOW_UNSAFE_PATHS=1 to override.",
+                path.display(),
+            ));
+        }
     }
     Ok(())
 }

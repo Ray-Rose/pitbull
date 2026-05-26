@@ -4,7 +4,7 @@
 //!
 //! - `reject/PB{rule}_{slug}.rs` — must trigger PSS-1 violation of `PB{rule}`.
 //! - `accept/PB{rule}_{slug}.rs` — adjacent valid program that must NOT
-//!                                  trigger any PSS-1 violation.
+//!   trigger any PSS-1 violation.
 //!
 //! ## Why two layers
 //!
@@ -68,7 +68,7 @@ fn reject_corpus_filenames_well_formed() {
         let rule = rule_from_filename(name).unwrap_or_else(|| {
             panic!("malformed reject filename {name:?}; expected PB{{nnn}}_{{slug}}.rs")
         });
-        assert!(rule >= 1 && rule <= 75, "rule {rule} out of range");
+        assert!((1..=75).contains(&rule), "rule {rule} out of range");
     }
 }
 /// Sanity test: every accept/ file's name follows the convention.
@@ -79,7 +79,7 @@ fn accept_corpus_filenames_well_formed() {
         let rule = rule_from_filename(name).unwrap_or_else(|| {
             panic!("malformed accept filename {name:?}; expected PB{{nnn}}_{{slug}}.rs")
         });
-        assert!(rule >= 1 && rule <= 75, "rule {rule} out of range");
+        assert!((1..=75).contains(&rule), "rule {rule} out of range");
     }
 }
 /// Coverage report. Not a hard test in v0.1 (corpus is incipient) but a
@@ -269,16 +269,25 @@ const KNOWN_UNIMPLEMENTED_REJECT: &[u16] = &[41];
 /// Both can be blocked on independent pieces of v0.2 work.
 ///
 /// - PB054 (slice index without bound): the visitor emits an
-///   `IndexBound` obligation and `pitbull-vc::compile` produces a
-///   real SMT problem, but the obligation kind is still a unit
-///   variant — there are no operand bindings yet that would let
-///   a `#[pitbull::requires(i < s.len())]` precondition actually
-///   constrain the SMT `idx` and `len` variables. So even on a
-///   bounded-index corpus file the verifier reports "undischarged
-///   (no solver)" or "NOT DISCHARGED (sat)", and the wrapper's
-///   "(PB054)" verdict surface triggers the contains-check as if
-///   the rule fired. When operand-binding lands (Task P.2 or
-///   later) this exception lifts.
+///   `IndexBound` obligation, `pitbull-vc::compile` produces a
+///   real SMT problem, AND Task P.2 wired the operand binding
+///   so user preconditions can constrain the SMT search space.
+///   What's still missing: the corpus accept file
+///   (`PB054_bounded_index.rs`) uses an EXPRESSION-form
+///   `#[pitbull::requires(i < s.len())]` attribute that the
+///   O.3 HIR attribute parser doesn't accept (it only handles
+///   string-literal arguments). Also the predicate grammar
+///   doesn't yet support `<ident> <cmp> <ident>` form. Until
+///   either one lands, the corpus accept file has no extractable
+///   precondition, the obligation reports as undischarged, and
+///   the wrapper's `(PB054)` verdict surface triggers the
+///   contains-check as if the rule fired.
+///
+///   Note: the parallel e2e test
+///   `wrapper_proves_bounded_index_safe_under_precondition`
+///   demonstrates a successful PB054 discharge by routing the
+///   precondition through `pitbull.toml` (raw SMT-LIB form) —
+///   that path IS fully wired.
 const KNOWN_UNDISCHARGED_ACCEPT: &[u16] = &[54];
 /// Environment needed to drive the wrapper: paths to the built
 /// pitbull-rustc binary and the nightly sysroot.
@@ -604,16 +613,15 @@ fn dispatch_refuses_contradictory_preconditions() {
     //
     // To make it portable, we set the precondition under several
     // plausible key forms.
-    let cfg_text = format!(
-        r#"
+    let cfg_text = r#"
 [project]
 name = "corpus_test"
 toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 
 [verification.preconditions]
 "corpus_test::add_one" = ["(assert false)"]
-"#,
-    );
+"#
+    .to_string();
     fs::write(&cfg_path, cfg_text).expect("write contradictory pitbull.toml");
     let (stderr, code) = run_one_corpus_file_full(
         &env,

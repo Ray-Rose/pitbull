@@ -1023,7 +1023,6 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // PB030: channels.
         if path.starts_with("std::sync::mpsc::") || path.starts_with("std::sync::mpmc::") {
             self.reject(rules::PB030, span, format!("channel type `{path}`"));
-            return;
         }
         // Anything else: user-defined ADT or stdlib type we haven't
         // classified. Accepted; the reachability driver will visit its
@@ -1147,6 +1146,19 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// emitted when the visitor can stand behind the typed claim.
     /// `pitbull-vc` is then free to compile and dispatch knowing
     /// the obligation is well-formed.
+    ///
+    /// Audit-cleanup (audit finding N1, 2026-05-26): when the
+    /// visitor *can't* emit an obligation for an arithmetic
+    /// binop (projected operand, non-int type, mismatched types),
+    /// surface an audit note rather than silently returning.
+    /// Reason: code like `fn add_tuple(p: (u32, u32)) -> u32 { p.0 + p.1 }`
+    /// lowers to a BinaryOp on `Place`s with `ProjectionElem::Field`,
+    /// where `operand_primitive_int_name` returns `None` —
+    /// pre-audit the obligation was silently dropped. An auditor
+    /// reading a report of zero obligations and zero undischarged
+    /// would conclude the code was verified when in fact no check
+    /// ran. The audit posture is "no silent skips"; surfacing the
+    /// gap meets that contract.
     fn maybe_emit_overflow_obligation(
         &mut self,
         binop: crate::mir_api::BinOp,
@@ -1167,12 +1179,44 @@ impl<'cfg> SubsetVisitor<'cfg> {
         let lhs_name = self.operand_primitive_int_name(lhs);
         let rhs_name = self.operand_primitive_int_name(rhs);
         let (Some(lhs_name), Some(rhs_name)) = (lhs_name, rhs_name) else {
+            // Audit finding N1: at least one operand's type wasn't
+            // resolvable. Most common cause: projected operand
+            // (`p.0 + p.1`). Audit-safe direction is over-
+            // approximate "we tried to check but couldn't" rather
+            // than silently treating it as verified. The note
+            // surfaces in the report so an auditor sees the gap
+            // and can either rewrite the body to bring the
+            // operands into a checkable position or accept the
+            // scaffold limitation explicitly.
+            self.audit_note(
+                span,
+                format!(
+                    "PB049: BinaryOp {arith_op:?} skipped — operand type \
+                     unresolvable (likely a projected operand like `p.0 + \
+                     p.1`, or a non-primitive-int type). v0.2 scaffold can \
+                     only emit overflow obligations when both operands are \
+                     direct reads of locals with primitive-integer types. \
+                     This gap is tracked for v0.3+ projection-type resolution.",
+                ),
+            );
             return;
         };
         if lhs_name != rhs_name {
             // Mixed-type arithmetic doesn't reach MIR post-coercion
             // in normal Rust code; refuse to emit a goal we can't
-            // stand behind.
+            // stand behind. Audit finding N1: surface the gap
+            // explicitly (same rationale as above — silent skip
+            // misleads the auditor).
+            self.audit_note(
+                span,
+                format!(
+                    "PB049: BinaryOp {arith_op:?} skipped — operand types \
+                     differ ({lhs_name} vs {rhs_name}). Should be unreachable \
+                     in well-formed MIR post-coercion; if you see this \
+                     note, the visitor encountered an unusual lowering and \
+                     the gap is worth investigating.",
+                ),
+            );
             return;
         }
         // O.2.5: pin constant-operand values into the SMT problem.
@@ -1349,19 +1393,38 @@ impl<'cfg> SubsetVisitor<'cfg> {
     fn emit_panic_reachability_obligation(&mut self, _panic_path: &str, span: Span) {
         let seq = self.vc_obligations.len();
         let id = format!("pb043-panic-{seq}");
-        // Carry the current body's preconditions through. They
-        // don't have a natural binding for PanicReachability today
-        // (no `lhs`/`rhs` like overflow obligations have), so the
-        // pitbull-vc compiler currently ignores them — but keeping
-        // them in the obligation means a future backend with a
-        // richer encoding inherits the context automatically.
-        let assumptions = self.current_body_preconditions.clone();
+        // Apply F2 lex validation to each precondition before
+        // attaching to the obligation. Today `pitbull-vc::compile`
+        // returns `None` for `PanicReachability` so the
+        // assumptions never reach the solver, but pinning the
+        // validation contract now prevents a future PB043 backend
+        // from accidentally accepting a multi-directive injection
+        // via the assumptions field. Audit-cleanup (audit finding
+        // F8, 2026-05-26): consistency with the
+        // `ArithmeticOverflow` and `IndexBound` paths.
+        let mut assumptions: Vec<String> =
+            Vec::with_capacity(self.current_body_preconditions.len());
+        let mut pending_audit_notes: Vec<String> = Vec::new();
+        for raw in &self.current_body_preconditions {
+            match crate::predicate::validate_assertion_form(raw) {
+                Ok(()) => assumptions.push(raw.clone()),
+                Err(e) => {
+                    pending_audit_notes.push(format!(
+                        "PB043: rejecting precondition (not a valid SMT-LIB \
+                         `(assert ...)` form): {e} — input: {raw:?}",
+                    ));
+                }
+            }
+        }
         self.vc_obligations.push(crate::vc::VcObligation {
             id,
             span,
             kind: crate::vc::VcObligationKind::PanicReachability,
             assumptions,
         });
+        for msg in pending_audit_notes {
+            self.audit_note(span, msg);
+        }
     }
     /// Emit an `IndexBound` VC obligation for a slice/array index
     /// projection. Maps to PSS-1 PB054 (slice index without bound
@@ -2518,6 +2581,92 @@ mod tests {
             report.vc_obligations[0].assumptions,
             vec![raw.to_string()],
             "raw SMT-LIB must pass through verbatim",
+        );
+    }
+    /// Audit finding N1: when a `BinaryOp::Add` (or Sub/Mul) has
+    /// projected operands like `p.0 + p.1`, the visitor previously
+    /// silently dropped the PB049 obligation — an auditor reading
+    /// the report would see "0 obligations" and conclude the body
+    /// was verified, when in fact no check ran. This test pins
+    /// the audit-cleanup fix: the obligation is still NOT emitted
+    /// (the visitor cannot construct a typed claim about projected
+    /// operands today), but a `PB049: ... skipped` audit note now
+    /// surfaces the gap.
+    #[test]
+    fn n1_projected_operand_emits_audit_note_for_skipped_pb049() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        // `fn add_tuple(p: (u32, u32)) -> u32 { p.0 + p.1 }`-style
+        // shape: BinaryOp::Add with operands that have
+        // ProjectionElem::Field projections.
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone()],
+            arg_names: vec!["p".into()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl {
+                    ty: u32_ty.clone(),
+                    span: Span::default(),
+                    mutability: Mutability::Not,
+                },
+                LocalDecl {
+                    ty: u32_ty.clone(),
+                    span: Span::default(),
+                    mutability: Mutability::Not,
+                },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place {
+                                local: Local(1),
+                                projection: vec![ProjectionElem::Field(0)],
+                            }),
+                            Operand::Copy(Place {
+                                local: Local(1),
+                                projection: vec![ProjectionElem::Field(1)],
+                            }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        // No obligation emitted (operand type unresolvable).
+        assert!(
+            report.vc_obligations.is_empty(),
+            "projected operand should NOT emit a PB049 obligation today \
+             (the visitor cannot construct a typed claim); got: {:?}",
+            report.vc_obligations,
+        );
+        // But an audit note must surface the gap. Pre-audit (silent
+        // skip) this list was empty — the gap was invisible.
+        let pb049_skip_notes: Vec<_> = report
+            .audit_notes
+            .iter()
+            .filter(|n| n.message.starts_with("PB049: BinaryOp"))
+            .filter(|n| n.message.contains("skipped"))
+            .collect();
+        assert_eq!(
+            pb049_skip_notes.len(),
+            1,
+            "exactly one PB049-skipped audit note expected; got {:?}",
+            report.audit_notes,
         );
     }
     /// Task N negative: a `BinaryOp` on a non-integer (`bool`)

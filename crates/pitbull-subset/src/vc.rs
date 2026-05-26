@@ -81,8 +81,14 @@ pub enum VcObligationKind {
         ty_name: String,
     },
     /// A reachable call to a panic function. Maps to PB043.
-    /// v0.1 visitor does not yet emit these; placeholder for the
-    /// v0.2 panic-unreachability work.
+    /// Emitted by the visitor (see
+    /// `visitor::emit_panic_reachability_obligation`);
+    /// `pitbull-vc::compile` returns `None` until v0.3+ path-
+    /// sensitive reachability lands, so the wrapper reports
+    /// each as "pending". The visitor's emission point is
+    /// `is_panic_call_path`-matched call sites (`core::panicking::*`,
+    /// `std::panicking::*`, `core::panic_any`, `std::panic_any`,
+    /// `std::rt::*`).
     PanicReachability,
     /// A `ProjectionElem::Index` that requires `idx < len`. Maps to
     /// PB054. Emitted by the visitor; `pitbull-vc` compiles to an

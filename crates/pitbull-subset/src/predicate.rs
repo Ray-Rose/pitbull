@@ -483,7 +483,7 @@ fn format_bv_literal(lit: i128, bits: u32) -> String {
     // counterparts) — it reads identical to the standard "0xCAFE"
     // notation in source. Fall back to `(_ bv<value> <bits>)` for
     // non-multiple-of-4 widths.
-    if bits % 4 == 0 {
+    if bits.is_multiple_of(4) {
         let hex_chars = (bits / 4) as usize;
         format!("#x{masked:0hex_chars$X}")
     } else {

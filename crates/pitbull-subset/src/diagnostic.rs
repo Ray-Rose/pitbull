@@ -258,10 +258,11 @@ mod tests {
     /// downstream consumer relies on the field names.
     #[test]
     fn sarif_minimal_emits_line_col_region() {
-        let mut span = Span::default();
-        span.lo = Span::pack(7, 12); // line 7, col 12
-        span.hi = Span::pack(7, 18);
-        span.file = 0xCAFE_BABE;
+        let span = Span {
+            lo: Span::pack(7, 12), // line 7, col 12
+            hi: Span::pack(7, 18),
+            file: 0xCAFE_BABE,
+        };
         let r = SubsetReport::new(vec![SubsetError {
             rule: PB001,
             span,
@@ -284,10 +285,11 @@ mod tests {
     /// covers that path).
     #[test]
     fn sarif_minimal_emits_uri_when_filename_table_present() {
-        let mut span = Span::default();
-        span.lo = Span::pack(3, 5);
-        span.hi = Span::pack(3, 10);
-        span.file = 0xDEAD_BEEF;
+        let span = Span {
+            lo: Span::pack(3, 5),
+            hi: Span::pack(3, 10),
+            file: 0xDEAD_BEEF,
+        };
         let mut table = HashMap::new();
         table.insert(0xDEAD_BEEF_u32, "src/lib.rs".to_string());
         let mut r = SubsetReport::new(vec![SubsetError {

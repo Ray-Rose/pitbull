@@ -264,13 +264,21 @@ mod tests {
         let goal = compile(&obligation).expect("IndexBound now compiles");
         assert_eq!(goal.obligation, obligation);
         assert!(goal.smt.contains("(set-logic QF_BV)"));
-        assert!(goal.smt.contains("(declare-const idx (_ BitVec 64))"));
-        assert!(goal.smt.contains("(declare-const len (_ BitVec 64))"));
-        assert!(goal.smt.contains("(assert (bvuge idx len))"));
-        // No idx_source_name → no define-fun alias.
+        // Audit-cleanup F3: canonical names are now `__pb_idx` /
+        // `__pb_len` with `idx`/`len` as user-facing aliases.
+        assert!(goal.smt.contains("(declare-const __pb_idx (_ BitVec 64))"));
+        assert!(goal.smt.contains("(declare-const __pb_len (_ BitVec 64))"));
+        assert!(goal.smt.contains("(define-fun idx () (_ BitVec 64) __pb_idx)"));
+        assert!(goal.smt.contains("(define-fun len () (_ BitVec 64) __pb_len)"));
+        assert!(goal.smt.contains("(assert (bvuge __pb_idx __pb_len))"));
+        // No idx_source_name → no SOURCE-NAME alias. (The
+        // canonical idx/len aliases are always present.)
+        // Match "(define-fun |" for the quoted-symbol form
+        // emit_index_bound_problem_with_assumptions uses for
+        // user-source-name aliases.
         assert!(
-            !goal.smt.contains("define-fun"),
-            "None idx_source_name should produce no alias; got:\n{}",
+            !goal.smt.contains("(define-fun |"),
+            "None idx_source_name should produce no source-name alias; got:\n{}",
             goal.smt,
         );
         assert!(
@@ -279,12 +287,14 @@ mod tests {
             goal.consistency_check,
         );
     }
-    /// Task P.2: IndexBound with `idx_source_name: Some("i")`
-    /// produces a SMT problem containing `(define-fun i () (_
-    /// BitVec 64) idx)` so user preconditions referencing `i`
-    /// constrain the SMT problem. The consistency check carries
-    /// the SAME alias so the F1 guard runs against the same
-    /// model as the main problem.
+    /// Task P.2 + audit-cleanup F4: IndexBound with
+    /// `idx_source_name: Some("i")` produces a SMT problem
+    /// containing `(define-fun |i| () (_ BitVec 64) __pb_idx)`
+    /// — quoted-symbol syntax so any Rust ident (including raw
+    /// idents and SMT reserved words) is well-formed — so user
+    /// preconditions referencing `i` constrain the SMT problem.
+    /// The consistency check carries the SAME alias so the F1
+    /// guard runs against the same model as the main problem.
     #[test]
     fn compile_index_bound_with_source_name_emits_alias() {
         let obligation = VcObligation {
@@ -297,8 +307,8 @@ mod tests {
         };
         let goal = compile(&obligation).expect("IndexBound with alias compiles");
         assert!(
-            goal.smt.contains("(define-fun i () (_ BitVec 64) idx)"),
-            "main problem must contain the alias; got:\n{}",
+            goal.smt.contains("(define-fun |i| () (_ BitVec 64) __pb_idx)"),
+            "main problem must contain the quoted-symbol alias; got:\n{}",
             goal.smt,
         );
         let cs = goal
@@ -306,7 +316,7 @@ mod tests {
             .as_ref()
             .expect("consistency check should be present when assumptions exist");
         assert!(
-            cs.contains("(define-fun i () (_ BitVec 64) idx)"),
+            cs.contains("(define-fun |i| () (_ BitVec 64) __pb_idx)"),
             "consistency check must carry the SAME alias as the main problem \
              (the F1 guard runs the same model); got:\n{cs}",
         );
@@ -327,9 +337,11 @@ mod tests {
             ],
         };
         let goal = compile(&obligation).expect("IndexBound now compiles");
-        // Main problem contains the safety predicate.
-        assert!(goal.smt.contains("(assert (bvuge idx len))"));
-        // Assumption appears in the main problem.
+        // Main problem contains the safety predicate. Audit-cleanup
+        // F3: uses internal canonical name `__pb_idx`/`__pb_len`.
+        assert!(goal.smt.contains("(assert (bvuge __pb_idx __pb_len))"));
+        // Assumption appears in the main problem (references the
+        // user-facing `idx` alias which forwards to `__pb_idx`).
         assert!(goal.smt.contains("(assert (bvult idx #x0000000000000064))"));
         // Consistency check is populated and contains the
         // assumption but NOT the safety predicate.

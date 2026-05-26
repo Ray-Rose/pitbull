@@ -5,14 +5,13 @@
 //! ## Subcommand structure
 //!
 //! - `cargo pitbull check`   — run subset checking only (fast, the
-//!                              v0.1 demo path).
+//!   v0.1 demo path).
 //! - `cargo pitbull verify`  — run subset + translation + SMT
-//!                              (full pipeline, lands in subsequent
-//!                              milestones).
+//!   (full pipeline, lands in subsequent milestones).
 //! - `cargo pitbull replay`  — re-execute committed proof certificates
-//!                              against current solver binaries.
+//!   against current solver binaries.
 //! - `cargo pitbull rules`   — print the rule registry as JSON, for
-//!                              tooling and audit scripts.
+//!   tooling and audit scripts.
 //!
 //! v0.1 ships `check`, `rules`, and a stub `verify` that delegates to
 //! `check` plus a warning that translation is still in development.
@@ -22,7 +21,7 @@
 //! - `0`  — clean verification.
 //! - `1`  — PSS-1 subset violations found.
 //! - `2`  — verification could not run (config invalid, MIR unavailable,
-//!          solver unreachable).
+//!   solver unreachable).
 //! - `3`  — internal error (panic, ICE).
 //!
 //! These map to the SARIF-consumer conventions used by GitHub

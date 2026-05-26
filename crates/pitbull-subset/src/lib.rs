@@ -36,7 +36,7 @@
 //! - [`diagnostic`]    — error type, SARIF rendering, miette-backed printing.
 //! - [`mir_api`]       — the single import surface for `rustc_public`.
 //! - [`mutation`]      — (feature-gated) mutation-testing harness for the
-//!                       subset checker itself.
+//!   subset checker itself.
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 // When the build script sets `--cfg rustc_public_real` (opt-in via

@@ -6,8 +6,11 @@ verifier where the previous session left off. Read top to
 bottom on first sit-down; refer back to individual sections
 during work.
 
-Last known-good commit at hand-off: **`a66a1a4`** ("Milestone 2
-Task O.3"). Branch `main`, local repo only (no remote).
+Last known-good commit at hand-off: **`<refresh after this commit>`**.
+The post-P.2 state ships Tasks P / P.1 / P.2 (PB054 end-to-end:
+visitor → SMT compile → operand binding → Z3 discharge) plus an
+audit-cleanup pass that closed N1 / N2 / F3 / F4 / F5–F13 from
+the deep audit. Branch `main`, local repo only (no remote).
 
 ## TL;DR
 
@@ -15,16 +18,20 @@ Task O.3"). Branch `main`, local repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch (Z3 today). See `docs/PSS-1.md` for the
   specification.
-- **State:** 122 tests passing, both lanes warning-clean. The
-  Milestone-2 work (Tasks E through O.2 plus six audit-cleanup
-  commits) is done.
-- **Next task:** **Z3 verification** (5 min) — install Z3 and
-  run the headline-demo capstone test to confirm the v0.2
-  spec-context-narrowing series (O.1 → O.2 → O.2.5 → O.3)
-  actually produces `unsat` end-to-end. Then pick a strategic
-  direction from Section 5's menu (PB054 bound checks,
-  multi-solver agreement, attribute coverage expansion, corpus
-  growth, …).
+- **State:** 154 tests passing, both lanes warning-clean, clippy
+  clean. Milestone-2 work through Tasks P.2 is done — including:
+  the v0.2 deductive backend (Tasks M + N), spec-context narrowing
+  (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
+  and the post-audit cleanups closing F1 / F2 / F7 / H3 / N1 / N2
+  / F3 / F4 / F8 / F11.
+- **Next task:** Pick a strategic direction from Section 5's menu.
+  PB049 overflow and PB054 index-bound both discharge end-to-end
+  under Z3 with preconditions in `pitbull.toml`. Reasonable next
+  steps: PB043 (panic reachability — path-sensitive backend),
+  multi-solver agreement (CVC5 + Alt-Ergo voting), expanded O.3
+  attribute coverage (`ensures` / `trusted` / impl methods), or
+  predicate-grammar extension to `<ident> <cmp> <ident>` form
+  so `i < len`-style preconditions don't need raw-SMT.
 - **First commands to run in a fresh session:** see
   [Section 4: Smoke test in a fresh session](#4-smoke-test-in-a-fresh-session).
 
@@ -49,6 +56,11 @@ Task O.3"). Branch `main`, local repo only (no remote).
 ### Recent commit log (newest first)
 
 ```
+<this commit> Audit-cleanup pass after P/P.1/P.2 (N1/N2/F3/F4/F5–F13 closed)
+c05bd13 Milestone 2 Task P.2: PB054 operand binding — IndexBound discharges end-to-end
+f0b7dc7 Milestone 2 Task P.1: PB054 SMT discharge — IndexBound compiles to QF_BV
+9e15116 Milestone 2 Task P: PB054 MVP — detect index sites and emit IndexBound obligations
+de0054e docs: HANDOFF.md refresh for post-O.3 state
 a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
 808f5dd Audit O.2.5-followup: sign-extend narrow signed values + capstone test + doc fixes
 f18a3fa Milestone 2 Task O.2.5: constant-operand value extraction (headline demo unlocker)
@@ -86,11 +98,12 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **130 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **154 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
+| `cargo +stable clippy --workspace --all-features --tests` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The 130 breaks down: 1 (spec) + 97 (subset lib) + 15 (integration) + 17 (vc) = 130.
+The 154 breaks down: 1 (spec) + 108 (subset lib) + 16 (integration) + 29 (vc) = 154.
 
 ---
 
@@ -265,24 +278,36 @@ PATH="$SYSROOT/bin:$PATH" \
 Expected stderr (Z3 not installed):
 ```
 pitbull-rustc: z3 not installed; VC obligations cannot be discharged. ...
-pitbull-rustc: vc pb049-add-0: undischarged (no solver) [1 assumption]
+pitbull-rustc: vc pb049-add-0 (PB049): undischarged (no solver) [1 assumption]
 pitbull-rustc: VC summary: 1 obligation(s), 0 discharged, 1 undischarged
 pitbull-rustc: crate analyzed: 1 items, 1 bodies walked, 0 non-fn items, 0 unsafe blocks, 0 subset violation(s)
 ```
 
+Each verdict line carries `(PBxxx)` (the canonical PSS-1 rule id, added in Task P.1) alongside the obligation id, so an auditor reading stderr sees both the rule and the per-obligation tag at a glance.
+
 If Z3 IS installed:
 ```
-pitbull-rustc: vc pb049-add-0: NOT DISCHARGED (sat — counterexample exists) [1 assumption]
+pitbull-rustc: vc pb049-add-0 (PB049): NOT DISCHARGED (sat — counterexample exists) [1 assumption]
 pitbull-rustc: VC summary: 1 obligation(s), 0 discharged, 1 undischarged
 ```
 (The lone obligation reports sat because there's no precondition constraining `x`; `x = u32::MAX` is a witness. The `[1 assumption]` is the O.2.5 const-pin for `rhs = 1`.
 
 With a `#[pitbull::requires("x < 100")]` attribute on the same function — and `#![feature(register_tool)]` + `#![register_tool(pitbull)]` at the crate root — the verdict flips:
 ```
-pitbull-rustc: vc pb049-add-0: discharged (unsat — safety property holds) [2 assumptions]
+pitbull-rustc: vc pb049-add-0 (PB049): discharged (unsat — safety property holds) [2 assumptions]
 pitbull-rustc: VC summary: 1 obligation(s), 1 discharged, 0 undischarged
 ```
-This is the v0.2 spec-context-narrowing headline demo. See Section 5 for verification details.)
+
+A second discharge demo, PB054 (added in Tasks P / P.1 / P.2):
+`fn at(s: &[u8], i: usize) -> u8 { s[i] }` with
+`"corpus_test::at" = ["(assert (bvult i len))"]` in pitbull.toml
+produces (Z3 on PATH):
+```
+pitbull-rustc: vc pb054-idx-0 (PB054): discharged (unsat — safety property holds) [1 assumption]
+pitbull-rustc: VC summary: 1 obligation(s), 1 discharged, 0 undischarged
+```
+Both demos route through the same compile + dispatch pipeline.
+See Section 5 for verification details.)
 
 ### Step 4.6 — Optional: full e2e with PITBULL_REQUIRE_E2E
 
@@ -371,36 +396,37 @@ yourself on the back.
 Several reasonable next steps. Listed in approximate
 impact-to-effort order:
 
-#### Option A — PB054 bound checks (~1 day, high impact)
-The next obligation kind after PB049 overflow. Same SMT
-bit-vector shape (`(assert (bvult idx len))` vs. `(assert
-(bvuaddo lhs rhs))`), similar visitor wiring. Concrete demo:
-`fn at(v: &[u32], i: usize) -> u32 { v[i] }` with
-`requires(i < v.len())` proves safe.
+#### Option A — PB054 bound checks (**DONE** in Tasks P / P.1 / P.2)
+~~The next obligation kind after PB049 overflow.~~ Shipped.
+PB054 now emits via the visitor's `visit_projection` (Task P),
+compiles to a real QF_BV SMT problem (Task P.1), and discharges
+end-to-end under Z3 with operand-bound preconditions (Task P.2).
+See `tests/integration.rs::wrapper_proves_bounded_index_safe_under_precondition`
+for the e2e capstone. Limitations that remain are tracked in
+Section 7 below — chiefly that the predicate grammar doesn't yet
+support `<ident> <cmp> <ident>` form, so users write raw SMT in
+`pitbull.toml` rather than `#[pitbull::requires("i < len")]`.
 
-Note on rule-ID overlap: `rules::PB054` is currently used for
-two distinct audit concerns in the visitor — (1) the projection
-depth cap at `visitor.rs` `MAX_PROJECTION_DEPTH` (via
-`reject(PB054, ...)`) and (2) the slice index bound obligation
-emitted from `visit_projection`. The first is a syntactic
-rejection that appears as a `SubsetError`; the second is a
-`VcObligation` whose `id` starts with `pb054-idx-` so an
-auditor can distinguish the two cases from output alone.
-Reusing the rule ID is acceptable — the depth cap is itself
-about "projection sanity" which the slice-index bound obligation
-is one facet of — but the distinct obligation ID prefixes are
-mandatory to keep traces unambiguous.
+#### Option A' — PB043 panic reachability (~3 days, high impact)
+The next obligation kind. Different shape than PB049/PB054: needs
+path-sensitive symbolic execution rather than bit-vector arithmetic
+alone. The visitor already emits `VcObligationKind::PanicReachability`
+at every reachable `core::panicking::*` / `std::panicking::*` call
+site; `pitbull-vc::compile` returns `None` for the kind today
+(reported as "pending" in the verdict). A real backend would track
+SMT-encoded path conditions through the MIR (post-monomorphization)
+and prove the panic call is unreachable under the precondition set.
 
 Sketch:
-1. Identify slice/array index sites in the visitor's
-   `visit_projection` (`ProjectionElem::Index`,
-   `ProjectionElem::ConstantIndex`, `ProjectionElem::Subslice`).
-2. Emit a `VcObligationKind::IndexBound` obligation with the
-   index operand and the slice's length as SMT terms.
-3. Extend `pitbull-vc::compile`'s match to handle
-   `IndexBound`; emit `(declare-const idx ...)` /
-   `(declare-const len ...)` / `(assert (bvult idx len))`.
-4. Pin the operand values via O.2.5 if known constants.
+1. Add a new `pitbull-vc` module for path-condition tracking
+   (CFG → SMT bool assertions per basic block).
+2. Encode the call site's path condition; ask the solver "is
+   this path condition satisfiable under the user preconditions?"
+3. unsat ⇒ discharged (panic unreachable); sat ⇒ undischarged
+   with the satisfying assignment as counterexample.
+4. Connect to `strict_panic_acceptance` in pitbull.toml (current
+   posture: visitor-level reject when strict; obligation when
+   non-strict).
 
 #### Option B — Multi-solver agreement (~2 days, high TCB impact)
 The SAFETY-MANUAL flags solver bugs as a real TCB hole; the
@@ -548,14 +574,17 @@ git commit -m "..."
 | `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `a66a1a4`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |
 | Path-sensitive symbolic exec | PB043 PanicReachability obligations are emitted but `pitbull-vc::compile` returns None for the kind. | `pitbull-vc/src/vc.rs::compile` | The SMT encoding for "panic site is unreachable" requires path-sensitive analysis — multi-week task. |
 | Termination measures (PB041) | Recursion-decreasing obligations not yet emitted. | visitor + vc | Needs call-graph SCC analysis, currently a documented gap. |
-| Bounds checks (PB054) | Index obligations emitted but not compiled. | vc compile | Needs `idx < len` reasoning over MIR local state. |
+| Bounds checks (PB054) | ✅ DONE in Tasks P / P.1 / P.2 + audit-cleanup. Visitor emits `IndexBound { idx_source_name: Option<String> }`; compile emits QF_BV with `__pb_idx`/`__pb_len` canonical names + `idx`/`len` aliases + optional source-name alias in quoted-symbol syntax for raw-ident safety. End-to-end discharge under Z3 verified by `wrapper_proves_bounded_index_safe_under_precondition`. | — | Closed. |
+| Z3 subprocess timeout / output cap | Z3 invocation can hang indefinitely on a pathological SMT problem; no captured-output size cap. | `pitbull-vc/src/solver.rs` | DoS vector flagged in audit finding N3 (2026-05-26). Mitigation requires spawning + try_wait + size-cap; bigger change than the audit-cleanup pass absorbed. |
+| PB049 silent skip on projected operands | ✅ DONE in audit-cleanup. `maybe_emit_overflow_obligation` now emits a `PB049: ... skipped` audit note when operand types can't be resolved (projected operands like `p.0 + p.1`, mismatched types). Pre-fix the obligation was silently dropped — auditors reading "0 obligations" would falsely conclude verified. | — | Closed (audit finding N1, 2026-05-26). |
+| SARIF / TOML symlink follow | ✅ DONE in audit-cleanup. `check_env_path` now refuses symlink leaf paths via `symlink_metadata().file_type().is_symlink()`. Pre-fix a build.rs could create a `.json`-extension symlink to overwrite `~/.config/.../settings.json` via `PITBULL_SARIF_OUT`. | — | Closed (audit finding N2, 2026-05-26). |
 
 ### UX / quality work
 
 | What | Where | Priority |
 |---|---|---|
 | F7 regression corpus test | `crates/pitbull-subset/tests/corpus/accept/PB001_macro_expansion.rs` | MEDIUM. Smoke-verified manually; pinning requires a corpus file walked through the nightly wrapper. |
-| Clippy cleanup | workspace-wide | LOW. 60+ pre-existing warnings; not gated in CI. |
+| Clippy cleanup | workspace-wide | ✅ DONE in audit-cleanup. `cargo +stable clippy --workspace --all-features --tests` is now error-clean. Remaining are non-deny warnings (~100). |
 | Mutation testing harness wiring | `pitbull-subset/src/mutation.rs` | MEDIUM. Module exists; cargo-mutants integration is the missing piece. |
 | Corpus expansion | `tests/corpus/{accept,reject}/` | LOW (ongoing). Want ≥10 reject + ≥5 accept per rule per PSS-1 §15. |
 | `cargo pitbull check` subcommand wires verdict aggregation | `pitbull-driver/src/main.rs` | MEDIUM. Subcommand exists but uses status.success() rather than per-crate Pitbull output. |

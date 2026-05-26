@@ -39,6 +39,14 @@
 //! Prophecy syntax (`^x` for the future value of a mutable borrow) is
 //! intentionally not exposed in v0.1 (PB070). It returns in v0.2 after the
 //! tutorial and counterexample UX are in place.
+// Defense-in-depth (audit-cleanup F11, 2026-05-26): the workspace
+// `[lints]` configuration already sets `unsafe_code = "forbid"`, but
+// inner `#![forbid(unsafe_code)]` is harder to silently undo via a
+// future `[lints]` reconfiguration. The proc-macro crate is TCB-
+// critical (it shapes what the wrapper sees at HIR level) so the
+// belt-and-suspenders inner attr matches the other three crate
+// roots.
+#![forbid(unsafe_code)]
 use proc_macro::TokenStream;
 /// Marks a function as a verification entry point.
 ///

@@ -1310,14 +1310,21 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  120 passing, 0 ignored — was 49 + 1 ignored in the v0.1
-  baseline). The driver-side test harness is the right home for tests
-  that exercise the adapter against real MIR.
+  154 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  baseline; the surge tracks the v0.2 deductive-backend, HIR
+  pre-pass, and PB054 P / P.1 / P.2 work). The driver-side test
+  harness is the right home for tests that exercise the adapter
+  against real MIR.
 **Verification today:**
 ```bash
-# Stable: v0.1 baseline (49 + 1 ignored, 0 warnings)
-cargo test --workspace --all-features
-# Nightly + opt-in: adapter scaffold compiles
-PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 check -p pitbull-subset
+# Stable: 154 passing, 0 warnings, clippy clean
+cargo +stable test --workspace --all-features
+cargo +stable clippy --workspace --all-features --tests
+# Nightly + opt-in: wrapper builds, end-to-end PB049/PB054 discharge
+# under Z3 (graceful skip when Z3 isn't on PATH).
+PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc
+PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
 ```
-See `docs/ROADMAP.md` (forthcoming) for the milestone plan.
+Future-roadmap detail lives in `docs/HANDOFF.md`; multi-solver
+agreement and the v0.3 path-sensitive panic-reachability backend
+are the next two strategic directions.
