@@ -86,10 +86,28 @@ pub enum VcObligationKind {
     PanicReachability,
     /// A `ProjectionElem::Index` that requires `idx < len`. Maps to
     /// PB054. Emitted by the visitor; `pitbull-vc` compiles to an
-    /// SMT problem with unsigned bit-vector idx and len; without
-    /// operand bindings the problem is sat (the obligation reports
-    /// as undischarged) — see Task P.1 in PSS-1.md §17.1.
-    IndexBound,
+    /// SMT problem with unsigned bit-vector idx and len. The
+    /// `idx_source_name` carries the source-level identifier the
+    /// index resolved to (`Some("i")` for `s[i]` where `i` is a
+    /// function parameter, `None` for indices derived from local
+    /// computations the visitor can't trace). When `Some`, the
+    /// SMT problem includes a `(define-fun <name> () (_ BitVec 64)
+    /// idx)` alias so user preconditions written with the source
+    /// name (e.g. `(assert (bvult i len))`) constrain the SMT
+    /// search space. Without the binding (`None`), the obligation
+    /// stays unconstrained — the obligation will report as sat
+    /// (counterexample exists) unless the user writes preconditions
+    /// referencing `idx` and `len` directly.
+    IndexBound {
+        /// Source identifier the index local resolved to, when
+        /// the index `ProjectionElem::Index(Local)` references a
+        /// function-argument slot whose source name is known.
+        /// `None` for `ConstantIndex`/`Subslice` (no MIR local
+        /// — the offset is a u64 literal), for indices derived
+        /// from intermediate `let` bindings (no data-flow trace),
+        /// and for arg slots whose source name was anonymized.
+        idx_source_name: Option<String>,
+    },
     /// A recursive call where the `#[decreases(...)]` measure must
     /// strictly decrease. Maps to PB041. Visitor placeholder;
     /// requires call-graph SCC analysis.
@@ -115,7 +133,7 @@ impl VcObligationKind {
         match self {
             VcObligationKind::ArithmeticOverflow { .. } => "PB049",
             VcObligationKind::PanicReachability => "PB043",
-            VcObligationKind::IndexBound => "PB054",
+            VcObligationKind::IndexBound { .. } => "PB054",
             VcObligationKind::RecursionDecreases => "PB041",
         }
     }
@@ -226,7 +244,17 @@ mod tests {
             "PB049",
         );
         assert_eq!(VcObligationKind::PanicReachability.rule_id(), "PB043");
-        assert_eq!(VcObligationKind::IndexBound.rule_id(), "PB054");
+        assert_eq!(
+            VcObligationKind::IndexBound { idx_source_name: None }.rule_id(),
+            "PB054",
+        );
+        assert_eq!(
+            VcObligationKind::IndexBound {
+                idx_source_name: Some("i".into()),
+            }
+            .rule_id(),
+            "PB054",
+        );
         assert_eq!(VcObligationKind::RecursionDecreases.rule_id(), "PB041");
     }
 }

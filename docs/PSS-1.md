@@ -859,11 +859,131 @@ the std form and now also matches. No shadow type changes.
   With Z3 installed but without operand bindings the verdict
   becomes `NOT DISCHARGED (sat — counterexample exists)` — the
   honest answer for an obligation whose `idx` and `len` are
-  unconstrained. When operand-binding lands in Task P.2+, a
-  body with `requires(i < s.len())` will see the assumption
-  constrain the search space and the obligation will discharge
-  to `unsat`. Test totals: 1 + 104 + 15 + 24 = 144 (up from
-  136; +8 SMT-discharge tests).
+  unconstrained. Test totals after this commit: 1 + 104 + 15 +
+  24 = 144 (up from 136; +8 SMT-discharge tests). Task P.2 (next
+  entry) wires the operand binding that lets `i < len`-style
+  preconditions actually constrain the SMT problem.
+- ✅ PB054 P.2 — operand binding (idx → source identifier).
+  Closes the PB054 deductive chain end-to-end. `fn at(s: &[u8],
+  i: usize) -> u8 { s[i] }` with a precondition `(assert (bvult
+  i len))` in `pitbull.toml` now reports `discharged (unsat
+  — safety property holds) [1 assumption]` under Z3.
+
+  Pieces wired:
+    * `VcObligationKind::IndexBound` becomes a struct variant:
+      `IndexBound { idx_source_name: Option<String> }`. The
+      visitor populates it from the MIR local that the
+      `ProjectionElem::Index(Local)` references. When the index
+      local IS a function-argument slot whose source name is
+      known (e.g. `i` in `fn at(s, i) { s[i] }`), the name flows
+      into the obligation. Conservative posture: indices
+      derived from local computations (intermediate `let`
+      bindings, arithmetic results) emit `None` because the
+      visitor doesn't do data-flow analysis — the SMT problem
+      then has no source-name alias, the precondition silently
+      doesn't bind, and the obligation reports as undischarged.
+      That's the audit-safe direction: missing-bind ⇒ over-
+      approximate "could fail", not under-approximate
+      "vacuously holds".
+    * New visitor helper `local_arg_name(Local) -> Option<String>`:
+      sibling to the existing `operand_arg_name(Operand)`,
+      reusing the same arg-slot-lookup logic (`_1..=_arg_count`
+      → `current_body_arg_names[0..arg_count)`, skipping empty
+      names from anonymous patterns).
+    * `emit_index_bound_obligation` now takes
+      `idx_source_name: Option<String>` and applies F2 lex
+      validation (`validate_assertion_form`) to each
+      precondition before attaching, with a PB054-specific
+      audit note on rejection. Mirrors the audit posture of the
+      PB049 path — no silent skips when a user precondition is
+      malformed. The v0.2 grammar's `<ident> <cmp> <int>` form
+      doesn't apply to IndexBound (whose natural shape is `i <
+      len`, two idents), so only raw SMT-LIB strings flow
+      through today; the predicate-grammar extension to ident-
+      vs-ident lands in a follow-up.
+    * `smt::emit_index_bound_problem_with_assumptions` now
+      takes `idx_alias: Option<&str>`. When `Some(name)`, the
+      SMT problem emits `(define-fun <name> () (_ BitVec 64)
+      idx)` between the variable declarations and the
+      assumptions. A user precondition `(assert (bvult i len))`
+      then reaches `idx` via the alias; combined with the
+      safety negation `(assert (bvuge idx len))`, the
+      conjunction is unsat under any sound precondition.
+      Collision guard: an alias name equal to `idx` or `len`
+      is silently dropped (no-op for `idx`, would collide with
+      `len`'s declaration).
+    * `emit_index_bound_consistency_check` takes the SAME
+      alias for the F1 guard — running the consistency check
+      against a different model than the main problem would
+      let the F1 guard miss-fire on alias-dependent
+      assumptions.
+    * `pitbull-vc::vc::compile` threads `idx_source_name.as_deref()`
+      through to both SMT emitters.
+    * Integration test infrastructure now passes
+      `--crate-name=corpus_test` explicitly. CARGO_PKG_NAME is
+      a cargo env var that rustc doesn't read; without `--
+      crate-name` rustc derived the crate name from the temp
+      filename, silently breaking pitbull.toml-keyed
+      precondition lookups for e2e tests. The fix landed
+      alongside Task P.2 because the new bounded-index
+      capstone exposed it (the existing add_one capstone was
+      Z3-gated and skip-passed on dev machines without Z3).
+
+  Tests added:
+    * `visitor::tests::index_projection_binds_arg_source_name`
+      — pins that an arg-slot index (`_2` in a body with
+      `arg_names = ["s", "i"]`) resolves to `Some("i")` via
+      `local_arg_name`.
+    * `visitor::tests::index_projection_with_non_arg_local_has_no_binding`
+      — pins the conservative-fail direction for non-arg
+      locals.
+    * `visitor::tests::constant_index_and_subslice_have_no_idx_source_name`
+      — pins that ConstantIndex / Subslice carry `None` (no
+      MIR local to look up).
+    * `pitbull_vc::smt::tests::index_bound_with_alias_emits_define_fun`
+      — SMT-shape pin for the alias path.
+    * `pitbull_vc::smt::tests::index_bound_alias_collision_with_canonical_names_dropped`
+      — collision-guard pin.
+    * `pitbull_vc::smt::tests::index_bound_alias_lets_assumption_reference_source_name`
+      — assumption-after-alias ordering pin.
+    * `pitbull_vc::vc::tests::compile_index_bound_with_source_name_emits_alias`
+      — `compile()` threading pin (both main SMT and
+      consistency check carry the alias).
+    * `integration::tests::wrapper_proves_bounded_index_safe_under_precondition`
+      — full e2e capstone: writes a probe with `fn at(s, i) {
+      s[i] }`, a `pitbull.toml` with `(assert (bvult i len))`,
+      invokes the wrapper, asserts `discharged (unsat)` and
+      exit code 0 when Z3 is on PATH. Skips gracefully without
+      Z3.
+
+  E2e capstone output (Z3 4.13.0 via GNATprove bundle):
+  ```
+  pitbull-rustc: vc pb054-idx-0 (PB054): discharged (unsat — safety property holds) [1 assumption]
+  pitbull-rustc: VC summary: 1 obligation(s), 1 discharged, 0 undischarged
+  ```
+
+  Restrictions (deferred to v0.3+):
+    * `KNOWN_UNDISCHARGED_ACCEPT = &[54]` stays in place for
+      the corpus accept file (`PB054_bounded_index.rs`) — that
+      file uses `#[pitbull::requires(i < s.len())]` in
+      expression form, which the O.3 attribute parser (string-
+      literal only) can't extract. Use pitbull.toml-based
+      preconditions for now; the attribute-expression parser
+      extension lands separately.
+    * `len` doesn't have a source-level alias yet; users still
+      write `len` (the canonical SMT name) in raw-SMT
+      preconditions. Synthesizing `s_len`-style aliases for
+      the slice place would require threading the base local's
+      source name through the projection visit — natural
+      follow-up.
+    * The predicate grammar doesn't yet support
+      `<ident> <cmp> <ident>` form, so users can't write
+      `"i < len"` and have it desugar to SMT — they write the
+      raw `(assert (bvult i len))` form via pitbull.toml.
+
+  Test totals after this commit: 1 + 107 + 16 + 28 = 152 (up
+  from 144; +8 tests covering visitor binding, SMT alias
+  emission, compile threading, and e2e discharge).
 - ✅ Constant-operand value extraction — the headline-demo
   unlocker (Task O.2.5). Before this commit, the SMT problem
   treated `Operand::Constant` as a free `BitVec N` variable —

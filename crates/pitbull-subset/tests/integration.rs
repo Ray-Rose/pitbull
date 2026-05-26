@@ -438,6 +438,16 @@ fn run_one_corpus_file_full_inner(
         .arg("--edition=2021")
         .arg("--crate-type=lib")
         .arg("--emit=metadata")
+        // Force the crate name so `item.name()` returns
+        // "corpus_test::<fn>" — matches the convention the
+        // pitbull.toml-based tests use for their precondition
+        // keys. Without this, rustc derives the crate name from
+        // the temp filename (e.g. `pitbull_corpus_PBxxx_yyy_zzz`)
+        // and the precondition lookup silently misses, leaving
+        // obligations with no assumptions even when the user
+        // wrote a precondition. CARGO_PKG_NAME is a cargo env var
+        // that rustc itself doesn't read — must come through CLI.
+        .arg("--crate-name=corpus_test")
         .arg("-o")
         .arg(&output_artifact)
         .arg(&temp_dir)
@@ -830,6 +840,96 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
         code,
         Some(0),
         "O.2.5: a fully-discharged obligation should exit 0 \
+         (rustc clean + Pitbull clean). Got {code:?}",
+    );
+}
+/// PB054 P.2 capstone (parallel to the O.2.5 add_one test): when
+/// Z3 is installed, the wrapper proves `fn at(s: &[u8], i: usize) -> u8 { s[i] }`
+/// is safe under `(assert (bvult i len))` end-to-end. This pins the
+/// chain — visitor extracts the source name "i" for the index local,
+/// `pitbull-vc::compile` emits a `(define-fun i () (_ BitVec 64) idx)`
+/// alias, the user precondition references `i` (which resolves to idx),
+/// the safety negation `(bvuge idx len)` is unsat under the conjunction,
+/// the wrapper reports "discharged (unsat)".
+///
+/// Gated on Z3 availability: gracefully skips if Z3 isn't on PATH.
+#[test]
+fn wrapper_proves_bounded_index_safe_under_precondition() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_bounded_index_safe_under_precondition: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!(
+        "pitbull-p2-bounded-{}.toml",
+        std::process::id(),
+    ));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-p2-bounded-{}.rs",
+        std::process::id(),
+    ));
+    // The body uses `s[i]` which lowers to a `ProjectionElem::Index`
+    // on the slice — the visitor's PB054 path emits an IndexBound
+    // obligation. The argument `i` resolves to source name "i", and
+    // the compile path emits a define-fun alias so the user
+    // precondition can reference `i` directly.
+    fs::write(
+        &probe_rs,
+        "pub fn at(s: &[u8], i: usize) -> u8 { s[i] }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        r#"
+[project]
+name = "corpus_test"
+toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
+
+[verification.preconditions]
+"corpus_test::at" = ["(assert (bvult i len))"]
+"#,
+    )
+    .expect("write P.2 pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if stderr.contains("z3 not installed") {
+        eprintln!(
+            "wrapper_proves_bounded_index_safe_under_precondition: SKIPPED \
+             (z3 not on PATH; install Z3 to exercise this end-to-end test)",
+        );
+        return;
+    }
+    // With Z3 installed, the PB054 obligation must discharge. The
+    // verdict line will look like
+    //   `vc pb054-idx-0 (PB054): discharged (unsat — safety property holds) [1 assumption]`
+    assert!(
+        stderr.contains("discharged (unsat") && !stderr.contains("NOT DISCHARGED"),
+        "P.2 capstone: `at(s, i)[i]` with `(assert (bvult i len))` must discharge \
+         under Z3. Got code {code:?}, stderr:\n{stderr}",
+    );
+    // The verdict should specifically be on a PB054 obligation,
+    // not just any other discharged obligation that happened to
+    // be in the stderr.
+    assert!(
+        stderr.contains("(PB054)"),
+        "P.2 capstone: stderr should reference the canonical PB054 rule on the \
+         discharged verdict line. Got stderr:\n{stderr}",
+    );
+    // Wrapper exit code should be 0 (no violations, no undischarged) per F10.
+    assert_eq!(
+        code,
+        Some(0),
+        "P.2: a fully-discharged PB054 obligation should exit 0 \
          (rustc clean + Pitbull clean). Got {code:?}",
     );
 }

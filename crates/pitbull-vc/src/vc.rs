@@ -63,30 +63,32 @@ pub fn compile(obligation: &VcObligation) -> Option<VcGoal> {
             };
             (main, consistency)
         }
-        VcObligationKind::IndexBound => {
-            // PB054 SMT discharge (Task P.1): declare `idx` and
-            // `len` as 64-bit unsigned bit-vectors, splice
-            // assumptions in, assert the negation of the safety
-            // predicate (`bvuge idx len`), check sat.
+        VcObligationKind::IndexBound { idx_source_name } => {
+            // PB054 SMT discharge (Task P.1) + operand binding
+            // (Task P.2): declare `idx` and `len` as 64-bit
+            // unsigned bit-vectors, optionally alias the
+            // source-level identifier (e.g. `i`) to `idx` via
+            // define-fun, splice assumptions in, assert the
+            // negation of the safety predicate (`bvuge idx
+            // len`), check sat.
             //
-            // Without operand bindings (the visitor doesn't yet
-            // thread the actual index local and slice place into
-            // the obligation) the problem is satisfiable for the
-            // trivial counterexample idx=1, len=0 — so the
-            // verdict is "sat", which maps to "NOT DISCHARGED
-            // (counterexample exists)" in the wrapper. That's
-            // the honest verdict: the obligation IS unproven
-            // without bindings. When operand-binding lands, a
-            // body with `#[pitbull::requires("idx < len")]` will
-            // see the assumption constrain the search space and
-            // return unsat.
+            // When `idx_source_name` is `Some(name)`, the alias
+            // lets a user precondition written using the source
+            // name — `(assert (bvult i len))` — constrain the
+            // solver. When `None` (intermediate-let, computed
+            // index, etc.), the obligation stays unconstrained
+            // and the verdict is "sat" (counterexample exists),
+            // which is the honest verdict for an unproven claim.
+            let alias = idx_source_name.as_deref();
             let main = crate::smt::emit_index_bound_problem_with_assumptions(
+                alias,
                 &obligation.assumptions,
             );
             let consistency = if obligation.assumptions.is_empty() {
                 None
             } else {
                 Some(crate::smt::emit_index_bound_consistency_check(
+                    alias,
                     &obligation.assumptions,
                 ))
             };
@@ -256,7 +258,7 @@ mod tests {
         let obligation = VcObligation {
             id: "pb054-idx-0".into(),
             span: Span::default(),
-            kind: VcObligationKind::IndexBound,
+            kind: VcObligationKind::IndexBound { idx_source_name: None },
             assumptions: Vec::new(),
         };
         let goal = compile(&obligation).expect("IndexBound now compiles");
@@ -265,10 +267,48 @@ mod tests {
         assert!(goal.smt.contains("(declare-const idx (_ BitVec 64))"));
         assert!(goal.smt.contains("(declare-const len (_ BitVec 64))"));
         assert!(goal.smt.contains("(assert (bvuge idx len))"));
+        // No idx_source_name → no define-fun alias.
+        assert!(
+            !goal.smt.contains("define-fun"),
+            "None idx_source_name should produce no alias; got:\n{}",
+            goal.smt,
+        );
         assert!(
             goal.consistency_check.is_none(),
             "no consistency check expected with zero assumptions; got:\n{:?}",
             goal.consistency_check,
+        );
+    }
+    /// Task P.2: IndexBound with `idx_source_name: Some("i")`
+    /// produces a SMT problem containing `(define-fun i () (_
+    /// BitVec 64) idx)` so user preconditions referencing `i`
+    /// constrain the SMT problem. The consistency check carries
+    /// the SAME alias so the F1 guard runs against the same
+    /// model as the main problem.
+    #[test]
+    fn compile_index_bound_with_source_name_emits_alias() {
+        let obligation = VcObligation {
+            id: "pb054-idx-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::IndexBound {
+                idx_source_name: Some("i".into()),
+            },
+            assumptions: vec!["(assert (bvult i len))".into()],
+        };
+        let goal = compile(&obligation).expect("IndexBound with alias compiles");
+        assert!(
+            goal.smt.contains("(define-fun i () (_ BitVec 64) idx)"),
+            "main problem must contain the alias; got:\n{}",
+            goal.smt,
+        );
+        let cs = goal
+            .consistency_check
+            .as_ref()
+            .expect("consistency check should be present when assumptions exist");
+        assert!(
+            cs.contains("(define-fun i () (_ BitVec 64) idx)"),
+            "consistency check must carry the SAME alias as the main problem \
+             (the F1 guard runs the same model); got:\n{cs}",
         );
     }
     /// Task P.1: IndexBound with assumptions gets the consistency
@@ -281,7 +321,7 @@ mod tests {
         let obligation = VcObligation {
             id: "pb054-idx-1".into(),
             span: Span::default(),
-            kind: VcObligationKind::IndexBound,
+            kind: VcObligationKind::IndexBound { idx_source_name: None },
             assumptions: vec![
                 "(assert (bvult idx #x0000000000000064))".into(),
             ],

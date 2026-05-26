@@ -203,26 +203,40 @@ pub fn emit_overflow_problem_with_assumptions(
 ///   discharged ⇒ the rule fires.
 ///
 /// Both `idx` and `len` are declared as `INDEX_SMT_BITS`-wide
-/// unsigned bit-vectors. The variable names (`idx`, `len`) are
-/// the canonical SMT bindings users target in preconditions —
-/// `#[pitbull::requires("idx < len")]` translates to
-/// `(assert (bvult idx len))` and constrains the solver.
+/// unsigned bit-vectors. The canonical SMT names (`idx`, `len`)
+/// are always present so user preconditions can target them
+/// directly.
 ///
-/// Without bindings (the visitor doesn't yet thread the index
-/// operand and slice place into the obligation), this problem
-/// is always satisfiable (idx=1, len=0 is a model). That's
-/// correct: the obligation IS unproven without operand bindings
-/// or preconditions. The wrapper surfaces this as "NOT
-/// DISCHARGED (sat — counterexample exists)" which is the
-/// honest audit verdict. Once binding lands, well-constrained
-/// problems return `unsat` and the obligation discharges.
+/// Task P.2 binding: when `idx_alias` is `Some(name)`, the
+/// problem additionally emits a `(define-fun <name> () (_ BitVec
+/// N) idx)` directive, aliasing the source-level identifier
+/// (e.g. `i` for a function arg named `i`) to the SMT `idx`
+/// variable. The visitor extracts the source name from the
+/// MIR local that the `ProjectionElem::Index` references; this
+/// lets user preconditions written using the source name —
+/// `(assert (bvult i len))` — desugar to the safety-relevant
+/// `(assert (bvult idx len))` and constrain the solver.
 ///
-/// Assumptions are spliced verbatim between the declarations
-/// and the negated-safety assertion, exactly as
+/// Without an alias (and without any preconditions), the
+/// problem is always satisfiable (idx=1, len=0 is a model) and
+/// the obligation reports as undischarged. That's correct: the
+/// obligation IS unproven in that case.
+///
+/// Alias-name validation: the function expects `idx_alias` to
+/// be a valid SMT-LIB identifier (alphabetic + underscores +
+/// digits). The visitor's `local_arg_name` only returns names
+/// extracted from a Rust source identifier already (parsed by
+/// rustc), so they're already SMT-safe. We don't re-validate;
+/// any future caller that synthesizes alias names must do so
+/// with that contract in mind.
+///
+/// Assumptions are spliced between the declarations/alias and
+/// the negated-safety assertion, exactly as
 /// `emit_overflow_problem_with_assumptions` does — same audit
 /// posture, same lex-validation upstream contract.
 #[must_use]
 pub fn emit_index_bound_problem_with_assumptions(
+    idx_alias: Option<&str>,
     assumptions: &[String],
 ) -> String {
     let mut smt = format!(
@@ -230,6 +244,20 @@ pub fn emit_index_bound_problem_with_assumptions(
          (declare-const idx (_ BitVec {INDEX_SMT_BITS}))\n\
          (declare-const len (_ BitVec {INDEX_SMT_BITS}))\n",
     );
+    // If the visitor was able to bind the index local to a
+    // source-level identifier, alias it via define-fun so user
+    // preconditions referencing the source name reach the SMT
+    // `idx` variable. The alias is skipped when the source name
+    // would shadow the canonical SMT names (`idx` or `len`) —
+    // that would be a no-op define-fun for `idx` and would
+    // collide with the `len` declaration otherwise.
+    if let Some(name) = idx_alias {
+        if name != "idx" && name != "len" {
+            smt.push_str(&format!(
+                "(define-fun {name} () (_ BitVec {INDEX_SMT_BITS}) idx)\n",
+            ));
+        }
+    }
     for assumption in assumptions {
         smt.push_str(assumption);
         if !assumption.ends_with('\n') {
@@ -245,22 +273,28 @@ pub fn emit_index_bound_problem_with_assumptions(
     smt
 }
 /// Convenience wrapper: emit an SMT-LIB problem with no
-/// assumptions. Useful in tests; production path uses the
-/// `_with_assumptions` variant directly.
+/// assumptions and no idx alias. Useful in tests; production
+/// path uses the `_with_assumptions` variant directly.
 #[must_use]
 pub fn emit_index_bound_problem() -> String {
-    emit_index_bound_problem_with_assumptions(&[])
+    emit_index_bound_problem_with_assumptions(None, &[])
 }
 /// Sat-check-only variant for the consistency-check guard
-/// (red-team F1): declarations + assumptions + check-sat, NO
-/// safety predicate. The dispatcher runs this first when
-/// assumptions are present; an `unsat` here means the
-/// assumptions are logically contradictory, so a downstream
+/// (red-team F1): declarations + alias + assumptions +
+/// check-sat, NO safety predicate. The dispatcher runs this
+/// first when assumptions are present; an `unsat` here means
+/// the assumptions are logically contradictory, so a downstream
 /// `unsat` on the main problem would be vacuously true.
 ///
 /// Mirrors `emit_consistency_check` for ArithmeticOverflow.
+/// The `idx_alias` argument must be passed the SAME way as for
+/// the main problem so that an assumption referencing the
+/// source-level identifier resolves identically in both
+/// problems — otherwise the consistency check would see a
+/// different model and the F1 guard could mis-fire.
 #[must_use]
 pub fn emit_index_bound_consistency_check(
+    idx_alias: Option<&str>,
     assumptions: &[String],
 ) -> String {
     let mut smt = format!(
@@ -268,6 +302,13 @@ pub fn emit_index_bound_consistency_check(
          (declare-const idx (_ BitVec {INDEX_SMT_BITS}))\n\
          (declare-const len (_ BitVec {INDEX_SMT_BITS}))\n",
     );
+    if let Some(name) = idx_alias {
+        if name != "idx" && name != "len" {
+            smt.push_str(&format!(
+                "(define-fun {name} () (_ BitVec {INDEX_SMT_BITS}) idx)\n",
+            ));
+        }
+    }
     for assumption in assumptions {
         smt.push_str(assumption);
         if !assumption.ends_with('\n') {
@@ -399,7 +440,7 @@ mod tests {
             "(assert (bvult idx #x0000000000000064))".into(),
             "(assert (= len #x000000000000000a))".into(),
         ];
-        let smt = emit_index_bound_problem_with_assumptions(&assumptions);
+        let smt = emit_index_bound_problem_with_assumptions(None, &assumptions);
         let assume1_idx = smt
             .find("(assert (bvult idx #x0000000000000064))")
             .expect("first assumption present");
@@ -421,7 +462,7 @@ mod tests {
     /// discharge.
     #[test]
     fn index_bound_consistency_check_omits_safety_predicate() {
-        let cs = emit_index_bound_consistency_check(&[
+        let cs = emit_index_bound_consistency_check(None, &[
             "(assert (bvult idx #x0000000000000064))".into(),
         ]);
         assert!(cs.contains("(declare-const idx (_ BitVec 64))"));
@@ -432,5 +473,66 @@ mod tests {
             "consistency check must NOT contain the safety predicate; got:\n{cs}",
         );
         assert!(cs.ends_with("(check-sat)\n"));
+    }
+    /// Task P.2: passing `Some("i")` as the alias emits a
+    /// `(define-fun i () (_ BitVec 64) idx)` directive so user
+    /// preconditions referencing `i` constrain the SMT problem.
+    #[test]
+    fn index_bound_with_alias_emits_define_fun() {
+        let smt = emit_index_bound_problem_with_assumptions(Some("i"), &[]);
+        assert!(
+            smt.contains("(define-fun i () (_ BitVec 64) idx)"),
+            "alias should emit a define-fun aliasing the source name to idx; got:\n{smt}",
+        );
+        // The alias must appear AFTER the idx/len declarations
+        // (it references `idx`), and BEFORE the safety predicate.
+        let idx_decl = smt.find("(declare-const idx").expect("idx decl");
+        let alias = smt.find("(define-fun i").expect("alias");
+        let safety = smt.find("(assert (bvuge idx len))").expect("safety");
+        assert!(
+            idx_decl < alias,
+            "alias must come after idx declaration; idx_decl={idx_decl}, alias={alias}",
+        );
+        assert!(
+            alias < safety,
+            "alias must come before safety predicate; alias={alias}, safety={safety}",
+        );
+    }
+    /// Task P.2 collision guard: an alias name equal to `idx`
+    /// or `len` is silently dropped (no-op for `idx`, would
+    /// collide with declaration for `len`). The visitor's
+    /// `local_arg_name` won't produce these in practice, but
+    /// the guard means the SMT problem stays well-formed even
+    /// if a future binding path hands them in by mistake.
+    #[test]
+    fn index_bound_alias_collision_with_canonical_names_dropped() {
+        for collision in ["idx", "len"] {
+            let smt =
+                emit_index_bound_problem_with_assumptions(Some(collision), &[]);
+            assert!(
+                !smt.contains(&format!("(define-fun {collision}")),
+                "collision name `{collision}` should be silently dropped, not emitted; \
+                 got:\n{smt}",
+            );
+        }
+    }
+    /// Task P.2: the assumption can reference the aliased name
+    /// and the resulting SMT problem is well-formed (declarations
+    /// come first, alias comes after idx, assumption references
+    /// the alias, safety predicate uses idx).
+    #[test]
+    fn index_bound_alias_lets_assumption_reference_source_name() {
+        let smt = emit_index_bound_problem_with_assumptions(
+            Some("i"),
+            &["(assert (bvult i len))".into()],
+        );
+        // Alias must appear before the assumption.
+        let alias = smt.find("(define-fun i").expect("alias");
+        let assumption = smt.find("(assert (bvult i len))").expect("assumption");
+        assert!(
+            alias < assumption,
+            "alias must be defined before the assumption uses it; \
+             alias={alias}, assumption={assumption}",
+        );
     }
 }

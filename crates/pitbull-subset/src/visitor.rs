@@ -802,10 +802,22 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // The obligation kind is `IndexBound` regardless of which of
             // the three projection variants triggered it; the discharger
             // in `pitbull-vc` reasons over the abstract claim, not the
-            // syntactic shape. v0.2 MVP: the discharger returns `None`
-            // for `IndexBound` so the wrapper surfaces each as "pending"
-            // — the gap is *visible*, which is the audit-posture point.
-            ProjectionElem::Index(_) => self.emit_index_bound_obligation(span),
+            // syntactic shape.
+            //
+            // Task P.2: try to bind the index local to its source-level
+            // arg name. When the index is a direct read of a function
+            // parameter (e.g. `s[i]` where `i: usize`), the source
+            // identifier flows into the obligation, then into the SMT
+            // problem as an alias for the `idx` BV variable —
+            // preconditions written using the source name (`i < len`)
+            // can then constrain the solver. Local computations break
+            // the chain (the visitor doesn't do data-flow); they emit
+            // the obligation with `None` and stay unconstrained, which
+            // is the audit-safe direction.
+            ProjectionElem::Index(local) => {
+                let idx_source_name = self.local_arg_name(*local);
+                self.emit_index_bound_obligation(idx_source_name, span);
+            }
             // Constant slice index. The bound is statically known and the
             // future SMT problem is trivial (constant offset vs. constant
             // or symbolic length), but we still emit the obligation today
@@ -814,8 +826,10 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // would create a silent-accept hole — an auditor reading the
             // obligation log would see "no PB054 obligation" and assume
             // the index was safe, when in fact the visitor never asked.
+            // No source name to bind here — the offset is a `u64`
+            // literal in the projection itself, not a MIR local.
             ProjectionElem::ConstantIndex { .. } | ProjectionElem::Subslice { .. } => {
-                self.emit_index_bound_obligation(span);
+                self.emit_index_bound_obligation(None, span);
             }
             // Enum variant downcast. Accepted.
             ProjectionElem::Downcast(_) => {}
@@ -1351,12 +1365,22 @@ impl<'cfg> SubsetVisitor<'cfg> {
     }
     /// Emit an `IndexBound` VC obligation for a slice/array index
     /// projection. Maps to PSS-1 PB054 (slice index without bound
-    /// proof). The visitor identifies the site; the v0.3+ backend
-    /// is responsible for proving `idx < len`. Until that backend
-    /// lands, `pitbull-vc::compile` returns `None` for
-    /// `IndexBound` and the wrapper reports each as "pending" —
-    /// the gap is *visible* in the report, which is the audit-
-    /// posture requirement.
+    /// proof). The visitor identifies the site; `pitbull-vc`
+    /// compiles to a QF_BV SMT problem (Task P.1); operand
+    /// bindings let user preconditions referencing source names
+    /// constrain the SMT problem (Task P.2).
+    ///
+    /// `idx_source_name` is the source-level identifier the index
+    /// local resolves to, when the index `ProjectionElem::Index(Local)`
+    /// references a function-argument slot. Pass `None` for
+    /// `ConstantIndex` and `Subslice` (no MIR local — the offset
+    /// is a u64 literal) or when the index local doesn't trace
+    /// back to a named arg. When `Some`, the compiler emits a
+    /// `(define-fun <name> () (_ BitVec 64) idx)` alias in the
+    /// SMT problem so user preconditions written with the source
+    /// name (e.g. `(assert (bvult i len))`) constrain the
+    /// solver. Without the binding the obligation reports as
+    /// undischarged (sat — counterexample exists).
     ///
     /// Obligation ID format: `pb054-idx-{seq}`. The `-idx-`
     /// infix is mandatory: `PB054` is also used by the syntactic
@@ -1365,22 +1389,52 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// auditors disambiguate the two PB054 sites in trace output.
     ///
     /// Carries the current body's `current_body_preconditions`
-    /// list through verbatim. The compiler today ignores them
-    /// (same as for `PanicReachability` — the binding semantics
-    /// haven't been worked out for `IndexBound`'s eventual
-    /// declare-const shape), but plumbing them into the obligation
-    /// means the future backend inherits the spec context
-    /// automatically when its encoding arm is written.
-    fn emit_index_bound_obligation(&mut self, span: Span) {
+    /// list through verbatim — the compiler splices each into
+    /// the SMT problem before the safety predicate.
+    fn emit_index_bound_obligation(
+        &mut self,
+        idx_source_name: Option<String>,
+        span: Span,
+    ) {
         let seq = self.vc_obligations.len();
         let id = format!("pb054-idx-{seq}");
-        let assumptions = self.current_body_preconditions.clone();
+        // Apply the F2 red-team lex validation to each
+        // precondition before attaching it to the obligation.
+        // The PB049 path runs a richer predicate-grammar pipeline
+        // first, but the v0.2 grammar only supports
+        // `<ident> <cmp> <int>` — so for `IndexBound` (whose
+        // natural shape is `i < len`, two idents) only the raw
+        // SMT-LIB path applies. Malformed strings get an audit
+        // note and are dropped from the obligation (audit
+        // posture: no silent skips). When the predicate grammar
+        // extends to `<ident> <cmp> <ident>` in a future commit,
+        // this branch grows to mirror the PB049 logic.
+        let mut assumptions: Vec<String> =
+            Vec::with_capacity(self.current_body_preconditions.len());
+        let mut pending_audit_notes: Vec<String> = Vec::new();
+        for raw in &self.current_body_preconditions {
+            match crate::predicate::validate_assertion_form(raw) {
+                Ok(()) => assumptions.push(raw.clone()),
+                Err(e) => {
+                    pending_audit_notes.push(format!(
+                        "PB054: rejecting precondition (not a valid \
+                         SMT-LIB `(assert ...)` form for IndexBound — the \
+                         v0.2 grammar's `<ident> <cmp> <int>` form doesn't \
+                         apply here; user must write raw SMT-LIB): {e} — \
+                         input: {raw:?}",
+                    ));
+                }
+            }
+        }
         self.vc_obligations.push(crate::vc::VcObligation {
             id,
             span,
-            kind: crate::vc::VcObligationKind::IndexBound,
+            kind: crate::vc::VcObligationKind::IndexBound { idx_source_name },
             assumptions,
         });
+        for msg in pending_audit_notes {
+            self.audit_note(span, msg);
+        }
     }
     /// Resolve an operand to its source-level parameter name when
     /// the operand is a direct read of a function argument (no
@@ -1406,9 +1460,34 @@ impl<'cfg> SubsetVisitor<'cfg> {
         if !place.projection.is_empty() {
             return None;
         }
+        self.local_arg_name(place.local)
+    }
+    /// Same as `operand_arg_name` but for a bare `Local` (no
+    /// surrounding Operand). Used by PB054 `IndexBound` binding —
+    /// `ProjectionElem::Index(Local)` carries the index local
+    /// directly, not wrapped in an Operand.
+    ///
+    /// Returns `None` for:
+    /// - The return slot (`_0`).
+    /// - Locals outside the argument range (introduced by `let`,
+    ///   intermediate temporaries, etc.).
+    /// - Argument slots whose source name is the empty string
+    ///   (anonymous patterns).
+    ///
+    /// Same conservative posture as `operand_arg_name`: the
+    /// binding only fires when the local IS an arg slot. Intermediate
+    /// `let i_copy = i; arr[i_copy]` breaks the chain — without
+    /// data-flow analysis the visitor sees `i_copy` (a non-arg
+    /// local) and returns `None`. The downstream effect: the SMT
+    /// problem has no `define-fun i () ... idx` alias, so a
+    /// precondition referring to `i` doesn't constrain the
+    /// solver — the obligation reports as undischarged. That's
+    /// the audit-safe direction: missing-bind ⇒ over-approximate
+    /// "could fail", not under-approximate "vacuously holds".
+    fn local_arg_name(&self, local: crate::mir_api::Local) -> Option<String> {
         // Local `_0` is the return slot; `_1..=_arg_count` are args.
         // arg_names is indexed [0..arg_count) → maps to locals [1..=arg_count].
-        let local_idx = place.local.0 as usize;
+        let local_idx = local.0 as usize;
         if local_idx == 0 {
             return None;
         }
@@ -2965,7 +3044,7 @@ mod tests {
         assert!(
             matches!(
                 report.vc_obligations[0].kind,
-                crate::vc::VcObligationKind::IndexBound
+                crate::vc::VcObligationKind::IndexBound { .. }
             ),
             "expected IndexBound; got {:?}",
             report.vc_obligations[0].kind,
@@ -2987,7 +3066,7 @@ mod tests {
         assert_eq!(report.vc_obligations.len(), 1);
         assert!(matches!(
             report.vc_obligations[0].kind,
-            crate::vc::VcObligationKind::IndexBound
+            crate::vc::VcObligationKind::IndexBound { .. }
         ));
         assert!(report.vc_obligations[0].id.starts_with("pb054-idx-"));
     }
@@ -3001,7 +3080,7 @@ mod tests {
         assert_eq!(report.vc_obligations.len(), 1);
         assert!(matches!(
             report.vc_obligations[0].kind,
-            crate::vc::VcObligationKind::IndexBound
+            crate::vc::VcObligationKind::IndexBound { .. }
         ));
         assert!(report.vc_obligations[0].id.starts_with("pb054-idx-"));
     }
@@ -3065,7 +3144,7 @@ mod tests {
                 .iter()
                 .filter(|o| matches!(
                     o.kind,
-                    crate::vc::VcObligationKind::IndexBound,
+                    crate::vc::VcObligationKind::IndexBound { .. },
                 ))
                 .count();
             assert_eq!(
@@ -3160,5 +3239,134 @@ mod tests {
         assert_eq!(report.vc_obligations.len(), 2);
         assert_eq!(report.vc_obligations[0].id, "pb054-idx-0");
         assert_eq!(report.vc_obligations[1].id, "pb054-idx-1");
+    }
+    /// PB054 P.2: when the index `Local` references a function-argument
+    /// slot whose source name is known, the obligation carries that
+    /// name in `idx_source_name`. Used downstream by `pitbull-vc` to
+    /// emit a `(define-fun <name> () (_ BitVec 64) idx)` alias so
+    /// user preconditions referencing the source name constrain the
+    /// SMT problem.
+    #[test]
+    fn index_projection_binds_arg_source_name() {
+        let cfg = SubsetConfig::default_for_test();
+        let u8_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U8)) };
+        let usize_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::Usize)) };
+        // `fn at(s: &[u8], i: usize) -> u8 { s[i] }`-ish shape. The
+        // index local is _2 (second arg slot). Locals layout:
+        //   _0 = u8 return
+        //   _1 = &[u8] (slice arg, source name "s")
+        //   _2 = usize  (index arg,  source name "i")
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u8_ty.clone(), usize_ty.clone()],
+            arg_names: vec!["s".into(), "i".into()],
+            return_ty: u8_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl {
+                    ty: u8_ty.clone(),
+                    span: Span::default(),
+                    mutability: Mutability::Not,
+                },
+                LocalDecl {
+                    ty: u8_ty.clone(),
+                    span: Span::default(),
+                    mutability: Mutability::Not,
+                },
+                LocalDecl {
+                    ty: usize_ty,
+                    span: Span::default(),
+                    mutability: Mutability::Not,
+                },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::Use(Operand::Copy(Place {
+                            local: Local(1),
+                            projection: vec![ProjectionElem::Index(Local(2))],
+                        })),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1);
+        let crate::vc::VcObligationKind::IndexBound { idx_source_name } =
+            &report.vc_obligations[0].kind
+        else {
+            panic!("expected IndexBound; got {:?}", report.vc_obligations[0].kind);
+        };
+        assert_eq!(
+            idx_source_name.as_deref(),
+            Some("i"),
+            "index `Local(2)` should resolve to arg name \"i\" via local_arg_name lookup; got {:?}",
+            idx_source_name,
+        );
+    }
+    /// PB054 P.2: when the index local is NOT in the argument range
+    /// (e.g. an intermediate temporary from a `let` or arithmetic
+    /// expression), `idx_source_name` is `None`. Conservative
+    /// posture — without data-flow analysis the visitor can't trace
+    /// the binding, and emitting a stale name would let user
+    /// preconditions silently miss-bind to the wrong SMT variable.
+    #[test]
+    fn index_projection_with_non_arg_local_has_no_binding() {
+        let cfg = SubsetConfig::default_for_test();
+        // body_with_index_projection from above uses _0 (return) and
+        // _1 (one non-arg local) — no args. Index(Local(1)) refers
+        // to _1, which is NOT in the arg range (arg_names is empty).
+        // So the binding should fail to None.
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = body_with_index_projection(ProjectionElem::Index(Local(1)));
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        let crate::vc::VcObligationKind::IndexBound { idx_source_name } =
+            &report.vc_obligations[0].kind
+        else {
+            panic!("expected IndexBound");
+        };
+        assert_eq!(
+            *idx_source_name, None,
+            "non-arg index local must not bind to a source name; got {:?}",
+            idx_source_name,
+        );
+    }
+    /// PB054 P.2: ConstantIndex / Subslice projections carry `None`
+    /// for the source binding — the offset is a `u64` literal in
+    /// the projection itself, not a MIR local. Pin so adding name
+    /// resolution to these arms by accident gets caught.
+    #[test]
+    fn constant_index_and_subslice_have_no_idx_source_name() {
+        let cfg = SubsetConfig::default_for_test();
+        for proj in [
+            ProjectionElem::ConstantIndex { offset: 3 },
+            ProjectionElem::Subslice { from: 0, to: 4 },
+        ] {
+            let mut v = SubsetVisitor::new(&cfg);
+            let body = body_with_index_projection(proj.clone());
+            v.visit_body(&body, false);
+            let report = v.into_report();
+            let crate::vc::VcObligationKind::IndexBound { idx_source_name } =
+                &report.vc_obligations[0].kind
+            else {
+                panic!("expected IndexBound for {:?}", proj);
+            };
+            assert_eq!(
+                *idx_source_name, None,
+                "{:?} must carry None for idx_source_name (no MIR local)",
+                proj,
+            );
+        }
     }
 }
