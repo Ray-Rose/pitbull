@@ -25,14 +25,32 @@
 //!
 //! ## Future
 //!
-//! - `emit_index_bound_problem`: `idx < len` proofs for slice
-//!   indexing (PB054).
 //! - `emit_panic_unreachable_problem`: path-sensitive symbolic
 //!   reasoning to prove panic call sites unreachable (PB043).
 //!   Requires a richer encoding than bit-vector arithmetic alone.
 //! - `emit_decreasing_measure_problem`: termination measures for
 //!   recursion (PB041).
 use pitbull_subset::ArithOp;
+/// SMT bit-width used for index bound checks.
+///
+/// Slice / array indices in Rust are `usize`, which is target-
+/// pointer-width-dependent. PSS-1 PB052 has the user pin the
+/// target pointer width in `pitbull.toml`'s `[verification]`
+/// table, but the v0.2 scaffold doesn't yet thread that down to
+/// the SMT layer. Hardcoded to 64 here on the assumption that
+/// v0.2 targets x86_64 / aarch64 / wasm64. When the threading
+/// lands, this constant becomes a parameter resolved from the
+/// `SubsetConfig.verification.target_pointer_width` field.
+///
+/// Rationale for hard-coding 64 vs 32: false-negative direction
+/// is asymmetric — a 64-bit encoding can model 32-bit problems
+/// (the extra bits are unconstrained, the solver finds the same
+/// counterexample), but a 32-bit encoding can't model 64-bit
+/// problems (the solver may report unsat for a problem with a
+/// 64-bit-only counterexample). So choosing the wider default
+/// keeps the encoding sound across both target widths until the
+/// proper threading is wired.
+const INDEX_SMT_BITS: u32 = 64;
 /// Information about a primitive integer type for SMT encoding.
 struct IntInfo {
     /// Bit width.
@@ -173,6 +191,92 @@ pub fn emit_overflow_problem_with_assumptions(
     ));
     Some(smt)
 }
+/// Emit an SMT-LIB 2 problem that asks "is `idx >= len`
+/// satisfiable, given the assumptions?" — i.e. the negation of
+/// the safety property `idx < len`.
+///
+/// Solver semantics:
+/// - `unsat` ⇒ the negation has no model ⇒ `idx < len` always
+///   holds under the assumptions ⇒ PSS-1 PB054 obligation
+///   discharged ⇒ safe.
+/// - `sat`   ⇒ a counterexample exists ⇒ obligation NOT
+///   discharged ⇒ the rule fires.
+///
+/// Both `idx` and `len` are declared as `INDEX_SMT_BITS`-wide
+/// unsigned bit-vectors. The variable names (`idx`, `len`) are
+/// the canonical SMT bindings users target in preconditions —
+/// `#[pitbull::requires("idx < len")]` translates to
+/// `(assert (bvult idx len))` and constrains the solver.
+///
+/// Without bindings (the visitor doesn't yet thread the index
+/// operand and slice place into the obligation), this problem
+/// is always satisfiable (idx=1, len=0 is a model). That's
+/// correct: the obligation IS unproven without operand bindings
+/// or preconditions. The wrapper surfaces this as "NOT
+/// DISCHARGED (sat — counterexample exists)" which is the
+/// honest audit verdict. Once binding lands, well-constrained
+/// problems return `unsat` and the obligation discharges.
+///
+/// Assumptions are spliced verbatim between the declarations
+/// and the negated-safety assertion, exactly as
+/// `emit_overflow_problem_with_assumptions` does — same audit
+/// posture, same lex-validation upstream contract.
+#[must_use]
+pub fn emit_index_bound_problem_with_assumptions(
+    assumptions: &[String],
+) -> String {
+    let mut smt = format!(
+        "(set-logic QF_BV)\n\
+         (declare-const idx (_ BitVec {INDEX_SMT_BITS}))\n\
+         (declare-const len (_ BitVec {INDEX_SMT_BITS}))\n",
+    );
+    for assumption in assumptions {
+        smt.push_str(assumption);
+        if !assumption.ends_with('\n') {
+            smt.push('\n');
+        }
+    }
+    // Negation of safety: we want to prove `idx < len`. The
+    // solver checks the negation `idx >= len`. `bvuge` is the
+    // unsigned greater-or-equal predicate for bit-vectors —
+    // matches Rust's slice-index semantics (indices are usize,
+    // never negative).
+    smt.push_str("(assert (bvuge idx len))\n(check-sat)\n");
+    smt
+}
+/// Convenience wrapper: emit an SMT-LIB problem with no
+/// assumptions. Useful in tests; production path uses the
+/// `_with_assumptions` variant directly.
+#[must_use]
+pub fn emit_index_bound_problem() -> String {
+    emit_index_bound_problem_with_assumptions(&[])
+}
+/// Sat-check-only variant for the consistency-check guard
+/// (red-team F1): declarations + assumptions + check-sat, NO
+/// safety predicate. The dispatcher runs this first when
+/// assumptions are present; an `unsat` here means the
+/// assumptions are logically contradictory, so a downstream
+/// `unsat` on the main problem would be vacuously true.
+///
+/// Mirrors `emit_consistency_check` for ArithmeticOverflow.
+#[must_use]
+pub fn emit_index_bound_consistency_check(
+    assumptions: &[String],
+) -> String {
+    let mut smt = format!(
+        "(set-logic QF_BV)\n\
+         (declare-const idx (_ BitVec {INDEX_SMT_BITS}))\n\
+         (declare-const len (_ BitVec {INDEX_SMT_BITS}))\n",
+    );
+    for assumption in assumptions {
+        smt.push_str(assumption);
+        if !assumption.ends_with('\n') {
+            smt.push('\n');
+        }
+    }
+    smt.push_str("(check-sat)\n");
+    smt
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +345,92 @@ mod tests {
                 "expected u32 {op:?} to defer SMT emission",
             );
         }
+    }
+    /// Pin the IndexBound SMT-LIB shape. Catches accidental
+    /// changes to the bit-width, variable names, or safety
+    /// predicate.
+    #[test]
+    fn index_bound_problem_basic() {
+        let smt = emit_index_bound_problem();
+        assert!(
+            smt.contains("(set-logic QF_BV)"),
+            "must declare QF_BV logic; got:\n{smt}",
+        );
+        assert!(
+            smt.contains("(declare-const idx (_ BitVec 64))"),
+            "must declare 64-bit idx; got:\n{smt}",
+        );
+        assert!(
+            smt.contains("(declare-const len (_ BitVec 64))"),
+            "must declare 64-bit len; got:\n{smt}",
+        );
+        assert!(
+            smt.contains("(assert (bvuge idx len))"),
+            "must assert the negated safety predicate (idx >= len); got:\n{smt}",
+        );
+        assert!(
+            smt.ends_with("(check-sat)\n"),
+            "must terminate with check-sat; got:\n{smt}",
+        );
+    }
+    /// Unsigned predicate: `bvuge` (not `bvsge`). Slice indices
+    /// are usize, never negative — using the signed predicate
+    /// would let the solver consider negative-idx counterexamples
+    /// that can't occur in Rust. Pin the unsigned shape so an
+    /// accidental signed-ification gets caught.
+    #[test]
+    fn index_bound_uses_unsigned_predicate() {
+        let smt = emit_index_bound_problem();
+        assert!(
+            smt.contains("bvuge"),
+            "must use unsigned ge predicate; got:\n{smt}",
+        );
+        assert!(
+            !smt.contains("bvsge"),
+            "must NOT use signed ge predicate (slice indices are usize); got:\n{smt}",
+        );
+    }
+    /// Assumptions splice in BEFORE the safety predicate so the
+    /// solver sees them as hypotheses, matching the overflow
+    /// encoding's contract.
+    #[test]
+    fn index_bound_with_assumptions_orders_correctly() {
+        let assumptions = vec![
+            "(assert (bvult idx #x0000000000000064))".into(),
+            "(assert (= len #x000000000000000a))".into(),
+        ];
+        let smt = emit_index_bound_problem_with_assumptions(&assumptions);
+        let assume1_idx = smt
+            .find("(assert (bvult idx #x0000000000000064))")
+            .expect("first assumption present");
+        let assume2_idx = smt
+            .find("(assert (= len #x000000000000000a))")
+            .expect("second assumption present");
+        let safety_idx = smt
+            .find("(assert (bvuge idx len))")
+            .expect("safety predicate present");
+        assert!(
+            assume1_idx < safety_idx && assume2_idx < safety_idx,
+            "assumptions must come before the safety predicate; \
+             assume1={assume1_idx}, assume2={assume2_idx}, safety={safety_idx}",
+        );
+    }
+    /// Consistency check has the same declarations + assumptions
+    /// but NO safety predicate — used by the dispatcher to check
+    /// assumptions aren't contradictory before claiming
+    /// discharge.
+    #[test]
+    fn index_bound_consistency_check_omits_safety_predicate() {
+        let cs = emit_index_bound_consistency_check(&[
+            "(assert (bvult idx #x0000000000000064))".into(),
+        ]);
+        assert!(cs.contains("(declare-const idx (_ BitVec 64))"));
+        assert!(cs.contains("(declare-const len (_ BitVec 64))"));
+        assert!(cs.contains("(assert (bvult idx #x0000000000000064))"));
+        assert!(
+            !cs.contains("bvuge"),
+            "consistency check must NOT contain the safety predicate; got:\n{cs}",
+        );
+        assert!(cs.ends_with("(check-sat)\n"));
     }
 }

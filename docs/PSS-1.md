@@ -766,15 +766,104 @@ the std form and now also matches. No shadow type changes.
   (a `fn first_byte_unsafe(s: &[u8], i: usize) -> u8 { s[i] }`)
   produces:
   ```
-  pitbull-rustc: vc pb054-idx-0: pending (compilation not yet supported for IndexBound)
+  pitbull-rustc: vc pb054-idx-0 (PB054): undischarged (no solver)
   pitbull-rustc: VC summary: 1 obligation(s), 0 discharged, 1 undischarged
   ```
-  The integration test keeps PB054 in `KNOWN_UNIMPLEMENTED_REJECT`
-  because its current contains-check looks for the uppercase
-  "PB054" string (the subset-violation format), not the
-  lowercase "pb054-idx-" obligation ID — switching the
-  obligation discharge from "pending" to "sat (counterexample)"
-  in a future commit will let that exception be removed.
+  (Task P.1 superseded this with a real SMT problem; see below.
+  The integration test now removes PB054 from
+  `KNOWN_UNIMPLEMENTED_REJECT` because the wrapper surfaces the
+  canonical `(PB054)` rule string in stderr.)
+- ✅ PB054 SMT discharge — IndexBound compiles to QF_BV
+  (Task P.1). Closes the loop on the "deductive verifier"
+  claim for slice indices: the visitor emits an `IndexBound`
+  obligation (Task P), `pitbull-vc::compile` now produces a
+  real SMT-LIB problem, the wrapper dispatches it through Z3,
+  and the verdict line surfaces the canonical PSS-1 rule ID
+  on every kind via a new `rule_id()` method.
+
+  Pieces wired:
+    * `pitbull_subset::vc::VcObligationKind::rule_id()` returns
+      `&'static str` — `"PB049"`, `"PB043"`, `"PB054"`,
+      `"PB041"` — the printable uppercase form of the obligation's
+      mapped PSS-1 rule. Pinned by the
+      `rule_id_for_each_kind` unit test so adding a new kind
+      without updating this method fails to compile (exhaustive
+      match).
+    * `pitbull_vc::smt::emit_index_bound_problem_with_assumptions`
+      generates the QF_BV problem: declares `idx` and `len` as
+      64-bit unsigned bit-vectors, splices assumptions in,
+      asserts the negation of the safety predicate
+      (`(assert (bvuge idx len))`), `(check-sat)`. The 64-bit
+      width is hardcoded in `INDEX_SMT_BITS` pending the
+      target-pointer-width threading from `[verification]`
+      config — the wider default is sound for both 32-bit and
+      64-bit targets (a 64-bit problem dominates the 32-bit
+      one).
+    * `emit_index_bound_consistency_check` mirrors
+      `emit_consistency_check` for the F1 audit guard: same
+      declarations + assumptions, no safety predicate; the
+      dispatcher runs it first to refuse vacuous discharges
+      from contradictory preconditions.
+    * `pitbull_vc::vc::compile` IndexBound arm calls both
+      emitters. Obligations with assumptions populate
+      `consistency_check`; obligations without skip the extra
+      solver call (matches the ArithmeticOverflow contract).
+    * Wrapper verdict format (`pitbull-rustc.rs`): each
+      verdict line now includes `(PB054)` / `(PB049)` / etc.
+      via `obligation.kind.rule_id()`. Applied to all six
+      dispatch branches (discharged / NOT DISCHARGED / no
+      solver / unknown / timeout / error) AND the
+      consistency-check branches (REFUSED / timeout / error)
+      AND the "pending" line (when compile returns None).
+      Two purposes: integration tests can match the canonical
+      rule string, and auditors don't have to mentally map
+      `pb054-idx-0` → PB054.
+    * `integration.rs::KNOWN_UNIMPLEMENTED_REJECT` drops PB054
+      — the wrapper now surfaces `PB054` uppercase on the
+      verdict line, so the contains-check matches. A new
+      `KNOWN_UNDISCHARGED_ACCEPT = &[54]` constant skips the
+      ACCEPT corpus file (`PB054_bounded_index.rs`) because
+      the verifier can detect the index site but cannot yet
+      discharge the obligation without operand bindings —
+      until Task P.2+ wires the bindings, even
+      `#[pitbull::requires(i < s.len())]` doesn't constrain
+      the SMT `idx`/`len` variables.
+
+  Tests added:
+    * `pitbull_subset::vc::tests::rule_id_for_each_kind` —
+      pins the kind → rule mapping.
+    * `pitbull_vc::smt::tests::index_bound_problem_basic` —
+      pins the SMT shape (logic, declarations, predicate).
+    * `pitbull_vc::smt::tests::index_bound_uses_unsigned_predicate`
+      — pins `bvuge` (slice indices are usize, never
+      negative; signed predicate would admit impossible
+      counterexamples).
+    * `pitbull_vc::smt::tests::index_bound_with_assumptions_orders_correctly`
+      — assumptions come before the safety predicate (same
+      contract as overflow encoding).
+    * `pitbull_vc::smt::tests::index_bound_consistency_check_omits_safety_predicate`
+      — F1 guard test for the IndexBound side.
+    * `pitbull_vc::vc::tests::compile_index_bound_produces_smt`
+      — compile no longer returns None for IndexBound.
+    * `pitbull_vc::vc::tests::compile_index_bound_with_assumptions_includes_consistency_check`
+      — F1 wiring is symmetric to ArithmeticOverflow.
+    * `pitbull_vc::vc::tests::compile_panic_and_recursion_still_return_none`
+      — negative-space pin so adding IndexBound to compile
+      didn't accidentally enable the other unhandled kinds.
+
+  E2e probe (real corpus file, no Z3 installed):
+  ```
+  pitbull-rustc: vc pb054-idx-0 (PB054): undischarged (no solver)
+  pitbull-rustc: VC summary: 1 obligation(s), 0 discharged, 1 undischarged
+  ```
+  With Z3 installed but without operand bindings the verdict
+  becomes `NOT DISCHARGED (sat — counterexample exists)` — the
+  honest answer for an obligation whose `idx` and `len` are
+  unconstrained. When operand-binding lands in Task P.2+, a
+  body with `requires(i < s.len())` will see the assumption
+  constrain the search space and the obligation will discharge
+  to `unsat`. Test totals: 1 + 104 + 15 + 24 = 144 (up from
+  136; +8 SMT-discharge tests).
 - ✅ Constant-operand value extraction — the headline-demo
   unlocker (Task O.2.5). Before this commit, the SMT problem
   treated `Operand::Constant` as a free `BitVec N` variable —

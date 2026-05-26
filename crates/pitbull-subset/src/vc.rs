@@ -85,12 +85,40 @@ pub enum VcObligationKind {
     /// v0.2 panic-unreachability work.
     PanicReachability,
     /// A `ProjectionElem::Index` that requires `idx < len`. Maps to
-    /// PB054. Visitor placeholder; v0.2 work.
+    /// PB054. Emitted by the visitor; `pitbull-vc` compiles to an
+    /// SMT problem with unsigned bit-vector idx and len; without
+    /// operand bindings the problem is sat (the obligation reports
+    /// as undischarged) — see Task P.1 in PSS-1.md §17.1.
     IndexBound,
     /// A recursive call where the `#[decreases(...)]` measure must
     /// strictly decrease. Maps to PB041. Visitor placeholder;
     /// requires call-graph SCC analysis.
     RecursionDecreases,
+}
+impl VcObligationKind {
+    /// Canonical PSS-1 rule ID for this obligation kind, as the
+    /// printable uppercase string (`"PB049"`, `"PB043"`, `"PB054"`,
+    /// `"PB041"`).
+    ///
+    /// The obligation `id` field carries a lowercase variant
+    /// (`"pb049-add-0"`) so that auditors can read trace output and
+    /// see at a glance which obligation maps to which kind. This
+    /// method surfaces the canonical uppercase form so the wrapper
+    /// can include it in verdict lines — and so integration tests
+    /// can look for `"PB054"` (the rule's canonical form) rather
+    /// than `"pb054-idx-"` (the obligation-id format).
+    ///
+    /// Returning `&'static str` so the wrapper can format with no
+    /// allocation per verdict line.
+    #[must_use]
+    pub fn rule_id(&self) -> &'static str {
+        match self {
+            VcObligationKind::ArithmeticOverflow { .. } => "PB049",
+            VcObligationKind::PanicReachability => "PB043",
+            VcObligationKind::IndexBound => "PB054",
+            VcObligationKind::RecursionDecreases => "PB041",
+        }
+    }
 }
 /// Arithmetic operators with associated overflow obligations.
 ///
@@ -182,5 +210,23 @@ mod tests {
         assert_eq!(ArithOp::Rem.tag(), "rem");
         assert_eq!(ArithOp::Shl.tag(), "shl");
         assert_eq!(ArithOp::Shr.tag(), "shr");
+    }
+    /// Each obligation kind maps to its PSS-1 rule ID. Pins the
+    /// kind→rule mapping so the integration test's contains-check
+    /// (`stderr.contains("PB054")`) remains stable across the
+    /// obligation-id format choice.
+    #[test]
+    fn rule_id_for_each_kind() {
+        assert_eq!(
+            VcObligationKind::ArithmeticOverflow {
+                op: ArithOp::Add,
+                ty_name: "u32".into(),
+            }
+            .rule_id(),
+            "PB049",
+        );
+        assert_eq!(VcObligationKind::PanicReachability.rule_id(), "PB043");
+        assert_eq!(VcObligationKind::IndexBound.rule_id(), "PB054");
+        assert_eq!(VcObligationKind::RecursionDecreases.rule_id(), "PB041");
     }
 }

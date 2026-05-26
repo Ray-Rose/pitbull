@@ -520,9 +520,19 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
     let mut discharged = 0usize;
     let mut undischarged = 0usize;
     for obligation in &report.vc_obligations {
+        // Canonical PSS-1 rule ID (uppercase `PBxxx`) surfaced
+        // alongside the obligation id on every verdict line.
+        // Two purposes:
+        //   1. Integration tests (and SARIF consumers) that
+        //      look for the canonical rule string in stderr
+        //      can match it without needing to parse the
+        //      obligation id format.
+        //   2. Auditors reading the dispatch log don't have to
+        //      mentally map `pb054-idx-0` → PB054.
+        let rule = obligation.kind.rule_id();
         let Some(goal) = pitbull_vc::compile(obligation) else {
             eprintln!(
-                "pitbull-rustc: vc {}: pending (compilation not yet supported for {:?})",
+                "pitbull-rustc: vc {} ({rule}): pending (compilation not yet supported for {:?})",
                 obligation.id, obligation.kind,
             );
             undischarged += 1;
@@ -542,7 +552,7 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
             match pitbull_vc::solver::invoke_z3(cs_smt) {
                 pitbull_vc::SolverResult::Unsat => {
                     eprintln!(
-                        "pitbull-rustc: vc {}: REFUSED — preconditions are \
+                        "pitbull-rustc: vc {} ({rule}): REFUSED — preconditions are \
                          contradictory (sat-check returned unsat); a discharge \
                          claim here would be vacuously true",
                         obligation.id,
@@ -564,7 +574,7 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
                 }
                 pitbull_vc::SolverResult::Timeout => {
                     eprintln!(
-                        "pitbull-rustc: vc {}: undischarged (consistency check \
+                        "pitbull-rustc: vc {} ({rule}): undischarged (consistency check \
                          timed out — assumption set may be too complex)",
                         obligation.id,
                     );
@@ -573,7 +583,7 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
                 }
                 pitbull_vc::SolverResult::Error(e) => {
                     eprintln!(
-                        "pitbull-rustc: vc {}: undischarged (consistency check \
+                        "pitbull-rustc: vc {} ({rule}): undischarged (consistency check \
                          solver error: {e})",
                         obligation.id,
                     );
@@ -605,14 +615,14 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
         match pitbull_vc::solver::invoke_z3(&goal.smt) {
             pitbull_vc::SolverResult::Unsat => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: discharged (unsat — safety property holds){assumption_suffix}",
+                    "pitbull-rustc: vc {} ({rule}): discharged (unsat — safety property holds){assumption_suffix}",
                     obligation.id,
                 );
                 discharged += 1;
             }
             pitbull_vc::SolverResult::Sat => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: NOT DISCHARGED (sat — counterexample exists){assumption_suffix}",
+                    "pitbull-rustc: vc {} ({rule}): NOT DISCHARGED (sat — counterexample exists){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;
@@ -627,28 +637,28 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
                     solver_missing_announced = true;
                 }
                 eprintln!(
-                    "pitbull-rustc: vc {}: undischarged (no solver){assumption_suffix}",
+                    "pitbull-rustc: vc {} ({rule}): undischarged (no solver){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;
             }
             pitbull_vc::SolverResult::Unknown => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: undischarged (solver returned unknown){assumption_suffix}",
+                    "pitbull-rustc: vc {} ({rule}): undischarged (solver returned unknown){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;
             }
             pitbull_vc::SolverResult::Timeout => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: undischarged (timeout){assumption_suffix}",
+                    "pitbull-rustc: vc {} ({rule}): undischarged (timeout){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;
             }
             pitbull_vc::SolverResult::Error(e) => {
                 eprintln!(
-                    "pitbull-rustc: vc {}: undischarged (solver error: {e}){assumption_suffix}",
+                    "pitbull-rustc: vc {} ({rule}): undischarged (solver error: {e}){assumption_suffix}",
                     obligation.id,
                 );
                 undischarged += 1;

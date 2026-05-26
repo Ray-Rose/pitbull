@@ -40,10 +40,10 @@ pub struct VcGoal {
 ///
 /// Returns `None` if the obligation can't be compiled today —
 /// either because the kind isn't yet supported (PanicReachability,
-/// IndexBound, RecursionDecreases) or because the SMT encoder
-/// rejected the specific instance (unsupported type, etc.). The
-/// caller treats `None` as "undischarged" — the obligation remains
-/// in the report so an auditor sees the gap.
+/// RecursionDecreases) or because the SMT encoder rejected the
+/// specific instance (unsupported type, etc.). The caller treats
+/// `None` as "undischarged" — the obligation remains in the report
+/// so an auditor sees the gap.
 #[must_use]
 pub fn compile(obligation: &VcObligation) -> Option<VcGoal> {
     let (smt, consistency_check) = match &obligation.kind {
@@ -63,12 +63,40 @@ pub fn compile(obligation: &VcObligation) -> Option<VcGoal> {
             };
             (main, consistency)
         }
+        VcObligationKind::IndexBound => {
+            // PB054 SMT discharge (Task P.1): declare `idx` and
+            // `len` as 64-bit unsigned bit-vectors, splice
+            // assumptions in, assert the negation of the safety
+            // predicate (`bvuge idx len`), check sat.
+            //
+            // Without operand bindings (the visitor doesn't yet
+            // thread the actual index local and slice place into
+            // the obligation) the problem is satisfiable for the
+            // trivial counterexample idx=1, len=0 — so the
+            // verdict is "sat", which maps to "NOT DISCHARGED
+            // (counterexample exists)" in the wrapper. That's
+            // the honest verdict: the obligation IS unproven
+            // without bindings. When operand-binding lands, a
+            // body with `#[pitbull::requires("idx < len")]` will
+            // see the assumption constrain the search space and
+            // return unsat.
+            let main = crate::smt::emit_index_bound_problem_with_assumptions(
+                &obligation.assumptions,
+            );
+            let consistency = if obligation.assumptions.is_empty() {
+                None
+            } else {
+                Some(crate::smt::emit_index_bound_consistency_check(
+                    &obligation.assumptions,
+                ))
+            };
+            (main, consistency)
+        }
         // The following kinds need richer encodings than bit-vector
-        // arithmetic alone — path-sensitive symbolic execution,
-        // termination measures, or `idx < len` reasoning over MIR
-        // local state. Tracked as v0.2 follow-up work.
+        // arithmetic alone — path-sensitive symbolic execution
+        // for panic reachability, termination measures for
+        // recursion. Tracked as v0.2+ follow-up work.
         VcObligationKind::PanicReachability
-        | VcObligationKind::IndexBound
         | VcObligationKind::RecursionDecreases => return None,
     };
     Some(VcGoal {
@@ -218,6 +246,83 @@ mod tests {
             "consistency check must NOT contain the safety predicate; \
              got:\n{cs}",
         );
+    }
+    /// Task P.1: IndexBound now compiles to an SMT problem (no
+    /// longer returns None). Pin the goal shape: 64-bit BV idx /
+    /// len, unsigned negation of the safety predicate
+    /// (`bvuge idx len`), check-sat.
+    #[test]
+    fn compile_index_bound_produces_smt() {
+        let obligation = VcObligation {
+            id: "pb054-idx-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::IndexBound,
+            assumptions: Vec::new(),
+        };
+        let goal = compile(&obligation).expect("IndexBound now compiles");
+        assert_eq!(goal.obligation, obligation);
+        assert!(goal.smt.contains("(set-logic QF_BV)"));
+        assert!(goal.smt.contains("(declare-const idx (_ BitVec 64))"));
+        assert!(goal.smt.contains("(declare-const len (_ BitVec 64))"));
+        assert!(goal.smt.contains("(assert (bvuge idx len))"));
+        assert!(
+            goal.consistency_check.is_none(),
+            "no consistency check expected with zero assumptions; got:\n{:?}",
+            goal.consistency_check,
+        );
+    }
+    /// Task P.1: IndexBound with assumptions gets the consistency
+    /// check populated, matching the contract that ArithmeticOverflow
+    /// already follows. The dispatcher runs the consistency check
+    /// first to refuse vacuous discharges from contradictory
+    /// preconditions (red-team F1).
+    #[test]
+    fn compile_index_bound_with_assumptions_includes_consistency_check() {
+        let obligation = VcObligation {
+            id: "pb054-idx-1".into(),
+            span: Span::default(),
+            kind: VcObligationKind::IndexBound,
+            assumptions: vec![
+                "(assert (bvult idx #x0000000000000064))".into(),
+            ],
+        };
+        let goal = compile(&obligation).expect("IndexBound now compiles");
+        // Main problem contains the safety predicate.
+        assert!(goal.smt.contains("(assert (bvuge idx len))"));
+        // Assumption appears in the main problem.
+        assert!(goal.smt.contains("(assert (bvult idx #x0000000000000064))"));
+        // Consistency check is populated and contains the
+        // assumption but NOT the safety predicate.
+        let cs = goal
+            .consistency_check
+            .as_ref()
+            .expect("consistency check should be present");
+        assert!(cs.contains("(assert (bvult idx #x0000000000000064))"));
+        assert!(
+            !cs.contains("bvuge"),
+            "consistency check must NOT contain the safety predicate; got:\n{cs}",
+        );
+    }
+    /// PanicReachability and RecursionDecreases still return None
+    /// from compile — they need richer encodings than QF_BV alone.
+    /// Pin this so adding IndexBound to compile didn't accidentally
+    /// open up the other kinds.
+    #[test]
+    fn compile_panic_and_recursion_still_return_none() {
+        let panic_obl = VcObligation {
+            id: "pb043-panic-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::PanicReachability,
+            assumptions: Vec::new(),
+        };
+        assert!(compile(&panic_obl).is_none());
+        let rec_obl = VcObligation {
+            id: "pb041-rec-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::RecursionDecreases,
+            assumptions: Vec::new(),
+        };
+        assert!(compile(&rec_obl).is_none());
     }
     /// No assumptions → no consistency check (the empty hypothesis
     /// set is trivially consistent; skipping the extra solver call
