@@ -744,6 +744,139 @@ fn pitbull_requires_attribute_attaches_precondition() {
          stderr; got:\n{stderr}",
     );
 }
+/// Task Q.1 (2026-05-26): `#[pitbull::trusted]` skips the
+/// MIR-body walk while keeping signature-level rules in force.
+/// A body with `x + 1` (which normally emits a PB049 overflow
+/// obligation) emits ZERO VC obligations when marked trusted.
+///
+/// Differential signal: stderr's "N obligation(s)" summary line.
+/// Untrusted body of `add_one` produces "1 obligation(s)";
+/// trusted body produces "0 obligation(s)". This is the
+/// audit-safe verification of trust: the visitor genuinely
+/// stops walking, not just suppresses output.
+#[test]
+fn pitbull_trusted_attribute_skips_body_walk() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_trusted_attribute_skips_body_walk: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q1-trusted-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::trusted]\n\
+         pub fn add_one(x: u32) -> u32 {\n\
+             x + 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) =
+        run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
+            .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    // The wrapper emits "VC summary: N obligation(s), ..." ONLY when
+    // at least one obligation exists. A trusted body with zero
+    // obligations produces no "VC summary" line at all — the visitor's
+    // body-walk short-circuit means PB049's `maybe_emit_overflow_obligation`
+    // never runs.
+    assert!(
+        !stderr.contains("pb049-add-"),
+        "Q.1: `#[pitbull::trusted]` on add_one should NOT emit a pb049 \
+         overflow obligation (the body walk short-circuits). Got stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("VC summary"),
+        "Q.1: trusted body with no obligations should produce no VC summary \
+         line. Got stderr:\n{stderr}",
+    );
+    // The visitor DID see the body (the items count is non-zero) —
+    // trust short-circuits AFTER signature checks, not before.
+    assert!(
+        stderr.contains("1 bodies walked"),
+        "Q.1: trusted body should still be walked (signature checks fire). \
+         Got stderr:\n{stderr}",
+    );
+}
+/// Task Q.1 negative control: WITHOUT `#[pitbull::trusted]`,
+/// the same body emits its normal PB049 overflow obligation.
+/// Pins the differential signal that the trust-extraction test
+/// relies on.
+#[test]
+fn no_pitbull_trusted_attribute_walks_body() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("no_pitbull_trusted_attribute_walks_body: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q1-untrusted-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "pub fn add_one(x: u32) -> u32 { x + 1 }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) = run_one_corpus_file_full(&env, &probe_rs, &[])
+        .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    assert!(
+        stderr.contains("1 obligation(s)"),
+        "Q.1 control: without `#[pitbull::trusted]`, add_one should produce \
+         exactly 1 PB049 overflow obligation. Got stderr:\n{stderr}",
+    );
+}
+/// Task Q.1: trust does NOT admit unsafe. A trusted `unsafe fn`
+/// must STILL produce a PB002 violation — trust applies to body
+/// content, not to signature-level safety qualifiers. Closes the
+/// open question from the Option C design doc (Q.1 #1).
+#[test]
+fn pitbull_trusted_does_not_silence_pb002_unsafe_fn() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_trusted_does_not_silence_pb002_unsafe_fn: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q1-trusted-unsafe-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::trusted]\n\
+         pub unsafe fn raw_op(x: u32) -> u32 {\n\
+             x + 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) =
+        run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
+            .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    assert!(
+        stderr.contains("PB002"),
+        "Q.1 safety pin: `#[pitbull::trusted] unsafe fn` MUST still report PB002. \
+         Trust ≠ unsafe admission. Got stderr:\n{stderr}",
+    );
+}
 /// O.3 control: the same body WITHOUT the attribute carries
 /// only the O.2.5 const-pin assumption. Pins the differential
 /// signal that the attribute-extraction test relies on.

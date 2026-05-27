@@ -280,7 +280,7 @@ impl PitbullCallbacks {
         // before the MIR pass and emit PB001 violations directly into
         // the report. tcx.hir_visit_all_item_likes_in_crate is callable
         // here because tcx remains valid inside rustc_internal::run.
-        let (hir_pb001_errors, hir_filename_partials, hir_preconditions) =
+        let (hir_pb001_errors, hir_filename_partials, hir_preconditions, hir_trusted) =
             collect_hir_pre_pass(tcx);
         self.hir_unsafe_blocks = hir_pb001_errors.len();
         // CrateDef gives `name()`, `span()`, `def_id()` as trait methods.
@@ -311,8 +311,33 @@ impl PitbullCallbacks {
                         continue;
                     }
                     let real_body = item.expect_body();
-                    let shadow_body =
+                    let mut shadow_body =
                         pitbull_subset::mir_api::adapter::body(&real_body);
+                    // Task Q.1 audit-cleanup (2026-05-26): the
+                    // adapter's `body()` hardcodes `is_unsafe: false`
+                    // and `is_async: false` because the rustc_public
+                    // surface doesn't expose those flags. Extract
+                    // them via the rustc_internal bridge (same
+                    // pattern as PB018's `is_mutable_static` for
+                    // statics). Without this, PB002 (unsafe fn) and
+                    // PB026 (async fn) silently don't fire on real
+                    // MIR — only on shadow-IR unit tests. The Q.1
+                    // trust-test surfaced the gap; closing it here
+                    // is in scope because it's adjacent (signature-
+                    // level safety rules) to trust semantics.
+                    let internal_id = rustc_public::rustc_internal::internal(
+                        tcx,
+                        item.def_id(),
+                    );
+                    let fn_sig = tcx.fn_sig(internal_id).skip_binder().skip_binder();
+                    shadow_body.is_unsafe = matches!(
+                        fn_sig.safety,
+                        rustc_hir::Safety::Unsafe,
+                    );
+                    shadow_body.is_async = matches!(
+                        tcx.asyncness(internal_id),
+                        rustc_middle::ty::Asyncness::Yes,
+                    );
                     self.bodies_walked += 1;
                     walked += 1;
                     // O.1 + O.3: install spec-derived preconditions
@@ -350,10 +375,17 @@ impl PitbullCallbacks {
                         preconditions.extend(attr_preconds.iter().cloned());
                     }
                     visitor.set_current_preconditions(preconditions);
-                    // All bodies are walked as untrusted in v0.2. Trust
-                    // marking requires the proc-macro / attribute plumbing
-                    // described in the doc comment above.
-                    visitor.visit_body(&shadow_body, /*trusted=*/ false);
+                    // Task Q.1 (2026-05-26): `#[pitbull::trusted]`
+                    // — the HIR pre-pass collects every fn-path with
+                    // the attribute; here we look up the current
+                    // item's path and pass the bool to visit_body.
+                    // Trust short-circuits the MIR walk after
+                    // signature checks (visitor.rs's
+                    // `current_body_trusted`); PB002/PB026 still
+                    // fire because they're signature-level and run
+                    // before the short-circuit.
+                    let is_trusted = hir_trusted.contains(&item_path);
+                    visitor.visit_body(&shadow_body, is_trusted);
                 }
                 rustc_public::ItemKind::Static => {
                     // `verify_roots` is a reachability-closure filter
@@ -912,15 +944,22 @@ fn collect_hir_pre_pass<'tcx>(
     Vec<pitbull_subset::SubsetError>,
     std::collections::HashMap<u32, String>,
     std::collections::HashMap<String, Vec<String>>,
+    std::collections::HashSet<String>,
 ) {
     let mut visitor = HirPreVisitor {
         tcx,
         violations: Vec::new(),
         filename_table: std::collections::HashMap::new(),
         preconditions: std::collections::HashMap::new(),
+        trusted: std::collections::HashSet::new(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
-    (visitor.violations, visitor.filename_table, visitor.preconditions)
+    (
+        visitor.violations,
+        visitor.filename_table,
+        visitor.preconditions,
+        visitor.trusted,
+    )
 }
 #[cfg(rustc_public_real)]
 struct HirPreVisitor<'tcx> {
@@ -933,6 +972,17 @@ struct HirPreVisitor<'tcx> {
     /// `visit_body` so users can mix attribute-based and
     /// config-based preconditions on the same function.
     preconditions: std::collections::HashMap<String, Vec<String>>,
+    /// Function paths marked `#[pitbull::trusted]` (Task Q.1,
+    /// 2026-05-26). The wrapper looks up each item in this set
+    /// and passes `trusted=true` to `SubsetVisitor::visit_body`,
+    /// which already short-circuits the MIR walk after signature
+    /// checks. PB002 (unsafe fn) and PB026 (async fn) STILL fire
+    /// on trusted bodies — trust does NOT admit unsafe; it only
+    /// trusts the body's contract (typically used for FFI shims
+    /// whose body Pitbull can't reason about but whose
+    /// signature is auditable). See visitor.rs's
+    /// `current_body_trusted` field for the short-circuit point.
+    trusted: std::collections::HashSet<String>,
 }
 #[cfg(rustc_public_real)]
 impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
@@ -963,6 +1013,7 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
             // different type used pre-HIR).
             let pitbull = rustc_span::Symbol::intern("pitbull");
             let requires = rustc_span::Symbol::intern("requires");
+            let trusted = rustc_span::Symbol::intern("trusted");
             let attrs = self.tcx.hir_attrs(item.hir_id());
             let def_id = item.owner_id.to_def_id();
             // Key the precondition map by the SAME string the
@@ -977,22 +1028,31 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
             let local_path = self.tcx.def_path_str(def_id);
             let fn_path = format!("{crate_name}::{local_path}");
             for attr in attrs {
-                if !attr.path_matches(&[pitbull, requires]) {
-                    continue;
-                }
-                let Some(meta_list) = attr.meta_item_list() else {
-                    continue;
-                };
-                for meta_inner in meta_list {
-                    let Some(lit) = meta_inner.lit() else {
+                if attr.path_matches(&[pitbull, requires]) {
+                    let Some(meta_list) = attr.meta_item_list() else {
                         continue;
                     };
-                    if let rustc_ast::ast::LitKind::Str(symbol, _style) = lit.kind {
-                        self.preconditions
-                            .entry(fn_path.clone())
-                            .or_default()
-                            .push(symbol.to_string());
+                    for meta_inner in meta_list {
+                        let Some(lit) = meta_inner.lit() else {
+                            continue;
+                        };
+                        if let rustc_ast::ast::LitKind::Str(symbol, _style) = lit.kind {
+                            self.preconditions
+                                .entry(fn_path.clone())
+                                .or_default()
+                                .push(symbol.to_string());
+                        }
                     }
+                } else if attr.path_matches(&[pitbull, trusted]) {
+                    // Task Q.1 (2026-05-26): `#[pitbull::trusted]`
+                    // is a flag attribute — no arguments. Its
+                    // presence on a function path means
+                    // `SubsetVisitor::visit_body` short-circuits
+                    // after signature checks (see visitor.rs's
+                    // `current_body_trusted`). PB002 / PB026
+                    // (unsafe fn / async fn) STILL fire — trust
+                    // does NOT admit unsafe.
+                    self.trusted.insert(fn_path.clone());
                 }
             }
         }
