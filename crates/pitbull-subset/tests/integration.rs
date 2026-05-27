@@ -941,6 +941,91 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
          (rustc clean + Pitbull clean). Got {code:?}",
     );
 }
+/// Phase B / Vision-audit #2 capstone (2026-05-26): same body as
+/// `wrapper_proves_bounded_index_safe_under_precondition` but the
+/// precondition uses the new ident-vs-ident PREDICATE FORM
+/// (`"i < len"`) instead of raw SMT-LIB. This validates the full
+/// pipeline:
+///   - HIR pre-pass extracts the string literal
+///   - Visitor's PB054 emitter routes through
+///     `parse_ident_vs_ident_predicate` (Path 1 of the three-path
+///     dispatcher)
+///   - Both idents resolve in the known-name set
+///     ({"idx", "len", "i"} via the source-arg alias)
+///   - `ident_vs_ident_to_smt_assertion` produces
+///     `(assert (bvult i len))`
+///   - Z3 discharges as `unsat — safety property holds`
+///
+/// Removes the UX cliff documented in HANDOFF.md: users no longer
+/// need to drop to raw SMT-LIB for the natural index-bound shape.
+///
+/// Gated on Z3 availability: gracefully skips if Z3 isn't on PATH.
+#[test]
+fn wrapper_proves_bounded_index_via_predicate_form() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_bounded_index_via_predicate_form: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!(
+        "pitbull-phaseB-pred-{}.toml",
+        std::process::id(),
+    ));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-phaseB-pred-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "pub fn at(s: &[u8], i: usize) -> u8 { s[i] }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        r#"
+[project]
+name = "corpus_test"
+toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
+
+[verification.preconditions]
+"corpus_test::at" = ["i < len"]
+"#,
+    )
+    .expect("write Phase-B pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if stderr.contains("z3 not installed") {
+        eprintln!(
+            "wrapper_proves_bounded_index_via_predicate_form: SKIPPED \
+             (z3 not on PATH)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("discharged (unsat") && !stderr.contains("NOT DISCHARGED"),
+        "Phase B: predicate-form `\"i < len\"` precondition must discharge \
+         like raw-SMT `(assert (bvult i len))`. Got code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("(PB054)"),
+        "Phase B: discharged verdict must reference PB054. stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "Phase B: fully-discharged obligation should exit 0. Got {code:?}",
+    );
+}
 /// Regression test for audit finding H3: when a hostile build.rs
 /// sets `PITBULL_TOML` to a file without a `.toml` extension (the
 /// realistic attack target being key files like `~/.ssh/id_rsa`

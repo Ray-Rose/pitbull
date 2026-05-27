@@ -49,6 +49,29 @@ pub struct Predicate {
     /// not silent truncation.
     pub lit: i128,
 }
+/// A parsed precondition of the form `<ident> <cmp> <ident>` — the
+/// shape needed for PB054 (`i < len`) and any future obligation
+/// where both sides of a comparison are SMT-bound names rather
+/// than a name vs a literal.
+///
+/// Vision-audit #2 / Option C / Phase B (2026-05-26): adds the
+/// missing-predicate shape that previously forced users to drop to
+/// raw SMT-LIB for PB054 preconditions. The two idents are
+/// translated VERBATIM as SMT symbols — the caller (typically
+/// the visitor's per-obligation emitter) is responsible for
+/// ensuring both names resolve in the surrounding SMT problem,
+/// either via `(declare-const NAME ...)`, `(define-fun NAME () ...)`,
+/// or canonical Pitbull-emitted aliases (`idx` / `len` for
+/// IndexBound, the source-name alias from `local_arg_name`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentVsIdentPredicate {
+    /// Left-hand-side identifier.
+    pub lhs: String,
+    /// Comparison operator (left → right, ident-first form).
+    pub op: CmpOp,
+    /// Right-hand-side identifier.
+    pub rhs: String,
+}
 /// Comparison operators in our predicate grammar.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CmpOp {
@@ -157,6 +180,99 @@ pub fn parse_predicate(s: &str) -> Result<Predicate, ParseError> {
         input: s.to_string(),
         reason: "no comparison operator found".into(),
     })
+}
+/// Parse a precondition string as `<ident> <cmp> <ident>` form.
+/// Returns `Err` if the input doesn't fit that shape (it may
+/// still be a valid `parse_predicate` ident-vs-int form; the
+/// caller can fall through).
+///
+/// Whitespace handling and operator-precedence semantics match
+/// `parse_predicate`. The operator is NOT normalized — `len > i`
+/// parses as `IdentVsIdent { lhs: "len", op: Gt, rhs: "i" }`
+/// rather than being flipped to ident-first, because both sides
+/// are idents and there's no canonical "left ident". The caller
+/// can apply `CmpOp::flip` if it wants to reorder.
+pub fn parse_ident_vs_ident_predicate(s: &str) -> Result<IdentVsIdentPredicate, ParseError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(ParseError {
+            input: s.to_string(),
+            reason: "empty input".into(),
+        });
+    }
+    const OPS: &[(&str, CmpOp)] = &[
+        ("<=", CmpOp::Le),
+        (">=", CmpOp::Ge),
+        ("==", CmpOp::Eq),
+        ("!=", CmpOp::Ne),
+        ("<", CmpOp::Lt),
+        (">", CmpOp::Gt),
+    ];
+    for (op_str, op) in OPS {
+        if let Some(idx) = trimmed.find(op_str) {
+            let left = trimmed[..idx].trim();
+            let right = trimmed[idx + op_str.len()..].trim();
+            if let (Some(lhs), Some(rhs)) = (parse_ident(left), parse_ident(right)) {
+                return Ok(IdentVsIdentPredicate { lhs, op: *op, rhs });
+            }
+            return Err(ParseError {
+                input: s.to_string(),
+                reason: format!(
+                    "matched operator `{op_str}` but operands don't form \
+                     `<ident> {op_str} <ident>` (left: {left:?}, right: {right:?})",
+                ),
+            });
+        }
+    }
+    Err(ParseError {
+        input: s.to_string(),
+        reason: "no comparison operator found".into(),
+    })
+}
+/// Translate an `IdentVsIdentPredicate` into an SMT-LIB
+/// `(assert ...)` directive that constrains two SMT symbols.
+///
+/// `target_ty_name` selects the predicate (signed vs unsigned) —
+/// `u64`-style names map to `bvult`/`bvule`/`bvugt`/`bvuge`,
+/// `i64`-style to `bvslt`/`bvsle`/etc. Equality (`==`) and
+/// inequality (`!=`) use SMT-LIB's `=` and `distinct` regardless
+/// of signedness.
+///
+/// The two ident names are emitted VERBATIM. The caller is
+/// responsible for ensuring both bind to SMT variables (via
+/// `declare-const` or `define-fun`) in the surrounding problem.
+/// For PB054 IndexBound, the canonical aliases `idx` / `len`
+/// plus the source-name alias from `local_arg_name` cover the
+/// common cases.
+///
+/// Note on bit-vector widths: the ident-vs-ident translator does
+/// NOT range-check (the operands aren't literals — there's
+/// nothing to range-check) and does NOT explicitly emit a width
+/// declaration. The caller's enclosing SMT problem must declare
+/// both idents with consistent widths or the solver returns a
+/// type-mismatch error (which the verdict-parser surfaces as
+/// `SolverResult::Error` — undischarged, audit-safe).
+pub fn ident_vs_ident_to_smt_assertion(
+    pred: &IdentVsIdentPredicate,
+    target_ty_name: &str,
+) -> Result<String, TranslationError> {
+    let (signed, _bits) = int_type_info(target_ty_name)
+        .ok_or_else(|| TranslationError::UnsupportedType {
+            ty_name: target_ty_name.to_string(),
+        })?;
+    let smt_op = match (pred.op, signed) {
+        (CmpOp::Lt, false) => "bvult",
+        (CmpOp::Lt, true) => "bvslt",
+        (CmpOp::Le, false) => "bvule",
+        (CmpOp::Le, true) => "bvsle",
+        (CmpOp::Gt, false) => "bvugt",
+        (CmpOp::Gt, true) => "bvsgt",
+        (CmpOp::Ge, false) => "bvuge",
+        (CmpOp::Ge, true) => "bvsge",
+        (CmpOp::Eq, _) => "=",
+        (CmpOp::Ne, _) => "distinct",
+    };
+    Ok(format!("(assert ({smt_op} {} {}))", pred.lhs, pred.rhs))
 }
 /// Validate an identifier per Rust's lexer (ASCII subset: starts
 /// with letter or underscore, continues with alphanumerics or
@@ -851,6 +967,116 @@ mod tests {
             validate_assertion_form("(assert true) ; trailing comment"),
             Err(AssertionFormError::CommentNotSupported),
         ));
+    }
+    // ----- ident-vs-ident parser + translator (Vision-audit #2 / Phase B) -----
+    /// `<ident> <cmp> <ident>` form parses cleanly and preserves
+    /// the left-to-right operator orientation (no flip — both
+    /// sides are idents, no canonical "left").
+    #[test]
+    fn ident_vs_ident_parses_every_operator() {
+        let cases = [
+            ("i < len", CmpOp::Lt, "i", "len"),
+            ("i <= len", CmpOp::Le, "i", "len"),
+            ("i > len", CmpOp::Gt, "i", "len"),
+            ("i >= len", CmpOp::Ge, "i", "len"),
+            ("a == b", CmpOp::Eq, "a", "b"),
+            ("a != b", CmpOp::Ne, "a", "b"),
+        ];
+        for (input, expected_op, expected_lhs, expected_rhs) in cases {
+            let p = parse_ident_vs_ident_predicate(input).expect(input);
+            assert_eq!(p.op, expected_op, "op mismatch on {input:?}");
+            assert_eq!(p.lhs, expected_lhs, "lhs mismatch on {input:?}");
+            assert_eq!(p.rhs, expected_rhs, "rhs mismatch on {input:?}");
+        }
+    }
+    /// Ident-vs-ident: whitespace flexibility matches the
+    /// ident-vs-int parser.
+    #[test]
+    fn ident_vs_ident_whitespace_flexibility() {
+        let canon = parse_ident_vs_ident_predicate("i < len").expect("canonical");
+        for input in ["i<len", " i < len ", "i  <  len"] {
+            let p = parse_ident_vs_ident_predicate(input).expect(input);
+            assert_eq!(p, canon, "whitespace variant should normalize: {input:?}");
+        }
+    }
+    /// Ident-vs-ident: malformed inputs return ParseError. Note
+    /// that pure ident-vs-int inputs ALSO fail here (they're
+    /// the wrong shape) — callers try `parse_predicate` first,
+    /// then fall back to `parse_ident_vs_ident_predicate`.
+    #[test]
+    fn ident_vs_ident_malformed_inputs_rejected() {
+        for input in [
+            "",            // empty
+            "i",           // no operator
+            "i <",         // missing rhs
+            "< len",       // missing lhs
+            "1 < len",     // lhs is int literal — wrong shape
+            "i < 100",     // rhs is int literal — wrong shape
+            "i.x < len",   // ident with `.` — not a simple Rust ident
+            "1x < len",    // starts with digit
+        ] {
+            assert!(
+                parse_ident_vs_ident_predicate(input).is_err(),
+                "expected parse failure on {input:?}",
+            );
+        }
+    }
+    /// SMT translation: unsigned u64 (PB054's IndexBound width)
+    /// produces `bvult`/`bvule`/etc.
+    #[test]
+    fn ident_vs_ident_translates_unsigned() {
+        let p = IdentVsIdentPredicate {
+            lhs: "i".into(),
+            op: CmpOp::Lt,
+            rhs: "len".into(),
+        };
+        let smt = ident_vs_ident_to_smt_assertion(&p, "u64").expect("u64 supported");
+        assert_eq!(smt, "(assert (bvult i len))");
+    }
+    /// SMT translation: signed types use bvslt/etc.
+    #[test]
+    fn ident_vs_ident_translates_signed() {
+        let p = IdentVsIdentPredicate {
+            lhs: "lo".into(),
+            op: CmpOp::Le,
+            rhs: "hi".into(),
+        };
+        let smt = ident_vs_ident_to_smt_assertion(&p, "i32").expect("i32 supported");
+        assert_eq!(smt, "(assert (bvsle lo hi))");
+    }
+    /// SMT translation: equality/inequality use `=` / `distinct`
+    /// regardless of signedness.
+    #[test]
+    fn ident_vs_ident_equality_uses_bv_equality() {
+        let p = IdentVsIdentPredicate {
+            lhs: "a".into(),
+            op: CmpOp::Eq,
+            rhs: "b".into(),
+        };
+        let smt = ident_vs_ident_to_smt_assertion(&p, "u32").expect("u32 supported");
+        assert_eq!(smt, "(assert (= a b))");
+        let p = IdentVsIdentPredicate {
+            lhs: "a".into(),
+            op: CmpOp::Ne,
+            rhs: "b".into(),
+        };
+        let smt = ident_vs_ident_to_smt_assertion(&p, "i64").expect("i64 supported");
+        assert_eq!(smt, "(assert (distinct a b))");
+    }
+    /// Unsupported types reject (e.g. `f32`, `bool`).
+    #[test]
+    fn ident_vs_ident_unsupported_type_rejected() {
+        let p = IdentVsIdentPredicate {
+            lhs: "x".into(),
+            op: CmpOp::Lt,
+            rhs: "y".into(),
+        };
+        for ty in ["f32", "bool", "usize", "isize"] {
+            assert!(matches!(
+                ident_vs_ident_to_smt_assertion(&p, ty),
+                Err(TranslationError::UnsupportedType { .. }),
+            ));
+        }
     }
     /// Audit finding H-RT1 (2026-05-26): SMT-LIB quoted-symbol
     /// syntax `|...|` defeats the byte-level paren scanner. A

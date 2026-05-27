@@ -1475,30 +1475,96 @@ impl<'cfg> SubsetVisitor<'cfg> {
     ) {
         let seq = self.vc_obligations.len();
         let id = format!("pb054-idx-{seq}");
-        // Apply the F2 red-team lex validation to each
-        // precondition before attaching it to the obligation.
-        // The PB049 path runs a richer predicate-grammar pipeline
-        // first, but the v0.2 grammar only supports
-        // `<ident> <cmp> <int>` — so for `IndexBound` (whose
-        // natural shape is `i < len`, two idents) only the raw
-        // SMT-LIB path applies. Malformed strings get an audit
-        // note and are dropped from the obligation (audit
-        // posture: no silent skips). When the predicate grammar
-        // extends to `<ident> <cmp> <ident>` in a future commit,
-        // this branch grows to mirror the PB049 logic.
+        // Each precondition string goes through three potential
+        // paths, in order:
+        //   1. `parse_ident_vs_ident_predicate` — `i < len`-style
+        //      (vision-audit #2 / Phase B 2026-05-26). Translates
+        //      with target type `u64` (IndexBound's canonical
+        //      width). The two idents must resolve in the SMT
+        //      problem; we check against the known-name set
+        //      {`idx`, `len`, idx_source_name?} and audit-note
+        //      otherwise.
+        //   2. `parse_predicate` — `i < 100`-style ident-vs-int.
+        //      Same name binding rules; literal range-checked
+        //      against u64.
+        //   3. `validate_assertion_form` — raw SMT-LIB splice
+        //      (O.1 escape hatch). For preconditions that
+        //      reference symbols our parser doesn't know.
+        //
+        // On any failure, emit a precondition-specific audit
+        // note so the auditor sees exactly which path rejected
+        // and why. Audit posture: no silent skips.
+        let known_smt_names: Vec<&str> = {
+            let mut v = vec!["idx", "len"];
+            if let Some(name) = &idx_source_name {
+                v.push(name.as_str());
+            }
+            v
+        };
         let mut assumptions: Vec<String> =
             Vec::with_capacity(self.current_body_preconditions.len());
         let mut pending_audit_notes: Vec<String> = Vec::new();
         for raw in &self.current_body_preconditions {
+            // Path 1: ident-vs-ident.
+            if let Ok(p) = crate::predicate::parse_ident_vs_ident_predicate(raw) {
+                if known_smt_names.contains(&p.lhs.as_str())
+                    && known_smt_names.contains(&p.rhs.as_str())
+                {
+                    match crate::predicate::ident_vs_ident_to_smt_assertion(&p, "u64") {
+                        Ok(smt) => {
+                            assumptions.push(smt);
+                            continue;
+                        }
+                        Err(e) => {
+                            pending_audit_notes.push(format!(
+                                "PB054: rejecting precondition (ident-vs-ident \
+                                 parsed but translation failed): {e} — input: {raw:?}",
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                pending_audit_notes.push(format!(
+                    "PB054: rejecting precondition (ident-vs-ident parsed \
+                     but at least one side does not resolve in the SMT \
+                     problem). Known names: {known_smt_names:?}; got \
+                     lhs={:?} rhs={:?}; input: {raw:?}",
+                    p.lhs, p.rhs,
+                ));
+                continue;
+            }
+            // Path 2: ident-vs-int.
+            if let Ok(p) = crate::predicate::parse_predicate(raw) {
+                if known_smt_names.contains(&p.var.as_str()) {
+                    // `var` resolves; translate vs u64 (IndexBound
+                    // canonical width). The translator emits
+                    // `(assert (bv<op> <var> <hex-literal>))`.
+                    match crate::predicate::predicate_to_smt_assertion(&p, &p.var, "u64") {
+                        Ok(smt) => {
+                            assumptions.push(smt);
+                            continue;
+                        }
+                        Err(e) => {
+                            pending_audit_notes.push(format!(
+                                "PB054: rejecting precondition (predicate parsed \
+                                 and bound but translation failed): {e} — input: {raw:?}",
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                // Predicate parses but var doesn't resolve. Fall
+                // through to raw-splice; if it's valid SMT it
+                // gets through.
+            }
+            // Path 3: raw SMT-LIB splice (with F2 lex validation).
             match crate::predicate::validate_assertion_form(raw) {
                 Ok(()) => assumptions.push(raw.clone()),
                 Err(e) => {
                     pending_audit_notes.push(format!(
-                        "PB054: rejecting precondition (not a valid \
-                         SMT-LIB `(assert ...)` form for IndexBound — the \
-                         v0.2 grammar's `<ident> <cmp> <int>` form doesn't \
-                         apply here; user must write raw SMT-LIB): {e} — \
-                         input: {raw:?}",
+                        "PB054: rejecting precondition (not a recognized \
+                         predicate form nor a valid SMT-LIB `(assert ...)` \
+                         form): {e} — input: {raw:?}",
                     ));
                 }
             }
