@@ -1004,6 +1004,79 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
     /// Future work: accept Rust-expression-form arguments
     /// `#[pitbull::requires(x < 100)]` via proper attribute
     /// parsing.
+    /// Task Q.2 (2026-05-26): extract `#[pitbull::requires]` and
+    /// `#[pitbull::trusted]` from methods on impl blocks. The
+    /// item-walk (`rustc_public::all_local_items`) already
+    /// flattens impl methods into `ItemKind::Fn` entries (via
+    /// `tcx.mir_keys` which includes `DefKind::AssocFn`) — so the
+    /// MIR body walk and VC emission already work for impl
+    /// methods. What was MISSING was the attribute extraction:
+    /// `HirPreVisitor::visit_item` only handles top-level items.
+    /// `visit_impl_item` runs alongside `visit_item` and applies
+    /// the same `requires`/`trusted` extraction logic to
+    /// `ImplItemKind::Fn`.
+    ///
+    /// Trait items (`visit_trait_item`) are deferred — trait
+    /// default methods can have bodies but are a smaller corner
+    /// case. Tracked as a follow-up gap.
+    /// Task Q.2 fix: `hir_visit_all_item_likes_in_crate` calls
+    /// `visit_impl_item` directly for every impl item in the
+    /// crate. Separately, when `walk_item` fires on the parent
+    /// `ItemKind::Impl`, the `NestedFilter::All` setting causes
+    /// `visit_nested_impl_item` to recurse into each item — also
+    /// calling `visit_impl_item`. The double-fire was observed
+    /// during Q.2 debugging (impl method's `#[pitbull::requires]`
+    /// produced TWO precondition entries → 3 assumptions instead
+    /// of expected 2). Override `visit_nested_impl_item` to a
+    /// no-op so the direct-call path is the only one that
+    /// produces attribute extraction. PB001 unsafe-block
+    /// detection inside method bodies still works because
+    /// `visit_block` runs from the direct visit_impl_item
+    /// call's walk_impl_item recursion (which we DON'T skip).
+    fn visit_nested_impl_item(&mut self, _id: rustc_hir::ImplItemId) {}
+    fn visit_impl_item(&mut self, ii: &'tcx rustc_hir::ImplItem<'tcx>) {
+        if let rustc_hir::ImplItemKind::Fn(..) = ii.kind {
+            let pitbull = rustc_span::Symbol::intern("pitbull");
+            let requires = rustc_span::Symbol::intern("requires");
+            let trusted = rustc_span::Symbol::intern("trusted");
+            let attrs = self.tcx.hir_attrs(ii.hir_id());
+            let def_id = ii.owner_id.to_def_id();
+            let crate_name = self
+                .tcx
+                .crate_name(rustc_hir::def_id::LOCAL_CRATE)
+                .to_string();
+            let local_path = self.tcx.def_path_str(def_id);
+            let fn_path = format!("{crate_name}::{local_path}");
+            for attr in attrs {
+                if attr.path_matches(&[pitbull, requires]) {
+                    let Some(meta_list) = attr.meta_item_list() else {
+                        continue;
+                    };
+                    for meta_inner in meta_list {
+                        let Some(lit) = meta_inner.lit() else {
+                            continue;
+                        };
+                        if let rustc_ast::ast::LitKind::Str(symbol, _style) = lit.kind {
+                            self.preconditions
+                                .entry(fn_path.clone())
+                                .or_default()
+                                .push(symbol.to_string());
+                        }
+                    }
+                } else if attr.path_matches(&[pitbull, trusted]) {
+                    self.trusted.insert(fn_path.clone());
+                }
+            }
+        }
+        // Recurse into the method body so PB001 unsafe-block
+        // detection (in visit_block) fires for `unsafe { ... }`
+        // blocks inside impl methods. The double-fire concern
+        // is handled by overriding visit_nested_impl_item above —
+        // walk_impl_item here is reached only via the DIRECT
+        // call from hir_visit_all_item_likes_in_crate, not via
+        // the parent impl block's recursive walk.
+        rustc_hir::intravisit::walk_impl_item(self, ii);
+    }
     fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) {
         if let rustc_hir::ItemKind::Fn { .. } = item.kind {
             // `path_matches` and `meta_item_list` are inherent

@@ -744,6 +744,99 @@ fn pitbull_requires_attribute_attaches_precondition() {
          stderr; got:\n{stderr}",
     );
 }
+/// Task Q.2 (2026-05-26): `#[pitbull::requires(...)]` and
+/// `#[pitbull::trusted]` on impl methods are extracted by the
+/// new `HirPreVisitor::visit_impl_item`. Pre-Q.2, the HIR
+/// pre-pass only handled top-level `ItemKind::Fn` items —
+/// impl methods' bodies still got walked (via
+/// `rustc_public::all_local_items()` which flattens
+/// `DefKind::AssocFn`) but their attributes were silently
+/// dropped, so users got `[1 assumption]` (const-pin only)
+/// instead of `[2 assumptions]` (const-pin + requires).
+#[test]
+fn pitbull_requires_on_impl_method_attaches_precondition() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_requires_on_impl_method_attaches_precondition: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q2-impl-requires-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         pub struct Foo;\n\
+         impl Foo {\n\
+             #[pitbull::requires(\"x < 100\")]\n\
+             pub fn bar(&self, x: u32) -> u32 {\n\
+                 x + 1\n\
+             }\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) =
+        run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
+            .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    assert!(
+        stderr.contains("[2 assumptions]"),
+        "Q.2: `#[pitbull::requires]` on impl method should produce \
+         `[2 assumptions]` (1 const-pin + 1 requires). Got stderr:\n{stderr}",
+    );
+}
+/// Task Q.2: `#[pitbull::trusted]` on an impl method must also
+/// short-circuit the body walk (no PB049 obligation emitted).
+/// Pairs with the Q.1 trust test but for impl methods.
+#[test]
+fn pitbull_trusted_on_impl_method_skips_body_walk() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_trusted_on_impl_method_skips_body_walk: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q2-impl-trusted-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         pub struct Foo;\n\
+         impl Foo {\n\
+             #[pitbull::trusted]\n\
+             pub fn bar(&self, x: u32) -> u32 {\n\
+                 x + 1\n\
+             }\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) =
+        run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
+            .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    assert!(
+        !stderr.contains("pb049-add-"),
+        "Q.2: `#[pitbull::trusted]` on impl method should short-circuit \
+         body walk (no PB049). Got stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("VC summary"),
+        "Q.2: trusted impl method should emit zero obligations (no VC summary). \
+         Got stderr:\n{stderr}",
+    );
+}
 /// Task Q.1 (2026-05-26): `#[pitbull::trusted]` skips the
 /// MIR-body walk while keeping signature-level rules in force.
 /// A body with `x + 1` (which normally emits a PB049 overflow
