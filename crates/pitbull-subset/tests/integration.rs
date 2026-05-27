@@ -744,6 +744,91 @@ fn pitbull_requires_attribute_attaches_precondition() {
          stderr; got:\n{stderr}",
     );
 }
+/// Task Q.3 (2026-05-26): expression-form
+/// `#[pitbull::requires(x < 100)]` (NO quotes) is extracted via
+/// the new token-tree pretty-printing path in
+/// `HirPreVisitor::extract_requires_strings`. Pre-Q.3 the
+/// attribute's args had to be a string literal; expression-form
+/// silently dropped through `meta_item_list()` returning None.
+/// Now we fall through to `AttrArgs::Delimited` and stringify
+/// via `rustc_ast_pretty::pprust::tts_to_string`.
+///
+/// Same `[2 assumptions]` differential signal as Q.1's
+/// string-literal test — proves the extraction worked end-to-end
+/// through the visitor's overflow obligation pipeline.
+#[test]
+fn pitbull_requires_expression_form_attaches_precondition() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_requires_expression_form_attaches_precondition: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q3-expr-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::requires(x < 100)]\n\
+         pub fn add_one(x: u32) -> u32 {\n\
+             x + 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) =
+        run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
+            .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    assert!(
+        stderr.contains("[2 assumptions]"),
+        "Q.3: expression-form `#[pitbull::requires(x < 100)]` should be extracted \
+         the same as string-literal form, producing `[2 assumptions]`. Got stderr:\n{stderr}",
+    );
+}
+/// Task Q.3 backward-compat: the existing string-literal form
+/// `#[pitbull::requires("x < 100")]` still works (this is the
+/// O.3-baseline path — pre-cleanup behavior preserved).
+#[test]
+fn pitbull_requires_string_literal_form_still_works() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_requires_string_literal_form_still_works: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q3-strlit-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::requires(\"x < 100\")]\n\
+         pub fn add_one(x: u32) -> u32 {\n\
+             x + 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) =
+        run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
+            .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    assert!(
+        stderr.contains("[2 assumptions]"),
+        "Q.3 backcompat: string-literal form must still produce `[2 assumptions]`. \
+         Got stderr:\n{stderr}",
+    );
+}
 /// Task Q.2 (2026-05-26): `#[pitbull::requires(...)]` and
 /// `#[pitbull::trusted]` on impl methods are extracted by the
 /// new `HirPreVisitor::visit_impl_item`. Pre-Q.2, the HIR

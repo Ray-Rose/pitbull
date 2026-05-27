@@ -78,6 +78,12 @@ fn main() {
 //   - rustc_public:    StableMIR — the typed view we run analysis against
 #[cfg(rustc_public_real)]
 extern crate rustc_ast;
+// Task Q.3 (2026-05-26): expression-form attribute argument
+// stringification — `#[pitbull::requires(x < 100)]` (no quotes)
+// requires us to pretty-print the attribute's token stream back
+// into a string we can hand to the predicate parser.
+#[cfg(rustc_public_real)]
+extern crate rustc_ast_pretty;
 #[cfg(rustc_public_real)]
 extern crate rustc_driver;
 #[cfg(rustc_public_real)]
@@ -985,6 +991,58 @@ struct HirPreVisitor<'tcx> {
     trusted: std::collections::HashSet<String>,
 }
 #[cfg(rustc_public_real)]
+impl<'tcx> HirPreVisitor<'tcx> {
+    /// Extract precondition strings from a `#[pitbull::requires(...)]`
+    /// attribute. Two forms accepted:
+    ///
+    /// 1. **String-literal** (O.3 baseline):
+    ///    `#[pitbull::requires("x < 100")]` — uses `meta_item_list()`
+    ///    to extract a `LitKind::Str`. Stable, well-understood.
+    /// 2. **Expression-form** (Q.3, 2026-05-26):
+    ///    `#[pitbull::requires(x < 100)]` — when `meta_item_list()`
+    ///    returns None or empty (the arg isn't a meta-item), we
+    ///    fall through to the raw `AttrArgs::Delimited` path and
+    ///    pretty-print the token stream via
+    ///    `rustc_ast_pretty::pprust::tts_to_string`. The result is
+    ///    fed through the same predicate-parse pipeline.
+    ///
+    /// Both forms produce strings the visitor's predicate parser
+    /// later attempts to interpret. A single attribute can produce
+    /// multiple strings only via the string-literal path (multi-arg
+    /// meta-lists); expression-form produces exactly one string.
+    fn extract_requires_strings(
+        &self,
+        attr: &rustc_hir::Attribute,
+    ) -> Vec<String> {
+        // Path 1: meta-item list (string-literal form).
+        if let Some(meta_list) = attr.meta_item_list() {
+            let mut out = Vec::new();
+            for meta_inner in meta_list {
+                if let Some(lit) = meta_inner.lit() {
+                    if let rustc_ast::ast::LitKind::Str(symbol, _style) = lit.kind {
+                        out.push(symbol.to_string());
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        // Path 2: Q.3 expression-form. The attribute's args are a
+        // raw token stream (e.g. `(x < 100)`). Pretty-print the
+        // inner tokens (without the outer parens). We use rustc's
+        // own pretty-printer via `rustc_ast_pretty::pprust::tts_to_string`
+        // to maintain consistency with how rustc renders the
+        // attribute in diagnostics.
+        let normal = attr.get_normal_item();
+        if let rustc_hir::AttrArgs::Delimited(delim) = &normal.args {
+            let stringified = rustc_ast_pretty::pprust::tts_to_string(&delim.tokens);
+            return vec![stringified.trim().to_string()];
+        }
+        Vec::new()
+    }
+}
+#[cfg(rustc_public_real)]
 impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
     type NestedFilter = rustc_middle::hir::nested_filter::All;
     fn maybe_tcx(&mut self) -> rustc_middle::ty::TyCtxt<'tcx> {
@@ -1049,19 +1107,13 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
             let fn_path = format!("{crate_name}::{local_path}");
             for attr in attrs {
                 if attr.path_matches(&[pitbull, requires]) {
-                    let Some(meta_list) = attr.meta_item_list() else {
-                        continue;
-                    };
-                    for meta_inner in meta_list {
-                        let Some(lit) = meta_inner.lit() else {
-                            continue;
-                        };
-                        if let rustc_ast::ast::LitKind::Str(symbol, _style) = lit.kind {
-                            self.preconditions
-                                .entry(fn_path.clone())
-                                .or_default()
-                                .push(symbol.to_string());
-                        }
+                    // Q.3 (2026-05-26): unified extraction handles
+                    // both string-literal AND expression-form args.
+                    for s in self.extract_requires_strings(attr) {
+                        self.preconditions
+                            .entry(fn_path.clone())
+                            .or_default()
+                            .push(s);
                     }
                 } else if attr.path_matches(&[pitbull, trusted]) {
                     self.trusted.insert(fn_path.clone());
@@ -1102,19 +1154,13 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
             let fn_path = format!("{crate_name}::{local_path}");
             for attr in attrs {
                 if attr.path_matches(&[pitbull, requires]) {
-                    let Some(meta_list) = attr.meta_item_list() else {
-                        continue;
-                    };
-                    for meta_inner in meta_list {
-                        let Some(lit) = meta_inner.lit() else {
-                            continue;
-                        };
-                        if let rustc_ast::ast::LitKind::Str(symbol, _style) = lit.kind {
-                            self.preconditions
-                                .entry(fn_path.clone())
-                                .or_default()
-                                .push(symbol.to_string());
-                        }
+                    // Q.3 (2026-05-26): unified extraction handles
+                    // both string-literal AND expression-form args.
+                    for s in self.extract_requires_strings(attr) {
+                        self.preconditions
+                            .entry(fn_path.clone())
+                            .or_default()
+                            .push(s);
                     }
                 } else if attr.path_matches(&[pitbull, trusted]) {
                     // Task Q.1 (2026-05-26): `#[pitbull::trusted]`
