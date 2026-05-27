@@ -1310,14 +1310,15 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  154 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  160 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
-  pre-pass, and PB054 P / P.1 / P.2 work). The driver-side test
-  harness is the right home for tests that exercise the adapter
-  against real MIR.
+  pre-pass, PB054 P / P.1 / P.2 work, and the N3 + H-RT1/H-RT2/
+  H-RT3/M-RT3 post-interruption red-team cleanup). The driver-side
+  test harness is the right home for tests that exercise the
+  adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 154 passing, 0 warnings, clippy clean
+# Stable: 160 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --tests
 # Nightly + opt-in: wrapper builds, end-to-end PB049/PB054 discharge

@@ -205,6 +205,16 @@ pub enum AssertionFormError {
     /// Contains a `;` character — SMT-LIB comments could mask
     /// paren imbalance. Rejected for now.
     CommentNotSupported,
+    /// Contains a `|` character — SMT-LIB quoted-symbol syntax
+    /// `|...|` ignores parens inside, but our byte-level paren
+    /// counter doesn't. A crafted precondition can therefore
+    /// validate as a single balanced `(assert ...)` form here
+    /// while Z3 sees multiple directives (audit finding H-RT1,
+    /// 2026-05-26). Rejected wholesale — Pitbull's own emitted
+    /// assumptions never need `|` (predicate-translated forms
+    /// use `bvult/bvslt/=/distinct` with hex literals; constant
+    /// pins use `=` with hex literals).
+    QuotedSymbolNotSupported,
 }
 impl std::fmt::Display for AssertionFormError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -215,6 +225,9 @@ impl std::fmt::Display for AssertionFormError {
             Self::MultipleDirectives => write!(f, "must be exactly one top-level directive"),
             Self::StringLiteralNotSupported => write!(f, "string literals not supported"),
             Self::CommentNotSupported => write!(f, "comments not supported"),
+            Self::QuotedSymbolNotSupported => {
+                write!(f, "quoted-symbol syntax `|...|` not supported (audit finding H-RT1)")
+            }
         }
     }
 }
@@ -247,6 +260,21 @@ pub fn validate_assertion_form(s: &str) -> Result<(), AssertionFormError> {
     }
     if trimmed.contains(';') {
         return Err(AssertionFormError::CommentNotSupported);
+    }
+    // Audit finding H-RT1 (2026-05-26): SMT-LIB quoted-symbol
+    // syntax `|...|` lets ANY character (except `|` and `\`)
+    // appear inside, including unmatched parens. Our byte-level
+    // paren scanner counts every `(` and `)` literally, so a
+    // crafted precondition like
+    //   `(assert (= 1 |))(check-sat)(assert false|))`
+    // can byte-balance correctly while Z3 sees three directives:
+    // `(assert (= 1 |...|))`, `(check-sat)`, `(assert false|...|))`.
+    // The validator's "single (assert ...) form" promise is broken.
+    // Pitbull's own assumption synthesis (predicate translation,
+    // operand pin) never emits `|`, so rejecting it wholesale
+    // closes the injection path with zero legitimate-use cost.
+    if trimmed.contains('|') {
+        return Err(AssertionFormError::QuotedSymbolNotSupported);
     }
     if !trimmed.starts_with("(assert") {
         return Err(AssertionFormError::NotAssertForm);
@@ -823,6 +851,42 @@ mod tests {
             validate_assertion_form("(assert true) ; trailing comment"),
             Err(AssertionFormError::CommentNotSupported),
         ));
+    }
+    /// Audit finding H-RT1 (2026-05-26): SMT-LIB quoted-symbol
+    /// syntax `|...|` defeats the byte-level paren scanner. A
+    /// crafted precondition can pass the validator's "single
+    /// (assert ...) form" check while Z3 sees multi-directive
+    /// injection. Reject all `|` characters wholesale.
+    #[test]
+    fn validate_rejects_quoted_symbol_syntax() {
+        // The textbook attack from H-RT1: byte-scan sees balanced
+        // `(assert ...)`; Z3 sees three top-level directives.
+        let attack = r"(assert (= 1 |))(check-sat)(assert false|))";
+        assert!(
+            matches!(
+                validate_assertion_form(attack),
+                Err(AssertionFormError::QuotedSymbolNotSupported),
+            ),
+            "H-RT1 attack payload must be rejected; got: {:?}",
+            validate_assertion_form(attack),
+        );
+        // Even benign-looking quoted-symbol uses are rejected —
+        // the wholesale ban is the simplest sound defense.
+        for benign in [
+            r"(assert (bvult |i| #x64))",        // quoted ident
+            r"(assert (= |my var| #x01))",       // quoted with space
+            r"(assert |raw|)",                    // bare quoted
+        ] {
+            assert!(
+                matches!(
+                    validate_assertion_form(benign),
+                    Err(AssertionFormError::QuotedSymbolNotSupported),
+                ),
+                "quoted-symbol form must be rejected uniformly; \
+                 input: {benign:?} got: {:?}",
+                validate_assertion_form(benign),
+            );
+        }
     }
     /// `(assertion ...)` (typo-like) rejected because the keyword
     /// must end before the next char.

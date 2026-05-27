@@ -6,7 +6,9 @@ verifier where the previous session left off. Read top to
 bottom on first sit-down; refer back to individual sections
 during work.
 
-Last known-good commit at hand-off: **`<refresh after this commit>`**.
+Last known-good commit at hand-off: **`e6f9154`** (audit-cleanup
+pass) plus follow-up commits closing N3 (Z3 timeout + output cap) and
+H-RT1 / H-RT2 / H-RT3 / M-RT3 from the post-interruption red-team.
 The post-P.2 state ships Tasks P / P.1 / P.2 (PB054 end-to-end:
 visitor → SMT compile → operand binding → Z3 discharge) plus an
 audit-cleanup pass that closed N1 / N2 / F3 / F4 / F5–F13 from
@@ -18,12 +20,12 @@ the deep audit. Branch `main`, local repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch (Z3 today). See `docs/PSS-1.md` for the
   specification.
-- **State:** 154 tests passing, both lanes warning-clean, clippy
+- **State:** 160 tests passing, both lanes warning-clean, clippy
   clean. Milestone-2 work through Tasks P.2 is done — including:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
   and the post-audit cleanups closing F1 / F2 / F7 / H3 / N1 / N2
-  / F3 / F4 / F8 / F11.
+  / N3 / F3 / F4 / F8 / F11 / H-RT1 / H-RT2 / H-RT3 / M-RT3.
 - **Next task:** Pick a strategic direction from Section 5's menu.
   PB049 overflow and PB054 index-bound both discharge end-to-end
   under Z3 with preconditions in `pitbull.toml`. Reasonable next
@@ -56,7 +58,8 @@ the deep audit. Branch `main`, local repo only (no remote).
 ### Recent commit log (newest first)
 
 ```
-<this commit> Audit-cleanup pass after P/P.1/P.2 (N1/N2/F3/F4/F5–F13 closed)
+<this commit> N3 + H-RT1/H-RT2/H-RT3/M-RT3 (post-interruption red-team cleanup)
+e6f9154 Audit-cleanup pass after P/P.1/P.2 (N1/N2/F3/F4/F5–F13 closed)
 c05bd13 Milestone 2 Task P.2: PB054 operand binding — IndexBound discharges end-to-end
 f0b7dc7 Milestone 2 Task P.1: PB054 SMT discharge — IndexBound compiles to QF_BV
 9e15116 Milestone 2 Task P: PB054 MVP — detect index sites and emit IndexBound obligations
@@ -98,12 +101,12 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **154 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **160 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --tests` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The 154 breaks down: 1 (spec) + 108 (subset lib) + 16 (integration) + 29 (vc) = 154.
+The 160 breaks down: 1 (spec) + 109 (subset lib) + 16 (integration) + 34 (vc) = 160. The +6 from the 154 baseline are: +1 H-RT1 quoted-symbol-rejection in predicate.rs, +5 N3 (read_capped helpers + process_kill_deadline scaling).
 
 ---
 
@@ -313,7 +316,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 130 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 160 passing.
 ```
 
 If any of these steps fail, the project state is degraded. Don't proceed to new tasks until baseline is green.

@@ -24,9 +24,9 @@
 //! error" so the calling code can fall back to "VC unsolved" rather
 //! than crashing. CI installs Z3 explicitly when verification
 //! coverage is part of the gate.
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 /// Outcome of an SMT solver invocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SolverResult {
@@ -54,6 +54,57 @@ pub enum SolverResult {
 /// Default per-VC timeout. Generous for the v0.2 scaffold; tighten
 /// once we have CI baseline data.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum bytes captured from a child solver's stdout. A
+/// pathological SMT problem can drive Z3 to emit unbounded output
+/// (e.g. via `(get-model)` on a problem with millions of free
+/// constants) and OOM the wrapper. Cap defends against that.
+///
+/// 16 MiB is far more than any well-formed v0.2 problem produces
+/// (verdicts are ~10 bytes; models are at most a few KiB) while
+/// still leaving headroom for legitimate debug output.
+///
+/// Audit-cleanup (audit finding N3, 2026-05-26).
+const STDOUT_CAP_BYTES: u64 = 16 * 1024 * 1024;
+/// Same cap on stderr. Z3's error messages are at most a few KiB
+/// in normal operation; an unbounded stderr usually indicates a
+/// runaway internal panic loop.
+const STDERR_CAP_BYTES: u64 = 1024 * 1024;
+/// Maximum SMT-LIB input length (bytes) the wrapper will accept
+/// from a single obligation. A malicious upstream maintainer who
+/// can write `pitbull.toml` could otherwise add a multi-GB
+/// precondition that — even though F2-validated — would OOM the
+/// wrapper as the writer thread holds the full string until Z3
+/// consumes it.
+///
+/// 64 MiB is far larger than any plausible legitimate SMT
+/// problem (Pitbull's own emission for a single obligation is
+/// under 4 KiB) while still bounding the per-VC memory footprint.
+///
+/// Audit-cleanup (audit finding H-RT3, 2026-05-26).
+const SMT_INPUT_CAP_BYTES: usize = 64 * 1024 * 1024;
+/// OS-level supervisory timeout cushion. The wrapper sets Z3's
+/// internal `:timeout` via SMT-LIB (which only applies during
+/// `(check-sat)`); we add a process-level kill some multiple
+/// later to catch the case where Z3 hangs DURING PARSING (before
+/// the internal timeout becomes effective).
+///
+/// 2.5× the requested timeout gives Z3 plenty of grace for slow
+/// parsing of large problems while still bounding hang risk.
+/// Audit-cleanup (audit finding N3, 2026-05-26 + N3-red-team-followup
+/// finding H5): the absolute ceiling stops misconfigured callers
+/// from producing multi-hour deadlines from misconfigured very-long
+/// SMT timeouts.
+const PROCESS_KILL_DEADLINE_CEILING: Duration = Duration::from_secs(2 * 60 * 60);
+fn process_kill_deadline(smt_timeout: Duration) -> Duration {
+    // 2.5× truncated (integer division), then add 2s for
+    // short-timeout cases; clamp to a 2h absolute ceiling.
+    let scaled = smt_timeout.saturating_mul(5) / 2;
+    let with_grace = scaled.saturating_add(Duration::from_secs(2));
+    with_grace.min(PROCESS_KILL_DEADLINE_CEILING)
+}
+/// Poll interval for `try_wait` while waiting on the child.
+/// 50ms balances responsiveness against CPU burn.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Invoke Z3 with an SMT-LIB problem string on stdin. Returns the
 /// solver's verdict.
 ///
@@ -73,6 +124,21 @@ pub fn invoke_z3(smt: &str) -> SolverResult {
 }
 /// `invoke_z3` with a custom timeout. Mostly for tests that need
 /// a shorter cap.
+///
+/// Timeout semantics (post-audit N3):
+/// - The SMT-LIB `:timeout` option caps the time spent inside
+///   `(check-sat)`. Z3 returns `unknown` when this fires.
+/// - The OS-level kill cushion (`process_kill_deadline`) catches
+///   the case where Z3 hangs BEFORE reaching `(check-sat)` — e.g.
+///   pathologically large SMT problems whose PARSING alone is
+///   unbounded. When this fires the wrapper kills the child and
+///   returns `SolverResult::Timeout`.
+/// - stdout / stderr are captured with hard byte caps. A solver
+///   that emits unbounded output (e.g. `(get-model)` on a
+///   thousand-free-variable problem) cannot OOM the wrapper.
+///   When the cap fires, we return `SolverResult::Error` with a
+///   description rather than risk picking a verdict from
+///   truncated output.
 #[must_use]
 pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
     // Inject the timeout via SMT-LIB's `set-option :timeout`.
@@ -83,6 +149,22 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
     let mut full = String::with_capacity(smt.len() + 64);
     full.push_str(&format!("(set-option :timeout {timeout_ms})\n"));
     full.push_str(smt);
+    // Audit finding H-RT3 (2026-05-26): refuse oversized SMT
+    // input. A malicious pitbull.toml precondition can ship a
+    // multi-gigabyte assertion that F2 validates (it IS a single
+    // balanced `(assert ...)` form) but would OOM the wrapper as
+    // the writer thread holds it in memory. Cap at 64 MiB —
+    // legitimate Pitbull-emitted problems are <4 KiB.
+    if full.len() > SMT_INPUT_CAP_BYTES {
+        return SolverResult::Error(format!(
+            "smt input exceeded {} MiB cap (got {} bytes); refusing \
+             to invoke z3. Pitbull's own emitted problems are under \
+             4 KiB; an input this large indicates a pathological \
+             precondition (see pitbull.toml `[verification.preconditions]`).",
+            SMT_INPUT_CAP_BYTES / (1024 * 1024),
+            full.len(),
+        ));
+    }
     let mut child = match Command::new("z3")
         .arg("-in")
         .stdin(Stdio::piped())
@@ -96,19 +178,139 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
         }
         Err(e) => return SolverResult::Error(format!("spawn z3: {e}")),
     };
-    if let Some(stdin) = child.stdin.as_mut() {
-        if let Err(e) = stdin.write_all(full.as_bytes()) {
-            return SolverResult::Error(format!("write z3 stdin: {e}"));
+    // Move stdin into a dedicated writer thread.
+    //
+    // N3 red-team finding H1: in the previous design, `write_all`
+    // ran on the main thread BEFORE the deadline regime started.
+    // If Z3 hung during parsing (reading stdin slowly or not at
+    // all), `write_all` blocked on a full pipe buffer indefinitely
+    // — defeating the entire point of an OS-level timeout for
+    // pathological large inputs. Spawning the writer means the
+    // poll loop covers it: when the deadline fires and we kill
+    // the child, the writer's pipe-write returns an error and
+    // the writer thread exits.
+    //
+    // We take stdout/stderr handles BEFORE spawning the writer
+    // (so the readers can capture from the start), then move stdin
+    // into the writer. All three handles live on dedicated threads;
+    // the main thread only polls and joins.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdin = child.stdin.take();
+    let stdout_handle = stdout.map(|s| {
+        std::thread::spawn(move || read_capped(s, STDOUT_CAP_BYTES))
+    });
+    let stderr_handle = stderr.map(|s| {
+        std::thread::spawn(move || read_capped(s, STDERR_CAP_BYTES))
+    });
+    let writer_handle = stdin.map(|mut s| {
+        std::thread::spawn(move || {
+            // `write_all` may fail with BrokenPipe if Z3 exits
+            // before we finish writing (e.g. it parsed a malformed
+            // problem and exited early). That's not a wrapper bug
+            // — just convert the io::Error to a string for the
+            // join-side. Successful write returns Ok(()).
+            s.write_all(full.as_bytes())
+            // stdin is dropped here, sending EOF to the child.
+        })
+    });
+    // OS-level kill deadline. Polls `try_wait` until the child
+    // exits or the deadline passes; on deadline, kill the child
+    // and return Timeout. The poll interval (50ms) is short
+    // enough to bound the worst-case overshoot but long enough
+    // to keep CPU burn negligible.
+    let deadline = Instant::now() + process_kill_deadline(timeout);
+    let (exit_status, hit_deadline) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (Some(status), false),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let status = child.wait().ok();
+                    break (status, true);
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => {
+                // N3 red-team finding H2: cleanup before early
+                // return. Kill the child (defensively — try_wait
+                // failed but the child may still be running),
+                // then drain the reader/writer threads so we
+                // don't leak descriptors or detached threads.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_handle.map(std::thread::JoinHandle::join);
+                let _ = stderr_handle.map(std::thread::JoinHandle::join);
+                let _ = writer_handle.map(std::thread::JoinHandle::join);
+                return SolverResult::Error(format!("try_wait z3: {e}"));
+            }
+        }
+    };
+    // N3 red-team finding M1: a panicked reader thread used to
+    // be coerced to `Ok((Vec::new(), false))` — the downstream
+    // verdict parser then saw no verdict line and emitted
+    // "no verdict from z3" with no clue that the OUR thread
+    // crashed. For a soundness-critical verifier, opacity is
+    // bad audit posture. Now we propagate the panic as a
+    // distinguishable Error message.
+    let stdout_result = match stdout_handle {
+        Some(h) => h.join().unwrap_or_else(|_| {
+            Err(std::io::Error::other("stdout reader thread panicked"))
+        }),
+        None => Ok((Vec::new(), false)),
+    };
+    let stderr_result = match stderr_handle {
+        Some(h) => h.join().unwrap_or_else(|_| {
+            Err(std::io::Error::other("stderr reader thread panicked"))
+        }),
+        None => Ok((Vec::new(), false)),
+    };
+    // The writer thread's result is consulted only on the
+    // non-deadline path. On deadline, the writer almost
+    // certainly hit BrokenPipe when we killed the child — that's
+    // expected, not a failure. We still join to reap the thread.
+    //
+    // Audit finding M-RT3 (2026-05-26): mirror M1's reader-thread
+    // panic handling. A writer-thread panic (e.g. OOM mid-write)
+    // is now distinguishable from a clean exit; previously, both
+    // collapsed to `None`.
+    let writer_result = writer_handle.map(|h| {
+        h.join().unwrap_or_else(|_| {
+            Err(std::io::Error::other("stdin writer thread panicked"))
+        })
+    });
+    let (stdout_bytes, stdout_capped) = match stdout_result {
+        Ok(v) => v,
+        Err(e) => return SolverResult::Error(format!("read z3 stdout: {e}")),
+    };
+    let (stderr_bytes, _stderr_capped) = match stderr_result {
+        Ok(v) => v,
+        Err(e) => return SolverResult::Error(format!("read z3 stderr: {e}")),
+    };
+    // N3 red-team finding H3 (carried through to the threaded
+    // design): if the writer failed for a reason OTHER than
+    // BrokenPipe (the expected outcome when Z3 closes its stdin
+    // early or when we kill it), surface as Error. BrokenPipe
+    // is normal — Z3 may finish parsing before we finish writing.
+    if !hit_deadline {
+        if let Some(Err(e)) = &writer_result {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                return SolverResult::Error(format!("write z3 stdin: {e}"));
+            }
         }
     }
-    // Close stdin by dropping the handle so Z3 sees EOF and
-    // processes the (check-sat).
-    drop(child.stdin.take());
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => return SolverResult::Error(format!("wait z3: {e}")),
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    if hit_deadline {
+        return SolverResult::Timeout;
+    }
+    if stdout_capped {
+        return SolverResult::Error(format!(
+            "z3 stdout exceeded {} MiB cap; refusing to interpret \
+             possibly-truncated verdict. This usually indicates a \
+             pathological SMT problem (e.g. unbounded model output).",
+            STDOUT_CAP_BYTES / (1024 * 1024),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     // Audit hardening (red-team finding F9): a well-formed problem
     // produces EXACTLY ONE verdict line. Multiple verdicts mean
     // either (a) an injected `(check-sat)` directive snuck through
@@ -130,20 +332,21 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
         [] => {
             // No verdict line at all. Inspect the rest of the
             // output to characterize the failure for the auditor.
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+            let status_success = exit_status.is_some_and(|s| s.success());
+            let status_code = exit_status.and_then(|s| s.code());
             if stdout.contains("error") || stderr_str.contains("error") {
                 SolverResult::Error(format!(
                     "z3 emitted no verdict; output contained errors. \
                      stdout: {stdout:?}, stderr: {stderr_str:?}",
                 ))
-            } else if output.status.success() {
+            } else if status_success {
                 SolverResult::Error(format!(
                     "no verdict from z3 (stdout: {stdout:?}, stderr: {stderr_str:?})",
                 ))
             } else {
                 SolverResult::Error(format!(
-                    "z3 exited {:?} with no verdict in output: {stdout}",
-                    output.status.code(),
+                    "z3 exited {status_code:?} with no verdict in output: {stdout}",
                 ))
             }
         }
@@ -159,6 +362,45 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
             ))
         }
     }
+}
+/// Read from `reader` into a Vec, capping at `cap_bytes`. Returns
+/// `Ok((bytes, was_capped))` where `was_capped == true` if the
+/// reader produced AT LEAST `cap_bytes` of output (the function
+/// stops reading at that point).
+///
+/// Implementation note: we read in 8 KiB chunks rather than using
+/// `Read::take` + `read_to_end` so we can distinguish "exactly
+/// cap_bytes" (reader had more) from "less than cap_bytes" (reader
+/// reached EOF on its own). The `Take` adapter doesn't expose that
+/// distinction directly.
+///
+/// Audit-cleanup (audit finding N3, 2026-05-26): used by
+/// `invoke_z3_with_timeout` to defend against pathological SMT
+/// problems that drive Z3 to unbounded output.
+fn read_capped<R: Read>(mut reader: R, cap_bytes: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    // Cap the underlying reader at cap_bytes + 1: the extra byte
+    // lets us detect "reader had more than cap" by checking
+    // bytes.len() > cap_bytes after the read.
+    let read_limit = cap_bytes.saturating_add(1);
+    let mut limited = reader.by_ref().take(read_limit);
+    let mut buf = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match limited.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let was_capped = buf.len() as u64 > cap_bytes;
+    if was_capped {
+        // Trim the tell-tale extra byte so the returned buffer
+        // matches the documented cap. The caller uses
+        // `was_capped` to decide whether to interpret the output.
+        buf.truncate(cap_bytes as usize);
+    }
+    Ok((buf, was_capped))
 }
 #[cfg(test)]
 mod tests {
@@ -256,6 +498,63 @@ mod tests {
                 "expected Error (refuse multi-verdict) or NotInstalled; got {other:?}",
             ),
         }
+    }
+    // ----- audit finding N3: timeout + output cap tests -----------------
+    /// `read_capped` returns the full reader contents when they fit
+    /// under the cap. `was_capped` is false in that case.
+    #[test]
+    fn read_capped_under_cap_returns_full_bytes() {
+        let data = b"hello world".to_vec();
+        let (out, capped) = read_capped(data.as_slice(), 1024).expect("read");
+        assert_eq!(out, data);
+        assert!(!capped);
+    }
+    /// `read_capped` stops at the cap and reports it. The returned
+    /// buffer is exactly `cap_bytes` long; the source-reader bytes
+    /// beyond that are NOT returned.
+    #[test]
+    fn read_capped_at_cap_truncates_and_reports() {
+        // 100 KiB source, 10 KiB cap.
+        let data = vec![b'A'; 100 * 1024];
+        let cap = 10 * 1024;
+        let (out, capped) = read_capped(data.as_slice(), cap).expect("read");
+        assert!(capped, "should report capped when source exceeds cap");
+        assert_eq!(out.len() as u64, cap, "buffer should be exactly cap bytes");
+        assert!(out.iter().all(|&b| b == b'A'));
+    }
+    /// `read_capped` on an empty reader returns an empty buffer and
+    /// reports not-capped.
+    #[test]
+    fn read_capped_empty_reader() {
+        let data: &[u8] = b"";
+        let (out, capped) = read_capped(data, 1024).expect("read");
+        assert!(out.is_empty());
+        assert!(!capped);
+    }
+    /// `read_capped` with EXACTLY `cap_bytes` available reports
+    /// not-capped (the boundary is `> cap_bytes`, not `>=`).
+    #[test]
+    fn read_capped_exactly_at_cap_not_reported_as_capped() {
+        let data = vec![b'X'; 100];
+        let (out, capped) = read_capped(data.as_slice(), 100).expect("read");
+        assert_eq!(out.len(), 100);
+        assert!(
+            !capped,
+            "exactly-cap reader should NOT report capped — only OVER-cap does",
+        );
+    }
+    /// Process-kill deadline grows with the SMT-LIB timeout: a 1s
+    /// SMT timeout gives the process 2 + 2.5 = 4.5s before OS-level
+    /// kill; a 10s SMT timeout gives 27s. The scaling factor is part
+    /// of the audit-cleanup N3 contract.
+    #[test]
+    fn process_kill_deadline_scales_with_timeout() {
+        let d = process_kill_deadline(Duration::from_secs(1));
+        assert!(d >= Duration::from_secs(4), "1s timeout → ≥4s deadline; got {d:?}");
+        assert!(d <= Duration::from_secs(5), "1s timeout → ≤5s deadline; got {d:?}");
+        let d = process_kill_deadline(Duration::from_secs(10));
+        assert!(d >= Duration::from_secs(27), "10s timeout → ≥27s deadline; got {d:?}");
+        assert!(d <= Duration::from_secs(28), "10s timeout → ≤28s deadline; got {d:?}");
     }
     /// Unsat path: constrain the inputs so overflow is impossible
     /// and confirm Z3 returns unsat.

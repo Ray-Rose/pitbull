@@ -283,6 +283,20 @@ impl<'cfg> SubsetVisitor<'cfg> {
             }
             self.visit_terminator(&block.terminator);
         }
+        // Audit finding H-RT2 (2026-05-26): clear preconditions
+        // at body exit so the next `visit_body` cannot
+        // accidentally inherit them. The wrapper calls
+        // `set_current_preconditions` before every `visit_body`
+        // — clearing here is a belt-and-suspenders guard for
+        // future callers (alt-drivers, tests, refactors) that
+        // might forget. If a caller relies on the same
+        // preconditions across N bodies, it must explicitly
+        // call `set_current_preconditions` before each one.
+        //
+        // We DON'T clear at body ENTRY because the wrapper's
+        // contract is "set, then visit" — clearing at entry
+        // would zero out what was just set.
+        self.current_body_preconditions.clear();
     }
     // -------------------------------------------------------------------------
     // Statement dispatch — exhaustive over all 13 StatementKind variants.

@@ -19,9 +19,12 @@ qualification. That target is tracked separately.
 2. Pick a unique slug that names the *what*, not the *why*.
 3. Drop the file in `reject/` or `accept/`.
 4. The integration tests pick it up automatically on the next run.
-## When real MIR ingestion lands
-The integration test `corpus_runs_full_pipeline` is currently marked
-`#[ignore]` because the v0.1 skeleton does not yet drive `rustc_public`.
-When that wiring lands (milestone 2), the `#[ignore]` comes off and the
-corpus runs end-to-end. The corpus content does not change with that
-transition; only the test driver does.
+## End-to-end via `corpus_runs_full_pipeline`
+The integration test `corpus_runs_full_pipeline` (Milestone 2 Task C,
+commit `50ec60d`) walks every corpus file through the real
+`pitbull-rustc` wrapper subprocess. It runs by default when both the
+nightly wrapper and the nightly toolchain are present; if either is
+missing, it skips gracefully unless `PITBULL_REQUIRE_E2E=1` is set
+(see HANDOFF.md §4 for the build incantation and §7 for the
+`KNOWN_UNIMPLEMENTED_REJECT` / `KNOWN_UNDISCHARGED_ACCEPT` skip lists
+covering rules that are not yet discharged end-to-end).
