@@ -1092,6 +1092,15 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
     /// `visit_block` runs from the direct visit_impl_item
     /// call's walk_impl_item recursion (which we DON'T skip).
     fn visit_nested_impl_item(&mut self, _id: rustc_hir::ImplItemId) {}
+    /// Same rationale as `visit_nested_impl_item` above, applied to
+    /// trait items (default methods). `hir_visit_all_item_likes_in_crate`
+    /// directly calls `visit_trait_item` for every trait item; the
+    /// `walk_item(ItemKind::Trait)` recursion under `NestedFilter::All`
+    /// would also call it via `visit_nested_trait_item`. Without this
+    /// override, PB001 unsafe-block detection inside trait default
+    /// methods would double-fire (audit-cleanup post-Q.3 red-team
+    /// finding M-RT-Q.2 / 2026-05-26).
+    fn visit_nested_trait_item(&mut self, _id: rustc_hir::TraitItemId) {}
     fn visit_impl_item(&mut self, ii: &'tcx rustc_hir::ImplItem<'tcx>) {
         if let rustc_hir::ImplItemKind::Fn(..) = ii.kind {
             let pitbull = rustc_span::Symbol::intern("pitbull");

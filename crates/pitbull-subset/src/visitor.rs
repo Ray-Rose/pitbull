@@ -273,8 +273,18 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 );
             }
         }
-        // Trusted bodies: signature-only check stops here.
+        // Trusted bodies: signature-only check stops here. The
+        // precondition clear (H-RT2 below) MUST run before this
+        // return so the belt-and-suspenders guarantee holds for
+        // trusted bodies too. Audit-cleanup post-Q.3 red-team
+        // finding M-RT-Q.C (2026-05-26): pre-cleanup the clear
+        // ran AFTER the trust early-return, so a trusted body
+        // followed by an untrusted body that forgot to call
+        // `set_current_preconditions` would leak. Not exploitable
+        // today (the wrapper always sets) but a documented
+        // guarantee silently didn't hold.
         if self.current_body_trusted {
+            self.current_body_preconditions.clear();
             return;
         }
         for block in &body.blocks {

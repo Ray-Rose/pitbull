@@ -266,9 +266,21 @@ pub fn emit_index_bound_problem_with_assumptions(
     // SMT-LIB quoted-symbol syntax so any Rust identifier is
     // syntactically valid in the SMT problem (audit finding F4).
     if let Some(name) = idx_alias {
-        smt.push_str(&format!(
-            "(define-fun |{name}| () (_ BitVec {INDEX_SMT_BITS}) __pb_idx)\n",
-        ));
+        // Skip when the source-arg name collides with one of the
+        // canonical user-facing aliases `idx` or `len`. Per SMT-LIB
+        // 2.6 §3.1, `idx` and `|idx|` denote the SAME symbol, so
+        // emitting both `(define-fun idx () ...)` and
+        // `(define-fun |idx| () ...)` produces a duplicate-symbol
+        // parse error from Z3 → SolverResult::Error → undischarged
+        // verdict with no clear cause for the user. Audit-cleanup
+        // post-Q.3 red-team finding M-RT-Q.B (2026-05-26): the
+        // canonical aliases already cover the case `arg name == idx`,
+        // so we just skip the source-name alias when it would collide.
+        if name != "idx" && name != "len" {
+            smt.push_str(&format!(
+                "(define-fun |{name}| () (_ BitVec {INDEX_SMT_BITS}) __pb_idx)\n",
+            ));
+        }
     }
     for assumption in assumptions {
         smt.push_str(assumption);
@@ -320,9 +332,21 @@ pub fn emit_index_bound_consistency_check(
          (define-fun len () (_ BitVec {INDEX_SMT_BITS}) __pb_len)\n",
     );
     if let Some(name) = idx_alias {
-        smt.push_str(&format!(
-            "(define-fun |{name}| () (_ BitVec {INDEX_SMT_BITS}) __pb_idx)\n",
-        ));
+        // Skip when the source-arg name collides with one of the
+        // canonical user-facing aliases `idx` or `len`. Per SMT-LIB
+        // 2.6 §3.1, `idx` and `|idx|` denote the SAME symbol, so
+        // emitting both `(define-fun idx () ...)` and
+        // `(define-fun |idx| () ...)` produces a duplicate-symbol
+        // parse error from Z3 → SolverResult::Error → undischarged
+        // verdict with no clear cause for the user. Audit-cleanup
+        // post-Q.3 red-team finding M-RT-Q.B (2026-05-26): the
+        // canonical aliases already cover the case `arg name == idx`,
+        // so we just skip the source-name alias when it would collide.
+        if name != "idx" && name != "len" {
+            smt.push_str(&format!(
+                "(define-fun |{name}| () (_ BitVec {INDEX_SMT_BITS}) __pb_idx)\n",
+            ));
+        }
     }
     for assumption in assumptions {
         smt.push_str(assumption);
@@ -532,25 +556,43 @@ mod tests {
             "alias must come before safety predicate; alias={alias}, safety={safety}",
         );
     }
-    /// Audit-cleanup F3+F4: an alias name equal to `idx` or
-    /// `len` (e.g. `fn at(s: &[u8], idx: usize)` — arg named
-    /// `idx`) is now ACCEPTED rather than silently dropped.
-    /// The user-facing names `idx` and `len` are themselves
-    /// `define-fun` aliases over `__pb_idx`/`__pb_len`, so the
-    /// arg-source alias `|idx|` coexists without name
-    /// collision. Pre-cleanup, the alias was dropped silently
-    /// — the user's precondition referring to `idx` bound to
-    /// the canonical SMT name with no warning. Post-cleanup,
-    /// the alias is emitted as `|idx|` (quoted-symbol syntax),
-    /// and `idx`-the-alias is distinct from `|idx|`-the-arg-
-    /// alias even though they both forward to `__pb_idx`.
+    /// Audit-cleanup post-Q.3 red-team finding M-RT-Q.B
+    /// (2026-05-26): when the source-arg name is `idx` or `len`,
+    /// the source-name alias is SKIPPED to avoid a duplicate
+    /// define-fun (per SMT-LIB 2.6 §3.1, `idx` and `|idx|`
+    /// denote the SAME symbol — emitting both produces a Z3
+    /// parse error → solver error → undischarged with no clear
+    /// cause). The earlier F3 fix mistakenly thought `|idx|`
+    /// and `idx` were distinct quoted vs simple symbols; the
+    /// red-team caught this. The canonical user-facing aliases
+    /// `idx` / `len` already cover the case — when arg is named
+    /// `idx`, user preconditions referencing `idx` correctly
+    /// resolve via the canonical alias.
     #[test]
-    fn index_bound_alias_with_canonical_name_is_accepted() {
-        for arg_name in ["idx", "len", "i", "x", "my_var"] {
+    fn index_bound_alias_with_canonical_name_skipped() {
+        for collision in ["idx", "len"] {
+            let smt = emit_index_bound_problem_with_assumptions(Some(collision), &[]);
+            // The canonical alias `(define-fun idx () ... __pb_idx)`
+            // is still present (that's the always-emitted one).
+            // What MUST NOT be present is a DUPLICATE source-name
+            // alias `(define-fun |idx| () ... __pb_idx)`.
+            assert!(
+                !smt.contains(&format!("(define-fun |{collision}|")),
+                "arg name `{collision}` collides with canonical alias; source-name \
+                 alias must be skipped to avoid Z3 duplicate-define-fun error. Got:\n{smt}",
+            );
+        }
+    }
+    /// Non-collision arg names still produce the source-name
+    /// alias (the normal Q.3-supported path).
+    #[test]
+    fn index_bound_alias_with_non_canonical_name_emitted() {
+        for arg_name in ["i", "x", "my_var", "index_value"] {
             let smt = emit_index_bound_problem_with_assumptions(Some(arg_name), &[]);
             assert!(
                 smt.contains(&format!("(define-fun |{arg_name}| () (_ BitVec 64) __pb_idx)")),
-                "arg name `{arg_name}` should produce a quoted-symbol alias to __pb_idx; got:\n{smt}",
+                "non-collision arg name `{arg_name}` must produce the quoted-symbol \
+                 alias; got:\n{smt}",
             );
         }
     }

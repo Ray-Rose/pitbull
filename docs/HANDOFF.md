@@ -20,12 +20,17 @@ the deep audit. Branch `main`, local repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch (Z3 today). See `docs/PSS-1.md` for the
   specification.
-- **State:** 160 tests passing, both lanes warning-clean, clippy
-  clean. Milestone-2 work through Tasks P.2 is done — including:
-  the v0.2 deductive backend (Tasks M + N), spec-context narrowing
-  (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
-  and the post-audit cleanups closing F1 / F2 / F7 / H3 / N1 / N2
-  / N3 / F3 / F4 / F8 / F11 / H-RT1 / H-RT2 / H-RT3 / M-RT3.
+- **State:** 177 tests passing, both lanes warning-clean, clippy
+  clean. Milestone-2 work through Tasks P.2 + Q.3 is done —
+  including: the v0.2 deductive backend (Tasks M + N), spec-context
+  narrowing (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge
+  (P / P.1 / P.2), the predicate-grammar `<ident> <cmp> <ident>`
+  extension (Phase B), `#[pitbull::trusted]` (Q.1) with adapter
+  fix for `is_unsafe`/`is_async`, impl-method attribute extraction
+  (Q.2), expression-form attributes (Q.3), and the post-audit
+  cleanups closing F1 / F2 / F7 / H3 / N1 / N2 / N3 / F3 / F4 /
+  F8 / F11 / H-RT1 / H-RT2 / H-RT3 / M-RT3 / M-RT-Q.A / M-RT-Q.B
+  / M-RT-Q.C / M-RT-Q.D.
 - **Next task:** Pick a strategic direction from Section 5's menu.
   PB049 overflow and PB054 index-bound both discharge end-to-end
   under Z3 with preconditions in `pitbull.toml`. Reasonable next
@@ -101,12 +106,12 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **160 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **177 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --tests` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The 160 breaks down: 1 (spec) + 109 (subset lib) + 16 (integration) + 34 (vc) = 160. The +6 from the 154 baseline are: +1 H-RT1 quoted-symbol-rejection in predicate.rs, +5 N3 (read_capped helpers + process_kill_deadline scaling).
+The 177 breaks down: 1 (spec/cargo-pitbull bin) + 116 (subset lib) + 25 (integration) + 35 (vc) = 177. Compared to the 160-baseline at commit 0767285: +7 subset (Phase B grammar tests + Q-series), +9 integration (Phase B + Q.1 + Q.2 + Q.3 e2e + audit-cleanup pins), +1 vc (M-RT-Q.B alias-collision skip test).
 
 ---
 
@@ -316,7 +321,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 160 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 177 passing.
 ```
 
 If any of these steps fail, the project state is degraded. Don't proceed to new tasks until baseline is green.

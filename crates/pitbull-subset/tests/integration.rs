@@ -744,6 +744,54 @@ fn pitbull_requires_attribute_attaches_precondition() {
          stderr; got:\n{stderr}",
     );
 }
+/// Audit-cleanup post-Q.3 red-team finding M-RT-Q.D (2026-05-26):
+/// Q.2's commit message asserted PB001 unsafe-block detection
+/// inside impl methods still works, but no integration test
+/// pinned the behavior. Verify: an impl method containing
+/// `unsafe { ... }` produces exactly one PB001 violation.
+#[test]
+fn pb001_fires_inside_impl_method() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pb001_fires_inside_impl_method: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q2-impl-pb001-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "pub struct Foo;\n\
+         impl Foo {\n\
+             pub fn bar(&self) {\n\
+                 unsafe { let _ptr: *const u8 = std::ptr::null(); }\n\
+             }\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) = run_one_corpus_file_full(&env, &probe_rs, &[])
+        .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    // Exactly one PB001 — defeats Q.2's potential double-fire.
+    let pb001_count = stderr.matches("PB001").count();
+    assert!(
+        pb001_count >= 1,
+        "PB001 must fire on `unsafe {{ ... }}` inside impl method; got {pb001_count} matches \
+         in stderr:\n{stderr}",
+    );
+    // Note: stderr may mention PB001 multiple times across rule
+    // descriptions, error tags, etc. The "1 unsafe blocks" summary
+    // line is the canonical count of distinct blocks detected.
+    assert!(
+        stderr.contains("1 unsafe blocks"),
+        "Q.2 regression pin: expected exactly 1 unsafe block detected; \
+         got stderr:\n{stderr}",
+    );
+}
 /// Task Q.3 (2026-05-26): expression-form
 /// `#[pitbull::requires(x < 100)]` (NO quotes) is extracted via
 /// the new token-tree pretty-printing path in

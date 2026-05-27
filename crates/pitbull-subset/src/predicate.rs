@@ -3,8 +3,10 @@
 //! ## Grammar
 //!
 //! ```text
-//! predicate := ws? ident ws? cmp_op ws? int_literal ws?
-//!            | ws? int_literal ws? cmp_op ws? ident ws?
+//! predicate    := ident_vs_lit | ident_vs_ident
+//! ident_vs_lit := ws? ident ws? cmp_op ws? int_literal ws?
+//!               | ws? int_literal ws? cmp_op ws? ident ws?
+//! ident_vs_ident := ws? ident ws? cmp_op ws? ident ws?    (Phase B)
 //! ident        := [a-zA-Z_] [a-zA-Z0-9_]*
 //! cmp_op       := "<" | "<=" | ">" | ">=" | "==" | "!="
 //! int_literal  := "-"? [0-9]+   (parsed as i128; range-checked at
@@ -17,6 +19,13 @@
 //! (`{ var: "x", op: Lt, lit: 100 }`); the reversed form is
 //! normalized via `CmpOp::flip` so downstream code only sees the
 //! ident-first form.
+//!
+//! `i < len`-style ident-vs-ident parses to a separate
+//! `IdentVsIdentPredicate` type (Phase B addition, 2026-05-26).
+//! Both sides are emitted VERBATIM as SMT symbols; the caller
+//! ensures they resolve via `declare-const` or `define-fun` in
+//! the surrounding SMT problem. There is no flip-normalization
+//! for ident-vs-ident (no canonical "left ident").
 //!
 //! ## Why not full Rust expression syntax
 //!
