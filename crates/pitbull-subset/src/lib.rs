@@ -65,4 +65,4 @@ pub use visitor::SubsetVisitor;
 /// Pitbull subset specification version this crate enforces.
 pub const PSS_VERSION: &str = "PSS-1";
 /// Number of rules defined in PSS-1.
-pub const RULE_COUNT: usize = 75;
+pub const RULE_COUNT: usize = 76;

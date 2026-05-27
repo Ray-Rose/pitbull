@@ -261,6 +261,13 @@ pub const PB073: RuleId = RuleId(73);
 pub const PB074: RuleId = RuleId(74);
 /// Cache signature verification.
 pub const PB075: RuleId = RuleId(75);
+/// Postcondition unmet. Task Q.4 (2026-05-26): added when
+/// `#[pitbull::ensures("...")]` attribute coverage landed.
+/// Category F (Control flow) — the postcondition's truth value
+/// at every function exit (every `return`, including the
+/// implicit return at end-of-body) must be provable from the
+/// body's effects and the precondition set.
+pub const PB076: RuleId = RuleId(76);
 // -----------------------------------------------------------------------------
 // The rule registry. Order is significant for reporting: rules appear in
 // numeric order, grouped by category, mirroring `docs/PSS-1.md`.
@@ -730,6 +737,17 @@ pub const RULES: &[Rule] = &[
         rationale: "Defense against cache poisoning.",
         future: FuturePlan::Permanent,
     },
+    // --- Category L (extends F): Postconditions -----------------------------
+    // Task Q.4 (2026-05-26): added when `#[pitbull::ensures(...)]`
+    // attribute coverage landed. v0.2 MVP emits the obligation;
+    // `pitbull-vc::compile` returns None (pending) until the
+    // body-effect encoder lands in Q.4a.
+    Rule {
+        id: PB076, title: "postcondition unmet",
+        category: Category::ControlFlow, severity: Severity::Error,
+        rationale: "Spec-declared exit condition must hold at every return.",
+        future: FuturePlan::Permanent,
+    },
 ];
 /// Look up a rule by id. Panics in debug, returns `None` in release if the id
 /// is unknown — callers should refer to rules through the `PB001`-style
@@ -771,6 +789,7 @@ mod tests {
             PB059, PB060, PB061, PB062, PB063,
             PB064, PB065, PB066, PB067, PB068, PB069, PB070,
             PB071, PB072, PB073, PB074, PB075,
+            PB076,
         ];
         assert_eq!(constants.len(), RULES.len());
         for (k, c) in constants.iter().enumerate() {

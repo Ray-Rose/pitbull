@@ -133,6 +133,23 @@ pub struct SubsetVisitor<'cfg> {
     /// updating between bodies (typical pattern: per-item lookup
     /// in `pitbull.toml`'s `[verification.preconditions]` table).
     current_body_preconditions: Vec<String>,
+    /// Spec-derived POSTCONDITIONS for the currently-walked body —
+    /// raw `#[pitbull::ensures("...")]` strings (Q.4, 2026-05-26).
+    /// Each must hold at every function exit (TerminatorKind::Return).
+    /// Set externally before `visit_body` via `set_current_ensures`;
+    /// cleared on body exit per the H-RT2 audit-cleanup pattern
+    /// (clears even on the trusted-body early-return — see Q.C fix
+    /// in visit_body).
+    current_body_ensures: Vec<String>,
+    /// Return-value type of the currently-walked body — used by
+    /// `emit_ensures_obligation` to size the SMT bit-vector for
+    /// the `result` binding. Set in `visit_body` from
+    /// `body.return_ty`; reset on body exit alongside the other
+    /// per-body fields. None when the return type isn't a
+    /// primitive integer (audit-note posture: obligation still
+    /// emits with empty `ret_ty_name`, the future encoder skips
+    /// non-int return types with a separate audit note).
+    current_body_return_ty: Option<crate::mir_api::Ty>,
     /// Whether the current body has been declared `#[pitbull::trusted]`.
     /// Trusted bodies are exempt from body-level checks but their *signatures*
     /// are still subject to PSS-1.
@@ -153,6 +170,8 @@ impl<'cfg> SubsetVisitor<'cfg> {
             current_body_locals: Vec::new(),
             current_body_arg_names: Vec::new(),
             current_body_preconditions: Vec::new(),
+            current_body_ensures: Vec::new(),
+            current_body_return_ty: None,
             current_body_trusted: false,
             in_spec_context: false,
         }
@@ -167,6 +186,20 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// across.
     pub fn set_current_preconditions(&mut self, preconditions: Vec<String>) {
         self.current_body_preconditions = preconditions;
+    }
+    /// Install the postcondition list for the next `visit_body`
+    /// call. Mirror of `set_current_preconditions` for the
+    /// `#[pitbull::ensures("...")]` path (Q.4, 2026-05-26).
+    ///
+    /// The wrapper looks up the item being walked in
+    /// `cfg.verification.ensures` (config-side) and the HIR
+    /// pre-pass's `ensures` map (attribute-side), merges them,
+    /// and passes the result here. Just like preconditions, the
+    /// list is cleared on body exit so a future caller that
+    /// forgets to call this between bodies inherits no stale
+    /// ensures — see the H-RT2/M-RT-Q.C pattern.
+    pub fn set_current_ensures(&mut self, ensures: Vec<String>) {
+        self.current_body_ensures = ensures;
     }
     /// Finalize the visit, producing a report. Transfers errors
     /// (subset violations), audit notes (informational gaps), and
@@ -240,6 +273,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // binding to map predicate variables (`x` in `x < 100`) to
         // operand positions (lhs/rhs of the binary op).
         self.current_body_arg_names.clone_from(&body.arg_names);
+        // Q.4 (2026-05-26): cache the return type so
+        // `emit_ensures_obligation` can size the SMT bit-vector
+        // for `result`. Cleared on body exit alongside other
+        // per-body fields.
+        self.current_body_return_ty = Some(body.return_ty.clone());
         // PB002: unsafe fn definitions are rejected outright. Even trusted
         // functions cannot be unsafe in v0.1; trust is for spec assumption,
         // not for `unsafe` admission.
@@ -284,7 +322,22 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // today (the wrapper always sets) but a documented
         // guarantee silently didn't hold.
         if self.current_body_trusted {
-            self.current_body_preconditions.clear();
+            // Q.4 (2026-05-26): on a trusted body, ensures
+            // strings would otherwise be silently ignored — we
+            // skip emitting the obligation (trust means
+            // body-content is assumed correct), but surface an
+            // audit note so the gap is VISIBLE. Caller-side
+            // propagation of trusted ensures (so callers can use
+            // them as hypotheses) is out of scope for the MVP.
+            if !self.current_body_ensures.is_empty() {
+                self.audit_note(
+                    body.span,
+                    "PB076: ensures on trusted body — assumed but not \
+                     proven; caller-side propagation of trusted \
+                     postconditions is out of scope for the v0.2 MVP",
+                );
+            }
+            self.clear_per_body_state();
             return;
         }
         for block in &body.blocks {
@@ -296,17 +349,25 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // Audit finding H-RT2 (2026-05-26): clear preconditions
         // at body exit so the next `visit_body` cannot
         // accidentally inherit them. The wrapper calls
-        // `set_current_preconditions` before every `visit_body`
-        // — clearing here is a belt-and-suspenders guard for
-        // future callers (alt-drivers, tests, refactors) that
-        // might forget. If a caller relies on the same
-        // preconditions across N bodies, it must explicitly
-        // call `set_current_preconditions` before each one.
+        // `set_current_preconditions` (and Q.4 `set_current_ensures`)
+        // before every `visit_body` — clearing here is a
+        // belt-and-suspenders guard for future callers
+        // (alt-drivers, tests, refactors) that might forget.
         //
         // We DON'T clear at body ENTRY because the wrapper's
         // contract is "set, then visit" — clearing at entry
         // would zero out what was just set.
+        self.clear_per_body_state();
+    }
+    /// Clear per-body state that's set externally before
+    /// `visit_body`. Run at body exit AND before the
+    /// trusted-body early-return so the H-RT2 belt-and-suspenders
+    /// guarantee holds uniformly. (Audit finding M-RT-Q.C
+    /// 2026-05-26.)
+    fn clear_per_body_state(&mut self) {
         self.current_body_preconditions.clear();
+        self.current_body_ensures.clear();
+        self.current_body_return_ty = None;
     }
     // -------------------------------------------------------------------------
     // Statement dispatch — exhaustive over all 13 StatementKind variants.
@@ -427,8 +488,17 @@ impl<'cfg> SubsetVisitor<'cfg> {
                     "unwinding terminator present; project must use `panic = \"abort\"`",
                 );
             }
-            // Plain return. Accepted.
-            TerminatorKind::Return => {}
+            // Plain return. Accepted, but Q.4 (2026-05-26) emits
+            // a `PB076 EnsuresPostcondition` obligation here if
+            // the current body has non-empty
+            // `current_body_ensures`. One obligation per return
+            // point (a body with multiple early-returns produces
+            // N obligations sharing the postcondition list and
+            // body-effect summary, but with distinct
+            // span+sequence ids).
+            TerminatorKind::Return => {
+                self.emit_ensures_obligation(term.span);
+            }
             // Unreachable: the verifier's job is to *prove* that this point
             // is dead. Reaching this terminator at runtime is UB; the v0.1
             // AoRTE proof obligation enforces it. The subset visitor accepts
@@ -1587,6 +1657,84 @@ impl<'cfg> SubsetVisitor<'cfg> {
         });
         for msg in pending_audit_notes {
             self.audit_note(span, msg);
+        }
+    }
+    /// Emit a `PB076 EnsuresPostcondition` VC obligation at a
+    /// `TerminatorKind::Return`. Task Q.4 (2026-05-26).
+    ///
+    /// Only emits when `current_body_ensures` is non-empty. The
+    /// obligation carries:
+    /// - `ret_name = "result"` (Creusot's lowercase convention)
+    /// - `ret_ty_name = primitive_int_name_from_ty(&body.return_ty)`
+    ///   or empty string when the return type isn't a primitive
+    ///   integer (the future encoder rejects non-int return types
+    ///   with an audit note rather than producing a malformed
+    ///   SMT problem).
+    ///
+    /// `assumptions` is the merge of preconditions (carried for
+    /// caller-context propagation) plus each ensures string,
+    /// each passing F2 lex validation before attachment. The
+    /// `pitbull-vc::compile` returns `None` for the MVP; the
+    /// wrapper surfaces each obligation as "pending". The
+    /// body-effect encoder that produces a real SMT problem
+    /// lands in Q.4a.
+    ///
+    /// Obligation id format: `pb076-ensures-{seq}`.
+    fn emit_ensures_obligation(&mut self, term_span: Span) {
+        if self.current_body_ensures.is_empty() {
+            return;
+        }
+        let seq = self.vc_obligations.len();
+        let id = format!("pb076-ensures-{seq}");
+        // Resolve the return type name. None means non-primitive
+        // (e.g. struct, tuple, slice) — we still emit the
+        // obligation so the auditor sees the gap, but the
+        // ret_ty_name is empty and the future encoder will skip
+        // the SMT problem with a separate "unsupported return
+        // type" audit note.
+        let ret_ty_name = self
+            .current_body_return_ty
+            .as_ref()
+            .and_then(primitive_int_name_from_ty)
+            .unwrap_or_default();
+        // F2 lex validation on each ensures string + caller-side
+        // preconditions. Mirror of the PB054 dispatcher's audit
+        // posture (no silent skips). For the MVP we only do the
+        // raw-SMT validation path; the predicate-grammar
+        // dispatch lands in Q.4a together with the body-effect
+        // encoder so we can bind `result` to a real SMT
+        // expression.
+        let mut assumptions: Vec<String> = Vec::with_capacity(
+            self.current_body_preconditions.len() + self.current_body_ensures.len(),
+        );
+        let mut pending_audit_notes: Vec<String> = Vec::new();
+        for raw in self.current_body_preconditions.iter()
+            .chain(self.current_body_ensures.iter())
+        {
+            match crate::predicate::validate_assertion_form(raw) {
+                Ok(()) => assumptions.push(raw.clone()),
+                Err(e) => {
+                    pending_audit_notes.push(format!(
+                        "PB076: rejecting precondition/ensures string \
+                         (not a valid SMT-LIB `(assert ...)` form for \
+                         the MVP encoder — Q.4a's predicate-grammar \
+                         dispatcher will handle `result < 101`-style \
+                         forms): {e} — input: {raw:?}",
+                    ));
+                }
+            }
+        }
+        self.vc_obligations.push(crate::vc::VcObligation {
+            id,
+            span: term_span,
+            kind: crate::vc::VcObligationKind::EnsuresPostcondition {
+                ret_name: "result".into(),
+                ret_ty_name,
+            },
+            assumptions,
+        });
+        for msg in pending_audit_notes {
+            self.audit_note(term_span, msg);
         }
     }
     /// Resolve an operand to its source-level parameter name when

@@ -97,9 +97,16 @@ pub fn compile(obligation: &VcObligation) -> Option<VcGoal> {
         // The following kinds need richer encodings than bit-vector
         // arithmetic alone — path-sensitive symbolic execution
         // for panic reachability, termination measures for
-        // recursion. Tracked as v0.2+ follow-up work.
+        // recursion, and body-effect symbolic state for
+        // postconditions. Tracked as v0.2+ follow-up work.
+        // Task Q.4 (2026-05-26): EnsuresPostcondition emission is
+        // wired up to the visitor; the encoder (a body-effect
+        // summarizer for straight-line bodies that maps `result`
+        // to an SMT expression over arg values, plus the
+        // postcondition negation) lands in Q.4a.
         VcObligationKind::PanicReachability
-        | VcObligationKind::RecursionDecreases => return None,
+        | VcObligationKind::RecursionDecreases
+        | VcObligationKind::EnsuresPostcondition { .. } => return None,
     };
     Some(VcGoal {
         obligation: obligation.clone(),
@@ -355,12 +362,15 @@ mod tests {
             "consistency check must NOT contain the safety predicate; got:\n{cs}",
         );
     }
-    /// PanicReachability and RecursionDecreases still return None
-    /// from compile — they need richer encodings than QF_BV alone.
-    /// Pin this so adding IndexBound to compile didn't accidentally
-    /// open up the other kinds.
+    /// PanicReachability, RecursionDecreases, and (Q.4 MVP)
+    /// EnsuresPostcondition still return None from compile —
+    /// they need richer encodings than QF_BV alone. Pin this so
+    /// adding IndexBound to compile didn't accidentally open up
+    /// the other kinds, and so Q.4a's body-effect encoder
+    /// landing for ensures doesn't silently change what panic /
+    /// recursion produce.
     #[test]
-    fn compile_panic_and_recursion_still_return_none() {
+    fn compile_pending_kinds_still_return_none() {
         let panic_obl = VcObligation {
             id: "pb043-panic-0".into(),
             span: Span::default(),
@@ -375,6 +385,20 @@ mod tests {
             assumptions: Vec::new(),
         };
         assert!(compile(&rec_obl).is_none());
+        // Q.4 MVP: EnsuresPostcondition is wired through the
+        // emit path but compile returns None — wrapper reports
+        // "pending". Q.4a will replace this branch with a real
+        // SMT problem for straight-line bodies.
+        let ens_obl = VcObligation {
+            id: "pb076-ensures-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::EnsuresPostcondition {
+                ret_name: "result".into(),
+                ret_ty_name: "u32".into(),
+            },
+            assumptions: Vec::new(),
+        };
+        assert!(compile(&ens_obl).is_none());
     }
     /// No assumptions → no consistency check (the empty hypothesis
     /// set is trivially consistent; skipping the extra solver call

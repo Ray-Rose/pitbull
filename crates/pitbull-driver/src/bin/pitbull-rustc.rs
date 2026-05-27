@@ -286,8 +286,13 @@ impl PitbullCallbacks {
         // before the MIR pass and emit PB001 violations directly into
         // the report. tcx.hir_visit_all_item_likes_in_crate is callable
         // here because tcx remains valid inside rustc_internal::run.
-        let (hir_pb001_errors, hir_filename_partials, hir_preconditions, hir_trusted) =
-            collect_hir_pre_pass(tcx);
+        let (
+            hir_pb001_errors,
+            hir_filename_partials,
+            hir_preconditions,
+            hir_trusted,
+            hir_ensures,
+        ) = collect_hir_pre_pass(tcx);
         self.hir_unsafe_blocks = hir_pb001_errors.len();
         // CrateDef gives `name()`, `span()`, `def_id()` as trait methods.
         // `ty()` is exposed as an inherent method on CrateItem (via the
@@ -381,6 +386,20 @@ impl PitbullCallbacks {
                         preconditions.extend(attr_preconds.iter().cloned());
                     }
                     visitor.set_current_preconditions(preconditions);
+                    // Q.4 (2026-05-26): mirror of preconditions
+                    // for postconditions. The HIR pre-pass
+                    // collects `#[pitbull::ensures("...")]`
+                    // strings into hir_ensures; merge with
+                    // pitbull.toml-side `[verification.ensures]`
+                    // (config field added alongside this
+                    // commit's wrapper wiring). For now, only
+                    // the attribute-side is wired; toml-side
+                    // can land in a follow-up if needed.
+                    let ensures = hir_ensures
+                        .get(&item_path)
+                        .cloned()
+                        .unwrap_or_default();
+                    visitor.set_current_ensures(ensures);
                     // Task Q.1 (2026-05-26): `#[pitbull::trusted]`
                     // — the HIR pre-pass collects every fn-path with
                     // the attribute; here we look up the current
@@ -951,12 +970,14 @@ fn collect_hir_pre_pass<'tcx>(
     std::collections::HashMap<u32, String>,
     std::collections::HashMap<String, Vec<String>>,
     std::collections::HashSet<String>,
+    std::collections::HashMap<String, Vec<String>>,
 ) {
     let mut visitor = HirPreVisitor {
         tcx,
         violations: Vec::new(),
         filename_table: std::collections::HashMap::new(),
         preconditions: std::collections::HashMap::new(),
+        ensures: std::collections::HashMap::new(),
         trusted: std::collections::HashSet::new(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
@@ -965,6 +986,7 @@ fn collect_hir_pre_pass<'tcx>(
         visitor.filename_table,
         visitor.preconditions,
         visitor.trusted,
+        visitor.ensures,
     )
 }
 #[cfg(rustc_public_real)]
@@ -978,6 +1000,14 @@ struct HirPreVisitor<'tcx> {
     /// `visit_body` so users can mix attribute-based and
     /// config-based preconditions on the same function.
     preconditions: std::collections::HashMap<String, Vec<String>>,
+    /// HIR-derived POSTCONDITIONS keyed by fully-qualified
+    /// function path. Task Q.4 (2026-05-26). Mirror of
+    /// `preconditions` for the `#[pitbull::ensures("...")]`
+    /// attribute. The wrapper passes the merged list to
+    /// `SubsetVisitor::set_current_ensures` before each
+    /// `visit_body`. The visitor emits a `PB076 EnsuresPostcondition`
+    /// obligation at every `TerminatorKind::Return`.
+    ensures: std::collections::HashMap<String, Vec<String>>,
     /// Function paths marked `#[pitbull::trusted]` (Task Q.1,
     /// 2026-05-26). The wrapper looks up each item in this set
     /// and passes `trusted=true` to `SubsetVisitor::visit_body`,
@@ -992,25 +1022,26 @@ struct HirPreVisitor<'tcx> {
 }
 #[cfg(rustc_public_real)]
 impl<'tcx> HirPreVisitor<'tcx> {
-    /// Extract precondition strings from a `#[pitbull::requires(...)]`
-    /// attribute. Two forms accepted:
+    /// Extract precondition / postcondition strings from a
+    /// `#[pitbull::<name>(...)]` attribute. Two forms accepted:
     ///
     /// 1. **String-literal** (O.3 baseline):
-    ///    `#[pitbull::requires("x < 100")]` — uses `meta_item_list()`
+    ///    `#[pitbull::<name>("x < 100")]` — uses `meta_item_list()`
     ///    to extract a `LitKind::Str`. Stable, well-understood.
     /// 2. **Expression-form** (Q.3, 2026-05-26):
-    ///    `#[pitbull::requires(x < 100)]` — when `meta_item_list()`
+    ///    `#[pitbull::<name>(x < 100)]` — when `meta_item_list()`
     ///    returns None or empty (the arg isn't a meta-item), we
     ///    fall through to the raw `AttrArgs::Delimited` path and
     ///    pretty-print the token stream via
-    ///    `rustc_ast_pretty::pprust::tts_to_string`. The result is
-    ///    fed through the same predicate-parse pipeline.
+    ///    `rustc_ast_pretty::pprust::tts_to_string`.
     ///
-    /// Both forms produce strings the visitor's predicate parser
-    /// later attempts to interpret. A single attribute can produce
-    /// multiple strings only via the string-literal path (multi-arg
-    /// meta-lists); expression-form produces exactly one string.
-    fn extract_requires_strings(
+    /// Used for both `requires` and `ensures` (Task Q.4,
+    /// 2026-05-26); the body is `<name>`-agnostic — the caller
+    /// pre-checks the attribute path with `attr.path_matches(...)`.
+    /// Renamed from `extract_requires_strings` when Q.4 added
+    /// the ensures sibling path; both call sites now route
+    /// through this helper.
+    fn extract_attr_strings(
         &self,
         attr: &rustc_hir::Attribute,
     ) -> Vec<String> {
@@ -1106,6 +1137,7 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
             let pitbull = rustc_span::Symbol::intern("pitbull");
             let requires = rustc_span::Symbol::intern("requires");
             let trusted = rustc_span::Symbol::intern("trusted");
+            let ensures = rustc_span::Symbol::intern("ensures");
             let attrs = self.tcx.hir_attrs(ii.hir_id());
             let def_id = ii.owner_id.to_def_id();
             let crate_name = self
@@ -1116,10 +1148,19 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
             let fn_path = format!("{crate_name}::{local_path}");
             for attr in attrs {
                 if attr.path_matches(&[pitbull, requires]) {
-                    // Q.3 (2026-05-26): unified extraction handles
-                    // both string-literal AND expression-form args.
-                    for s in self.extract_requires_strings(attr) {
+                    for s in self.extract_attr_strings(attr) {
                         self.preconditions
+                            .entry(fn_path.clone())
+                            .or_default()
+                            .push(s);
+                    }
+                } else if attr.path_matches(&[pitbull, ensures]) {
+                    // Q.4 (2026-05-26): mirror of requires for
+                    // postconditions. Same string-literal /
+                    // expression-form extraction via the renamed
+                    // `extract_attr_strings` helper.
+                    for s in self.extract_attr_strings(attr) {
+                        self.ensures
                             .entry(fn_path.clone())
                             .or_default()
                             .push(s);
@@ -1148,6 +1189,7 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
             let pitbull = rustc_span::Symbol::intern("pitbull");
             let requires = rustc_span::Symbol::intern("requires");
             let trusted = rustc_span::Symbol::intern("trusted");
+            let ensures = rustc_span::Symbol::intern("ensures");
             let attrs = self.tcx.hir_attrs(item.hir_id());
             let def_id = item.owner_id.to_def_id();
             // Key the precondition map by the SAME string the
@@ -1163,10 +1205,17 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
             let fn_path = format!("{crate_name}::{local_path}");
             for attr in attrs {
                 if attr.path_matches(&[pitbull, requires]) {
-                    // Q.3 (2026-05-26): unified extraction handles
-                    // both string-literal AND expression-form args.
-                    for s in self.extract_requires_strings(attr) {
+                    for s in self.extract_attr_strings(attr) {
                         self.preconditions
+                            .entry(fn_path.clone())
+                            .or_default()
+                            .push(s);
+                    }
+                } else if attr.path_matches(&[pitbull, ensures]) {
+                    // Q.4 (2026-05-26): mirror of requires for
+                    // postconditions. Same extraction helper.
+                    for s in self.extract_attr_strings(attr) {
+                        self.ensures
                             .entry(fn_path.clone())
                             .or_default()
                             .push(s);

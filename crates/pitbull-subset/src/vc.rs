@@ -118,6 +118,36 @@ pub enum VcObligationKind {
     /// strictly decrease. Maps to PB041. Visitor placeholder;
     /// requires call-graph SCC analysis.
     RecursionDecreases,
+    /// A `#[pitbull::ensures("...")]` postcondition that must
+    /// hold at every function exit (every `TerminatorKind::Return`,
+    /// including the implicit return at end-of-body). Maps to
+    /// PB076. Task Q.4 (2026-05-26).
+    ///
+    /// Emitted by the visitor at `Return` terminators when the
+    /// current body has non-empty `current_body_ensures`.
+    /// `pitbull-vc::compile` returns `None` for the MVP (matches
+    /// PanicReachability today); the wrapper reports the
+    /// obligation as "pending". The body-effect encoder needed
+    /// to discharge for straight-line bodies lands in Task Q.4a;
+    /// path-sensitive control-flow encoding for branchy bodies
+    /// lands alongside PB043.
+    EnsuresPostcondition {
+        /// Source-level name of the binding used in the
+        /// postcondition to refer to the return value. Today
+        /// always `"result"` (matches Creusot's convention;
+        /// lowercase, no SPARK-style capitalization workarounds).
+        /// The field is reserved for future per-function
+        /// renaming should that ever be useful.
+        ret_name: String,
+        /// Rust primitive type name of the return value
+        /// (e.g. `"u32"`, `"i64"`). The future SMT encoder
+        /// uses this to size the bit-vector for `result`.
+        /// Empty string when the return type is not a primitive
+        /// integer — the obligation is still emitted (so the
+        /// auditor sees the gap) but the encoder will reject
+        /// non-int return types until the encoding is extended.
+        ret_ty_name: String,
+    },
 }
 impl VcObligationKind {
     /// Canonical PSS-1 rule ID for this obligation kind, as the
@@ -141,6 +171,7 @@ impl VcObligationKind {
             VcObligationKind::PanicReachability => "PB043",
             VcObligationKind::IndexBound { .. } => "PB054",
             VcObligationKind::RecursionDecreases => "PB041",
+            VcObligationKind::EnsuresPostcondition { .. } => "PB076",
         }
     }
 }
@@ -262,5 +293,36 @@ mod tests {
             "PB054",
         );
         assert_eq!(VcObligationKind::RecursionDecreases.rule_id(), "PB041");
+        assert_eq!(
+            VcObligationKind::EnsuresPostcondition {
+                ret_name: "result".into(),
+                ret_ty_name: "u32".into(),
+            }
+            .rule_id(),
+            "PB076",
+        );
+    }
+    /// Task Q.4 (2026-05-26): EnsuresPostcondition serdes
+    /// round-trips cleanly through JSON. The struct-variant fields
+    /// (`ret_name`, `ret_ty_name`) survive a serialize/deserialize
+    /// cycle — needed because SubsetReport is JSON-serialized for
+    /// SARIF emission and for proof-certificate (planned).
+    #[test]
+    fn ensures_postcondition_round_trips_through_json() {
+        let o = VcObligation {
+            id: "pb076-ensures-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::EnsuresPostcondition {
+                ret_name: "result".into(),
+                ret_ty_name: "u32".into(),
+            },
+            assumptions: vec![
+                "(assert (bvult x #x00000064))".into(),
+                "(assert (bvult result #x00000065))".into(),
+            ],
+        };
+        let s = serde_json::to_string(&o).expect("serialize");
+        let back: VcObligation = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, o);
     }
 }

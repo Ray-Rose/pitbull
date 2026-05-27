@@ -744,6 +744,108 @@ fn pitbull_requires_attribute_attaches_precondition() {
          stderr; got:\n{stderr}",
     );
 }
+/// Task Q.4 MVP (2026-05-26): `#[pitbull::ensures("...")]`
+/// produces a PB076 EnsuresPostcondition obligation at every
+/// function exit (TerminatorKind::Return). The MVP encoder
+/// returns None — wrapper reports as "pending" — pending the
+/// Q.4a body-effect SMT encoder that proves `result < 101`
+/// from `x < 100` and `result = x + 1`. This test pins the
+/// emission contract: the obligation IS emitted and carries
+/// `ret_name: "result"` + `ret_ty_name: "u32"`.
+#[test]
+fn pitbull_ensures_attribute_emits_pb076_obligation() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_ensures_attribute_emits_pb076_obligation: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q4-ensures-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::ensures(\"result < 101\")]\n\
+         pub fn add_one(x: u32) -> u32 {\n\
+             x + 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) =
+        run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
+            .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    // The PB076 verdict line carries the canonical rule id and
+    // the obligation kind's Debug-rendered ret_name/ret_ty_name.
+    assert!(
+        stderr.contains("(PB076)"),
+        "Q.4: ensures should emit a PB076 obligation. Got stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("pb076-ensures-"),
+        "Q.4: verdict line should reference the pb076-ensures-{{seq}} id format. Got stderr:\n{stderr}",
+    );
+    // The MVP encoder returns None — wrapper reports as "pending".
+    assert!(
+        stderr.contains("pending"),
+        "Q.4 MVP: ensures obligation should report as `pending` (Q.4a will discharge). Got stderr:\n{stderr}",
+    );
+}
+/// Q.4 trust × ensures interaction (Option C design open-question #4):
+/// a `#[pitbull::trusted]` body's ensures is NOT emitted as a proof
+/// obligation (trust means body-content assumed correct). The visitor
+/// audit-notes the gap so the auditor sees that the ensures was
+/// noticed but not proven. Caller-side propagation of trusted
+/// postconditions is out of scope for the MVP.
+#[test]
+fn pitbull_trusted_with_ensures_audits_but_no_pb076() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pitbull_trusted_with_ensures_audits_but_no_pb076: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!(
+        "pitbull-q4-trusted-ensures-{}.rs",
+        std::process::id(),
+    ));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::trusted]\n\
+         #[pitbull::ensures(\"result < 101\")]\n\
+         pub fn add_one(x: u32) -> u32 {\n\
+             x + 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) =
+        run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
+            .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    // No PB076 obligation should appear (trusted bodies skip body
+    // walk before reaching emit_ensures_obligation).
+    assert!(
+        !stderr.contains("pb076-ensures-"),
+        "Q.4: trusted body should NOT emit a PB076 obligation. Got stderr:\n{stderr}",
+    );
+    // Audit note must explain the gap.
+    assert!(
+        stderr.contains("ensures on trusted body"),
+        "Q.4: trusted body with ensures must produce an explanatory audit note. \
+         Got stderr:\n{stderr}",
+    );
+}
 /// Audit-cleanup post-Q.3 red-team finding M-RT-Q.D (2026-05-26):
 /// Q.2's commit message asserted PB001 unsafe-block detection
 /// inside impl methods still works, but no integration test
