@@ -15,16 +15,16 @@ thiserror   = "1"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 toml        = "0.8"
-# Hashing for cache keys and trusted-build-script verification.
-sha2        = "0.10"
 # rustc_public is the StableMIR crate exposed by nightly rustc. It is not a
 # crates.io crate; it is provided by the pinned nightly toolchain through the
 # rustc_private mechanism. The shadow MIR types in `mir_api.rs` are used
 # whenever the `--cfg rustc_public_real` rustc flag is NOT set, which keeps
 # `cargo check --all-features` working on stable Rust.
-[dev-dependencies]
-trybuild    = "1"
-insta       = { version = "1", features = ["json"] }
+# Audit-cleanup (architectural-review #1, 2026-05-26): removed orphan deps
+# `sha2` (sha256 field in config.rs is stored as a String — no actual
+# hashing call site), `trybuild` (zero references in src/ or tests/),
+# `insta` (zero references). Adding back is a one-line edit when the
+# hashing/snapshot machinery actually lands.
 [lints]
 workspace = true
 [features]

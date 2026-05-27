@@ -9,8 +9,10 @@ description = "Specification attribute macros for the Pitbull deductive verifier
 [lib]
 proc-macro = true
 [dependencies]
-proc-macro2 = "1"
-quote       = "1"
-syn         = { version = "2", features = ["full", "extra-traits"] }
+# Audit-cleanup (architectural-review #1, 2026-05-26): pitbull-spec's
+# proc-macros are all `(_attr, item) -> item` passthroughs (see lib.rs:50-).
+# The std `proc_macro::TokenStream` is all we need; `proc_macro2`,
+# `quote`, and `syn` were never imported. Add them back the day a macro
+# actually parses or rewrites tokens.
 [lints]
 workspace = true
