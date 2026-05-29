@@ -340,6 +340,15 @@ impl PitbullCallbacks {
                         tcx,
                         item.def_id(),
                     );
+                    // PRECONDITION (audit-cleanup L-2, 2026-05-26):
+                    // `tcx.fn_sig` ICEs on non-fn DefIds. This is
+                    // safe ONLY because we're inside the
+                    // `ItemKind::Fn` match arm AND past the
+                    // `has_body()` filter above — so `internal_id`
+                    // is always a fn-like def with a body. Do NOT
+                    // hoist this read above the kind match or the
+                    // has_body guard, or a const/static/closure
+                    // DefId would crash the compiler.
                     let fn_sig = tcx.fn_sig(internal_id).skip_binder().skip_binder();
                     shadow_body.is_unsafe = matches!(
                         fn_sig.safety,
@@ -1068,6 +1077,24 @@ impl<'tcx> HirPreVisitor<'tcx> {
         let normal = attr.get_normal_item();
         if let rustc_hir::AttrArgs::Delimited(delim) = &normal.args {
             let stringified = rustc_ast_pretty::pprust::tts_to_string(&delim.tokens);
+            // Defense-in-depth (audit-cleanup L-1, 2026-05-26):
+            // the stringified attribute flows into the predicate
+            // parser or the F2 raw-SMT validator, both of which
+            // scan by `char`. SMT-LIB 2.6 only assigns meaning to
+            // ASCII, and the F2 validator already rejects `"`,
+            // `;`, and `|`. A non-ASCII byte that Z3's UTF-8 lexer
+            // treats as a paren/whitespace while F2's char-scan
+            // misses it would be the only residual injection
+            // vector — almost certainly empty (no such SMT-LIB
+            // grammar char exists), but the assert makes it
+            // provably closed in debug builds. Release builds
+            // skip the check (the F2 validator is the real guard);
+            // a non-ASCII string just fails to parse as a predicate
+            // and gets audit-noted by the visitor.
+            debug_assert!(
+                stringified.is_ascii(),
+                "expression-form attribute pretty-printed to non-ASCII: {stringified:?}",
+            );
             return vec![stringified.trim().to_string()];
         }
         Vec::new()

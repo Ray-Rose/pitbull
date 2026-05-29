@@ -394,7 +394,7 @@ mod tests {
             span: Span::default(),
             kind: VcObligationKind::EnsuresPostcondition {
                 ret_name: "result".into(),
-                ret_ty_name: "u32".into(),
+                ret_ty_name: Some("u32".into()),
             },
             assumptions: Vec::new(),
         };

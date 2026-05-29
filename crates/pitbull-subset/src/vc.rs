@@ -139,14 +139,25 @@ pub enum VcObligationKind {
         /// The field is reserved for future per-function
         /// renaming should that ever be useful.
         ret_name: String,
-        /// Rust primitive type name of the return value
-        /// (e.g. `"u32"`, `"i64"`). The future SMT encoder
-        /// uses this to size the bit-vector for `result`.
-        /// Empty string when the return type is not a primitive
-        /// integer — the obligation is still emitted (so the
-        /// auditor sees the gap) but the encoder will reject
-        /// non-int return types until the encoding is extended.
-        ret_ty_name: String,
+        /// Rust primitive integer type name of the return value
+        /// (e.g. `Some("u32")`, `Some("i64")`). The future SMT
+        /// encoder uses this to size the bit-vector for `result`.
+        ///
+        /// `None` when the return type is NOT a primitive integer
+        /// (struct, tuple, slice, `()`, etc.). Audit-cleanup
+        /// post-Q audit finding M-2 (2026-05-26): this used to be
+        /// an EMPTY STRING sentinel, which a future encoder could
+        /// misread as "no constraint on `result`" and produce a
+        /// vacuously-`unsat` problem — a latent false-discharge
+        /// trap for Q.4a. Making it `Option<String>` forces the
+        /// encoder to handle the unsupported case explicitly:
+        /// `pitbull-vc::compile` refuses to produce a goal for an
+        /// `EnsuresPostcondition` whose `ret_ty_name` is `None`
+        /// (fail-closed by construction, not by comment). The
+        /// obligation is still EMITTED (so the auditor sees the
+        /// gap) but can never discharge until the encoder gains
+        /// non-int-return support.
+        ret_ty_name: Option<String>,
     },
 }
 impl VcObligationKind {
@@ -296,7 +307,18 @@ mod tests {
         assert_eq!(
             VcObligationKind::EnsuresPostcondition {
                 ret_name: "result".into(),
-                ret_ty_name: "u32".into(),
+                ret_ty_name: Some("u32".into()),
+            }
+            .rule_id(),
+            "PB076",
+        );
+        // M-2: non-primitive return type carries None; rule_id
+        // is still PB076 (the rule fires regardless of whether
+        // the encoder can handle the return type).
+        assert_eq!(
+            VcObligationKind::EnsuresPostcondition {
+                ret_name: "result".into(),
+                ret_ty_name: None,
             }
             .rule_id(),
             "PB076",
@@ -314,12 +336,32 @@ mod tests {
             span: Span::default(),
             kind: VcObligationKind::EnsuresPostcondition {
                 ret_name: "result".into(),
-                ret_ty_name: "u32".into(),
+                ret_ty_name: Some("u32".into()),
             },
             assumptions: vec![
                 "(assert (bvult x #x00000064))".into(),
                 "(assert (bvult result #x00000065))".into(),
             ],
+        };
+        let s = serde_json::to_string(&o).expect("serialize");
+        let back: VcObligation = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, o);
+    }
+    /// M-2: an EnsuresPostcondition with `ret_ty_name: None`
+    /// (non-primitive return) also round-trips. The serde
+    /// `Option` representation must survive so a serialized
+    /// report's pending obligations re-load with the
+    /// unsupported-return marker intact.
+    #[test]
+    fn ensures_postcondition_none_ret_ty_round_trips() {
+        let o = VcObligation {
+            id: "pb076-ensures-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::EnsuresPostcondition {
+                ret_name: "result".into(),
+                ret_ty_name: None,
+            },
+            assumptions: Vec::new(),
         };
         let s = serde_json::to_string(&o).expect("serialize");
         let back: VcObligation = serde_json::from_str(&s).expect("deserialize");

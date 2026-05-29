@@ -154,6 +154,17 @@ pub struct SubsetVisitor<'cfg> {
     /// Trusted bodies are exempt from body-level checks but their *signatures*
     /// are still subject to PSS-1.
     current_body_trusted: bool,
+    /// Whether `emit_ensures_obligation` fired for the current body
+    /// (i.e. at least one `TerminatorKind::Return` was visited while
+    /// `current_body_ensures` was non-empty). Audit-cleanup M-1
+    /// (2026-05-26): a divergent body (infinite loop, `panic!` on
+    /// all paths, `-> !`) has NO Return terminator, so an
+    /// `#[pitbull::ensures]` on it would silently emit ZERO
+    /// obligations — the "no silent skips" anti-pattern. At body
+    /// exit, if ensures was non-empty but this flag is still false,
+    /// we surface an audit note so the gap is visible. Reset at
+    /// each `visit_body` entry.
+    saw_return_with_ensures: bool,
     /// Whether the current expression context is spec mode.
     /// In spec mode, additional rules (PB064, PB066, PB069) apply.
     in_spec_context: bool,
@@ -173,6 +184,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
             current_body_ensures: Vec::new(),
             current_body_return_ty: None,
             current_body_trusted: false,
+            saw_return_with_ensures: false,
             in_spec_context: false,
         }
     }
@@ -278,6 +290,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // for `result`. Cleared on body exit alongside other
         // per-body fields.
         self.current_body_return_ty = Some(body.return_ty.clone());
+        // M-1 (2026-05-26): reset the per-body "saw a return with
+        // ensures" flag. Set true in emit_ensures_obligation; checked
+        // at body exit to catch divergent bodies whose ensures
+        // would otherwise silently produce no obligation.
+        self.saw_return_with_ensures = false;
         // PB002: unsafe fn definitions are rejected outright. Even trusted
         // functions cannot be unsafe in v0.1; trust is for spec assumption,
         // not for `unsafe` admission.
@@ -345,6 +362,28 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 self.visit_statement(stmt);
             }
             self.visit_terminator(&block.terminator);
+        }
+        // M-1 (2026-05-26): a body with `#[pitbull::ensures]` but
+        // NO `TerminatorKind::Return` (diverges — infinite loop,
+        // `panic!`/`unreachable!` on every path, `-> !`) never
+        // reached `emit_ensures_obligation`, so its postcondition
+        // would silently produce zero obligations. Surface the gap
+        // as an audit note so an auditor doesn't read "0
+        // obligations" as "postcondition checked". (Today the
+        // ensures obligation is "pending" anyway, but this keeps
+        // the "no silent skips" invariant once Q.4a's encoder makes
+        // the obligation dischargeable.)
+        if !self.current_body_ensures.is_empty() && !self.saw_return_with_ensures {
+            self.audit_note(
+                body.span,
+                "PB076: function declares `#[pitbull::ensures]` but its body \
+                 has no return point (it diverges — infinite loop, always \
+                 panics, or `-> !`). The postcondition is vacuously \
+                 unchecked: no exit point exists to assert it at. If this \
+                 is intentional (a diverging function legitimately has no \
+                 postcondition to discharge), the ensures is dead and \
+                 should be removed.",
+            );
         }
         // Audit finding H-RT2 (2026-05-26): clear preconditions
         // at body exit so the next `visit_body` cannot
@@ -1684,19 +1723,31 @@ impl<'cfg> SubsetVisitor<'cfg> {
         if self.current_body_ensures.is_empty() {
             return;
         }
+        self.saw_return_with_ensures = true;
         let seq = self.vc_obligations.len();
         let id = format!("pb076-ensures-{seq}");
-        // Resolve the return type name. None means non-primitive
-        // (e.g. struct, tuple, slice) — we still emit the
-        // obligation so the auditor sees the gap, but the
-        // ret_ty_name is empty and the future encoder will skip
-        // the SMT problem with a separate "unsupported return
-        // type" audit note.
+        // Resolve the return type name. `None` means non-primitive
+        // (e.g. struct, tuple, slice). We still emit the obligation
+        // so the auditor sees the gap, but carry the `None` through
+        // to the obligation kind — `pitbull-vc::compile` fail-closes
+        // on it (audit-cleanup M-2, 2026-05-26). When the return
+        // type is non-primitive we ALSO surface an audit note so
+        // the gap is visible NOW, not just when the encoder lands.
         let ret_ty_name = self
             .current_body_return_ty
             .as_ref()
-            .and_then(primitive_int_name_from_ty)
-            .unwrap_or_default();
+            .and_then(primitive_int_name_from_ty);
+        if ret_ty_name.is_none() {
+            self.audit_note(
+                term_span,
+                "PB076: ensures on a function whose return type is not a \
+                 primitive integer — the v0.2 `result` binding can only \
+                 size a bit-vector for primitive-int returns, so this \
+                 postcondition cannot be discharged until the encoder \
+                 gains struct/tuple/slice support. Obligation emitted \
+                 (pending) so the gap is visible.",
+            );
+        }
         // F2 lex validation on each ensures string + caller-side
         // preconditions. Mirror of the PB054 dispatcher's audit
         // posture (no silent skips). For the MVP we only do the
@@ -3755,5 +3806,149 @@ mod tests {
                 proj,
             );
         }
+    }
+    /// M-1 (audit-cleanup 2026-05-26): a divergent body (no
+    /// `TerminatorKind::Return`) that declares `#[pitbull::ensures]`
+    /// must NOT silently emit zero obligations — it surfaces an
+    /// audit note so the "postcondition vacuously unchecked" gap is
+    /// visible. `empty_body()` has no blocks, hence no Return, which
+    /// models the diverging case (infinite loop / always-panics /
+    /// `-> !`).
+    #[test]
+    fn ensures_on_divergent_body_emits_audit_note_not_silent() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 101".to_string()]);
+        let body = empty_body(); // no blocks → no Return terminator
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        // No PB076 obligation could be emitted (no return point).
+        let pb076_count = report
+            .vc_obligations
+            .iter()
+            .filter(|o| matches!(
+                o.kind,
+                crate::vc::VcObligationKind::EnsuresPostcondition { .. }
+            ))
+            .count();
+        assert_eq!(
+            pb076_count, 0,
+            "divergent body has no return point → no PB076 obligation",
+        );
+        // But the gap must be VISIBLE as an audit note.
+        let has_divergent_note = report
+            .audit_notes
+            .iter()
+            .any(|n| n.message.contains("no return point"));
+        assert!(
+            has_divergent_note,
+            "M-1: divergent body with ensures must surface a 'no return point' \
+             audit note; got notes: {:?}",
+            report.audit_notes,
+        );
+    }
+    /// M-1 positive control: a body WITH a Return terminator and an
+    /// ensures emits the PB076 obligation and does NOT surface the
+    /// divergent-body audit note.
+    #[test]
+    fn ensures_on_returning_body_emits_obligation_no_divergent_note() {
+        use crate::mir_api::UintTy;
+        let cfg = SubsetConfig::default_for_test();
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            arg_names: vec![],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![LocalDecl {
+                ty: u32_ty,
+                span: Span::default(),
+                mutability: Mutability::Not,
+            }],
+            blocks: vec![BasicBlockData {
+                statements: vec![],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 101".to_string()]);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        let pb076_count = report
+            .vc_obligations
+            .iter()
+            .filter(|o| matches!(
+                o.kind,
+                crate::vc::VcObligationKind::EnsuresPostcondition { .. }
+            ))
+            .count();
+        assert_eq!(pb076_count, 1, "returning body with ensures emits one PB076");
+        assert!(
+            !report.audit_notes.iter().any(|n| n.message.contains("no return point")),
+            "returning body must NOT trigger the divergent-body note",
+        );
+    }
+    /// M-2 (audit-cleanup 2026-05-26): an ensures on a function with
+    /// a NON-primitive return type (here `bool`, which is not an
+    /// integer the BV encoder can size) emits the obligation with
+    /// `ret_ty_name: None` AND surfaces an audit note. The `None`
+    /// (not an empty-string sentinel) is what lets `pitbull-vc`
+    /// fail closed by construction.
+    #[test]
+    fn ensures_on_non_primitive_return_carries_none_and_audits() {
+        let cfg = SubsetConfig::default_for_test();
+        // bool return type — not a primitive integer.
+        let bool_ty = Ty { kind: TyKind::RigidTy(RigidTy::Bool) };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            arg_names: vec![],
+            return_ty: bool_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![LocalDecl {
+                ty: bool_ty,
+                span: Span::default(),
+                mutability: Mutability::Not,
+            }],
+            blocks: vec![BasicBlockData {
+                statements: vec![],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result".to_string()]);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        let kind = &report
+            .vc_obligations
+            .iter()
+            .find_map(|o| match &o.kind {
+                crate::vc::VcObligationKind::EnsuresPostcondition { ret_ty_name, .. } => {
+                    Some(ret_ty_name.clone())
+                }
+                _ => None,
+            })
+            .expect("PB076 obligation emitted even for non-primitive return");
+        assert_eq!(
+            *kind, None,
+            "M-2: non-primitive return type must carry ret_ty_name: None \
+             (fail-closed), not an empty-string sentinel",
+        );
+        assert!(
+            report.audit_notes.iter().any(|n| n.message.contains("not a primitive integer")),
+            "M-2: non-primitive return must surface an audit note; got: {:?}",
+            report.audit_notes,
+        );
     }
 }
