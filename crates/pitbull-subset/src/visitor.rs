@@ -1318,46 +1318,27 @@ impl<'cfg> SubsetVisitor<'cfg> {
             BinOp::Add => crate::vc::ArithOp::Add,
             BinOp::Sub => crate::vc::ArithOp::Sub,
             BinOp::Mul => crate::vc::ArithOp::Mul,
-            // Audit finding (2026-05-26 full-codebase sweep): Div / Rem
-            // carry a division-by-zero obligation AND, for signed
-            // types, a `MIN / -1` overflow obligation; Shl / Shr
-            // carry an over-shift obligation (shift amount >= bit
-            // width is UB-adjacent and panics in debug). These have
-            // a DIFFERENT SMT shape than the bvXaddo/bvXsubo/bvXmulo
-            // overflow predicates, so they are not yet encoded.
-            // Pre-fix, this arm was a silent `_ => return`, so
-            // reachable `a / b` / `a % b` / `a << n` produced ZERO
-            // obligations and ZERO audit notes — reported "verified"
-            // for code that can panic at runtime (an AoRTE hole and
-            // a "no silent skips" violation). Until the encoding
-            // lands, surface an audit note so the gap is visible.
-            BinOp::Div | BinOp::Rem => {
-                self.audit_note(
-                    span,
-                    format!(
-                        "PB049: `{binop:?}` carries a division-by-zero \
-                         obligation (and signed `MIN / -1` overflow) that \
-                         the v0.2 SMT encoder does not yet emit. The \
-                         operation is NOT proven panic-free — this is a \
-                         known coverage gap, tracked for the div/shift \
-                         obligation encoding. Treat as unverified.",
-                    ),
-                );
-                return;
-            }
-            BinOp::Shl | BinOp::Shr => {
-                self.audit_note(
-                    span,
-                    format!(
-                        "PB049: `{binop:?}` carries an over-shift obligation \
-                         (shift amount must be < bit width) that the v0.2 \
-                         SMT encoder does not yet emit. The operation is \
-                         NOT proven panic-free — known coverage gap. Treat \
-                         as unverified.",
-                    ),
-                );
-                return;
-            }
+            // Task R (2026-05-28): Div / Rem now emit a real
+            // obligation — division-by-zero plus, for signed types,
+            // `MIN / -1` overflow. `pitbull-vc` encodes the
+            // violation predicate. Both operands share the operand
+            // type in Rust, so the same-type guard below holds.
+            BinOp::Div => crate::vc::ArithOp::Div,
+            BinOp::Rem => crate::vc::ArithOp::Rem,
+            // Task R: Shl / Shr emit the over-shift obligation
+            // (shift amount >= bit width). NOTE: a shift's amount
+            // may have a DIFFERENT type than the value being
+            // shifted (`u32 << u8`). The same-type guard below
+            // emits the obligation only when both operands resolve
+            // to the SAME type (so the SMT bit-vectors are the same
+            // sort and `(bvuge rhs width)` is well-formed); a
+            // mixed-width shift falls through to that guard's audit
+            // note rather than producing a malformed SMT problem.
+            // That is the audit-safe direction (no silent skip;
+            // mixed-width shifts surface as an explicit gap). Full
+            // mixed-width over-shift encoding is a follow-up.
+            BinOp::Shl => crate::vc::ArithOp::Shl,
+            BinOp::Shr => crate::vc::ArithOp::Shr,
             // Bitwise and comparison ops have no overflow/panic
             // obligation — they are total functions over their input
             // bit-patterns. `Offset` is pointer arithmetic, which is
@@ -1402,21 +1383,36 @@ impl<'cfg> SubsetVisitor<'cfg> {
             return;
         };
         if lhs_name != rhs_name {
-            // Mixed-type arithmetic doesn't reach MIR post-coercion
-            // in normal Rust code; refuse to emit a goal we can't
-            // stand behind. Audit finding N1: surface the gap
-            // explicitly (same rationale as above — silent skip
-            // misleads the auditor).
-            self.audit_note(
-                span,
+            // Operand types differ. For Add/Sub/Mul/Div/Rem this is
+            // unreachable in well-formed MIR post-coercion (both
+            // operands share the type). For Shl/Shr it is EXPECTED
+            // and common — the shift amount may be a different
+            // integer type than the value (`u32 << u8`). Either way
+            // we cannot emit a well-sorted same-width SMT problem,
+            // so we surface the gap (audit-safe, no silent skip)
+            // rather than emit a malformed `(bvuge rhs width)` on
+            // mismatched bit-vector sorts. Mixed-width over-shift
+            // encoding (zero-extend the amount to the value width)
+            // is a tracked follow-up.
+            let note = if matches!(arith_op, crate::vc::ArithOp::Shl | crate::vc::ArithOp::Shr) {
+                format!(
+                    "PB049: shift {arith_op:?} skipped — value type {lhs_name} \
+                     differs from shift-amount type {rhs_name} (mixed-width \
+                     shift). The v0.2 encoder emits the over-shift obligation \
+                     only when both operands share a type; mixed-width \
+                     over-shift encoding is a tracked follow-up. Treat the \
+                     over-shift safety of this operation as unverified.",
+                )
+            } else {
                 format!(
                     "PB049: BinaryOp {arith_op:?} skipped — operand types \
                      differ ({lhs_name} vs {rhs_name}). Should be unreachable \
                      in well-formed MIR post-coercion; if you see this \
                      note, the visitor encountered an unusual lowering and \
                      the gap is worth investigating.",
-                ),
-            );
+                )
+            };
+            self.audit_note(span, note);
             return;
         }
         // O.2.5: pin constant-operand values into the SMT problem.
@@ -3920,16 +3916,26 @@ mod tests {
             report.audit_notes,
         );
     }
-    /// Companion: div/rem/shift binops surface an audit note (no
-    /// silent skip) since the v0.2 encoder doesn't yet emit their
-    /// division-by-zero / over-shift obligations. Pins the
-    /// full-codebase-sweep fix that replaced the silent `_ => return`.
+    /// Task R (2026-05-28): div/rem/shift binops with same-type
+    /// operands now emit a real `ArithmeticOverflow` obligation
+    /// (PB049) — division-by-zero / signed MIN-/-1 / over-shift,
+    /// encoded by `pitbull-vc`. This SUPERSEDES the earlier
+    /// audit-note-only treatment from the full-codebase sweep.
+    /// Pins: one obligation per op, kind = ArithmeticOverflow,
+    /// op matches, id prefix `pb049-<tag>-`, no coverage-gap
+    /// audit note.
     #[test]
-    fn div_rem_shift_binops_audit_note_not_silent() {
+    fn div_rem_shift_same_type_emit_arith_obligation() {
         use crate::mir_api::{BinOp, UintTy};
         let cfg = SubsetConfig::default_for_test();
         let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
-        for op in [BinOp::Div, BinOp::Rem, BinOp::Shl, BinOp::Shr] {
+        let cases = [
+            (BinOp::Div, crate::vc::ArithOp::Div, "div"),
+            (BinOp::Rem, crate::vc::ArithOp::Rem, "rem"),
+            (BinOp::Shl, crate::vc::ArithOp::Shl, "shl"),
+            (BinOp::Shr, crate::vc::ArithOp::Shr, "shr"),
+        ];
+        for (binop, expected_op, tag) in cases {
             let mut v = SubsetVisitor::new(&cfg);
             let body = Body {
                 def_id: DefId(0),
@@ -3948,7 +3954,7 @@ mod tests {
                         kind: StatementKind::Assign(
                             Place { local: Local(0), projection: vec![] },
                             Rvalue::BinaryOp(
-                                op,
+                                binop,
                                 Operand::Copy(Place { local: Local(1), projection: vec![] }),
                                 Operand::Copy(Place { local: Local(2), projection: vec![] }),
                             ),
@@ -3961,14 +3967,84 @@ mod tests {
             };
             v.visit_body(&body, false);
             let report = v.into_report();
+            assert_eq!(
+                report.vc_obligations.len(), 1,
+                "{binop:?} must emit exactly one obligation; got {:?}",
+                report.vc_obligations,
+            );
+            let crate::vc::VcObligationKind::ArithmeticOverflow { op, ty_name } =
+                &report.vc_obligations[0].kind
+            else {
+                panic!("{binop:?} must emit ArithmeticOverflow; got {:?}", report.vc_obligations[0].kind);
+            };
+            assert_eq!(*op, expected_op, "{binop:?} obligation op");
+            assert_eq!(ty_name, "u32");
             assert!(
-                report.audit_notes.iter().any(|n| n.message.contains("PB049")
-                    && (n.message.contains("division-by-zero") || n.message.contains("over-shift"))),
-                "{op:?} must surface a div/shift coverage audit note (no silent skip); \
-                 got notes: {:?}",
+                report.vc_obligations[0].id.starts_with(&format!("pb049-{tag}-")),
+                "{binop:?} id should be pb049-{tag}-N; got {:?}",
+                report.vc_obligations[0].id,
+            );
+            // No coverage-gap audit note now that the op is encoded.
+            assert!(
+                !report.audit_notes.iter().any(|n| n.message.contains("does not yet emit")
+                    || n.message.contains("coverage gap")),
+                "{binop:?} must NOT carry a coverage-gap note now that it emits; \
+                 got: {:?}",
                 report.audit_notes,
             );
         }
+    }
+    /// Task R: a mixed-width shift (`u32 << u8`) cannot be encoded
+    /// as a same-sort BV problem, so it emits NO obligation but
+    /// surfaces an explicit "mixed-width shift" audit note (no
+    /// silent skip). Pins the audit-safe fallback.
+    #[test]
+    fn mixed_width_shift_audit_notes_no_obligation() {
+        use crate::mir_api::{BinOp, UintTy};
+        let cfg = SubsetConfig::default_for_test();
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let u8_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U8)) };
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone(), u8_ty.clone()],
+            arg_names: vec!["a".into(), "b".into()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: u8_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::BinaryOp(
+                            BinOp::Shl,
+                            Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                            Operand::Copy(Place { local: Local(2), projection: vec![] }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator { kind: TerminatorKind::Return, span: Span::default() },
+            }],
+            span: Span::default(),
+        };
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert!(
+            report.vc_obligations.is_empty(),
+            "mixed-width shift must emit no obligation; got {:?}",
+            report.vc_obligations,
+        );
+        assert!(
+            report.audit_notes.iter().any(|n| n.message.contains("mixed-width shift")),
+            "mixed-width shift must surface an explicit audit note; got: {:?}",
+            report.audit_notes,
+        );
     }
     /// M-1 positive control: a body WITH a Return terminator and an
     /// ensures emits the PB076 obligation and does NOT surface the

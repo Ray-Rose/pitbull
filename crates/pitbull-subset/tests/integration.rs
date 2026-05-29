@@ -846,6 +846,95 @@ fn pitbull_trusted_with_ensures_audits_but_no_pb076() {
          Got stderr:\n{stderr}",
     );
 }
+/// Task R (2026-05-28) capstone: division-by-zero discharges
+/// end-to-end under Z3. `fn d(a, b) { a / b }` with
+/// `requires("b > 0")` must report `discharged (unsat)` — the
+/// solver proves a zero divisor is impossible. This is the AoRTE
+/// hole the full-codebase audit found (div/rem/shift emitted no
+/// obligation) now closed end-to-end. Gated on Z3 like the other
+/// discharge capstones.
+#[test]
+fn wrapper_proves_division_safe_under_precondition() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_division_safe_under_precondition: SKIPPED");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-r-div-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-r-div-{}.rs", std::process::id()));
+    fs::write(&probe_rs, "pub fn d(a: u32, b: u32) -> u32 { a / b }\n")
+        .expect("write probe.rs");
+    let cfg_text = r#"
+[project]
+name = "corpus_test"
+toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
+
+[verification.preconditions]
+"corpus_test::d" = ["b > 0"]
+"#
+    .to_string();
+    fs::write(&cfg_path, cfg_text).expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if stderr.contains("z3 not installed") {
+        eprintln!("wrapper_proves_division_safe_under_precondition: SKIPPED (no z3)");
+        return;
+    }
+    // The division obligation is a PB049 `pb049-div-*` and must
+    // discharge: b > 0 rules out the zero divisor.
+    assert!(
+        stderr.contains("pb049-div-0") && stderr.contains("discharged (unsat"),
+        "Task R: `a / b` with `b > 0` must discharge the div-by-zero \
+         obligation. Got code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("NOT DISCHARGED"),
+        "Task R: nothing should remain undischarged for `a / b` under `b > 0`. \
+         stderr:\n{stderr}",
+    );
+}
+/// Task R complement: WITHOUT a precondition, the same division
+/// must NOT discharge — Z3 finds the b = 0 counterexample. Proves
+/// the obligation is real (not vacuously discharged) and the
+/// fail-closed direction holds.
+#[test]
+fn wrapper_division_without_precondition_not_discharged() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_division_without_precondition_not_discharged: SKIPPED");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-r-div-bare-{}.rs", std::process::id()));
+    fs::write(&probe_rs, "pub fn d(a: u32, b: u32) -> u32 { a / b }\n")
+        .expect("write probe.rs");
+    let (stderr, code) = run_one_corpus_file_full(&env, &probe_rs, &[])
+        .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    if stderr.contains("z3 not installed") {
+        eprintln!("wrapper_division_without_precondition_not_discharged: SKIPPED (no z3)");
+        return;
+    }
+    assert!(
+        stderr.contains("pb049-div-0") && stderr.contains("NOT DISCHARGED (sat"),
+        "Task R: bare `a / b` must NOT discharge (b = 0 counterexample). \
+         Got code {code:?}, stderr:\n{stderr}",
+    );
+    // F10: undischarged obligation ⇒ non-zero exit.
+    assert_eq!(code, Some(1), "undischarged div obligation ⇒ exit 1");
+}
 /// Audit-cleanup post-Q.3 red-team finding M-RT-Q.D (2026-05-26):
 /// Q.2's commit message asserted PB001 unsafe-block detection
 /// inside impl methods still works, but no integration test

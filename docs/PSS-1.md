@@ -1347,12 +1347,24 @@ the std form and now also matches. No shadow type changes.
   "undischarged" (exit 1), never a false "verified".
 - ✅ Full-codebase audit sweep cleanup (post-Q). Closed three
   "no silent skip" gaps the foundational-code audit found:
-  (a) Div/Rem/Shl/Shr produced no obligation AND no audit note —
-  now they emit a coverage audit note ("treat as unverified")
-  pending the division-by-zero / over-shift obligation encoding;
+  (a) Div/Rem/Shl/Shr produced no obligation AND no audit note;
   (b) the divergent-`ensures` exit-0 asymmetry (now fail-closed);
   (c) `[reachability] exclude` dropped items with no surfaced count
   when `verify_roots` was empty (now printed with a warning).
+- ✅ Division / over-shift obligation encoding (Task R, 2026-05-28).
+  Closes the (a) gap above: Div/Rem/Shl/Shr now emit real PB049
+  `ArithmeticOverflow` obligations that discharge under Z3. The
+  `pitbull-vc` violation predicate is per-op: Div/Rem assert
+  division-by-zero `(= rhs 0)` plus (signed only) the `MIN / -1`
+  overflow; Shl/Shr assert over-shift `(bvuge rhs <bit-width>)`.
+  `fn d(a,b){a/b}` with `requires("b > 0")` reports `discharged
+  (unsat)`; without it, `NOT DISCHARGED (sat — b = 0 witness)`.
+  Mixed-width shifts (`u32 << u8`) cannot form a same-sort BV
+  problem and surface an explicit "mixed-width shift" audit note
+  (the over-shift encoding for those, via zero-extending the shift
+  amount, is a tracked follow-up). e2e capstones:
+  `wrapper_proves_division_safe_under_precondition` and
+  `wrapper_division_without_precondition_not_discharged`.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1360,7 +1372,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  185 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  191 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1373,7 +1385,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 185 passing, 0 warnings, clippy clean
+# Stable: 191 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --tests
 # Nightly + opt-in: wrapper builds, end-to-end PB049/PB054 discharge

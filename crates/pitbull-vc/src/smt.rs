@@ -94,15 +94,33 @@ impl IntInfo {
 /// - `sat`   ⇒ a witness exists ⇒ obligation NOT discharged ⇒
 ///   the rule fires (the counterexample is the SAT model).
 ///
-/// The encoded predicate uses SMT-LIB bit-vector overflow predicates:
-/// - `bvuaddo` / `bvsaddo` for `+`
-/// - `bvusubo` / `bvssubo` for `-`
-/// - `bvumulo` / `bvsmulo` for `*`
+/// The encoded violation predicate depends on the operator (Task R,
+/// 2026-05-28 — extended from overflow-only to full arithmetic AoRTE):
+/// - `+` / `-` / `*` → SMT-LIB overflow predicates `bvuaddo`/`bvsaddo`,
+///   `bvusubo`/`bvssubo`, `bvumulo`/`bvsmulo`.
+/// - `/` / `%` → division-by-zero `(= rhs 0)`, plus (signed only) the
+///   `MIN / -1` overflow `(and (= lhs MIN) (= rhs -1))`, combined with
+///   `or`.
+/// - `<<` / `>>` → over-shift `(bvuge rhs <bit-width>)` — a shift
+///   amount at or beyond the value's bit width is UB-adjacent and
+///   panics under debug assertions.
 ///
-/// Division/remainder/shift overflow predicates land in a follow-up.
+/// In every case the asserted predicate is the *violation* (the
+/// negated safety property): `unsat` ⇒ the violation is impossible ⇒
+/// the operation is safe; `sat` ⇒ a counterexample input exists.
 #[must_use]
 pub fn emit_overflow_problem(ty_name: &str, op: ArithOp) -> Option<String> {
     emit_overflow_problem_with_assumptions(ty_name, op, &[])
+}
+/// Format `value` as a `bits`-wide SMT-LIB hex literal (`#x...`).
+/// All Pitbull-supported integer widths (8/16/32/64/128) are
+/// multiples of 4, so a hex literal is always exact. Used for the
+/// division and over-shift violation constants (zero, signed MIN,
+/// -1, bit-width).
+fn bv_hex(value: u128, bits: u32) -> String {
+    let hex_digits = (bits / 4) as usize;
+    let mask: u128 = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
+    format!("#x{:0width$X}", value & mask, width = hex_digits)
 }
 /// Emit a SAT-CHECK-ONLY problem for the given assumptions: just
 /// the declarations + each assumption + `(check-sat)`. NO safety
@@ -160,19 +178,55 @@ pub fn emit_overflow_problem_with_assumptions(
     assumptions: &[String],
 ) -> Option<String> {
     let info = IntInfo::from_name(ty_name)?;
-    let overflow_predicate = match (op, info.signed) {
-        (ArithOp::Add, false) => "bvuaddo",
-        (ArithOp::Add, true) => "bvsaddo",
-        (ArithOp::Sub, false) => "bvusubo",
-        (ArithOp::Sub, true) => "bvssubo",
-        (ArithOp::Mul, false) => "bvumulo",
-        (ArithOp::Mul, true) => "bvsmulo",
-        // Div/Rem/Shl/Shr need different encoding shapes — defer.
-        (ArithOp::Div | ArithOp::Rem | ArithOp::Shl | ArithOp::Shr, _) => {
-            return None;
+    let bits = info.bits;
+    // Build the VIOLATION predicate (the negated safety property)
+    // as a complete SMT-LIB term, one per operator family.
+    let violation: String = match op {
+        // Overflow predicates: `bvXaddo`/`bvXsubo`/`bvXmulo` is true
+        // exactly when the operation overflows the operand width.
+        ArithOp::Add | ArithOp::Sub | ArithOp::Mul => {
+            let pred = match (op, info.signed) {
+                (ArithOp::Add, false) => "bvuaddo",
+                (ArithOp::Add, true) => "bvsaddo",
+                (ArithOp::Sub, false) => "bvusubo",
+                (ArithOp::Sub, true) => "bvssubo",
+                (ArithOp::Mul, false) => "bvumulo",
+                (ArithOp::Mul, true) => "bvsmulo",
+                // Unreachable: outer match already pinned Add/Sub/Mul.
+                _ => unreachable!("outer match restricts to Add/Sub/Mul"),
+            };
+            format!("({pred} lhs rhs)")
+        }
+        // Division / remainder (Task R): the violation is
+        // division-by-zero `(= rhs 0)` and, for SIGNED types only,
+        // the `MIN / -1` overflow `(and (= lhs MIN) (= rhs -1))`.
+        // Both `/` and `%` share the identical violation set in
+        // Rust (both panic on zero divisor; both overflow on
+        // `MIN % -1` / `MIN / -1`).
+        ArithOp::Div | ArithOp::Rem => {
+            let zero = bv_hex(0, bits);
+            if info.signed {
+                let min = bv_hex(1u128 << (bits - 1), bits); // 100..0
+                let neg_one = bv_hex(u128::MAX, bits); // 111..1 (two's-complement -1)
+                format!(
+                    "(or (= rhs {zero}) (and (= lhs {min}) (= rhs {neg_one})))",
+                )
+            } else {
+                format!("(= rhs {zero})")
+            }
+        }
+        // Shift (Task R): the violation is an over-shift — a shift
+        // amount at or beyond the value's bit width. In Rust this
+        // is debug-assert UB (`attempt to shift left with overflow`).
+        // `rhs` is the shift amount; the visitor only emits this
+        // obligation when lhs and rhs share the operand type, so
+        // `rhs` is `bits` wide and the comparison is well-sorted.
+        // Unsigned compare because a shift amount is never negative.
+        ArithOp::Shl | ArithOp::Shr => {
+            let width = bv_hex(u128::from(bits), bits);
+            format!("(bvuge rhs {width})")
         }
     };
-    let bits = info.bits;
     // QF_BV: quantifier-free bit-vector logic, the decidable
     // fragment Z3 and CVC5 both handle natively.
     let mut smt = format!(
@@ -186,10 +240,7 @@ pub fn emit_overflow_problem_with_assumptions(
             smt.push('\n');
         }
     }
-    smt.push_str(&format!(
-        "(assert ({overflow_predicate} lhs rhs))\n\
-         (check-sat)\n",
-    ));
+    smt.push_str(&format!("(assert {violation})\n(check-sat)\n"));
     Some(smt)
 }
 /// Emit an SMT-LIB 2 problem that asks "is `idx >= len`
@@ -415,16 +466,62 @@ mod tests {
         assert!(emit_overflow_problem("usize", ArithOp::Add).is_none());
         assert!(emit_overflow_problem("isize", ArithOp::Add).is_none());
     }
-    /// Div / rem / shifts return None today (encoding differs;
-    /// scaffolded for follow-up commit).
+    /// Task R: Div/Rem on UNSIGNED types encode only the
+    /// division-by-zero violation `(= rhs 0)` — no signed MIN/-1
+    /// arm. Pins the exact predicate.
     #[test]
-    fn div_rem_shifts_return_none_today() {
-        for op in [ArithOp::Div, ArithOp::Rem, ArithOp::Shl, ArithOp::Shr] {
+    fn div_rem_unsigned_emits_div_by_zero_only() {
+        for op in [ArithOp::Div, ArithOp::Rem] {
+            let smt = emit_overflow_problem("u32", op).expect("u32 div/rem supported");
             assert!(
-                emit_overflow_problem("u32", op).is_none(),
-                "expected u32 {op:?} to defer SMT emission",
+                smt.contains("(assert (= rhs #x00000000))"),
+                "u32 {op:?} must assert div-by-zero `(= rhs 0)`; got:\n{smt}",
+            );
+            assert!(
+                !smt.contains("(and"),
+                "unsigned {op:?} must NOT carry the signed MIN/-1 arm; got:\n{smt}",
             );
         }
+    }
+    /// Task R: Div/Rem on SIGNED types encode div-by-zero OR the
+    /// `MIN / -1` overflow. For i32: MIN = #x80000000, -1 =
+    /// #xFFFFFFFF.
+    #[test]
+    fn div_rem_signed_emits_div_by_zero_or_min_neg_one() {
+        for op in [ArithOp::Div, ArithOp::Rem] {
+            let smt = emit_overflow_problem("i32", op).expect("i32 div/rem supported");
+            assert!(
+                smt.contains("(or (= rhs #x00000000) (and (= lhs #x80000000) (= rhs #xFFFFFFFF)))"),
+                "i32 {op:?} must assert div-by-zero OR MIN/-1; got:\n{smt}",
+            );
+        }
+    }
+    /// Task R: Shl/Shr encode the over-shift violation — shift
+    /// amount >= bit width, unsigned compare. For u32, width = 32
+    /// = #x00000020.
+    #[test]
+    fn shl_shr_emits_over_shift() {
+        for op in [ArithOp::Shl, ArithOp::Shr] {
+            let smt = emit_overflow_problem("u32", op).expect("u32 shift supported");
+            assert!(
+                smt.contains("(assert (bvuge rhs #x00000020))"),
+                "u32 {op:?} must assert over-shift `(bvuge rhs 32)`; got:\n{smt}",
+            );
+        }
+    }
+    /// Task R: the division/shift constants are width-correct
+    /// across the supported integer widths.
+    #[test]
+    fn div_shift_constants_width_correct() {
+        // u8 div-by-zero: 8-bit zero = #x00.
+        let smt = emit_overflow_problem("u8", ArithOp::Div).expect("u8");
+        assert!(smt.contains("(= rhs #x00)"), "u8 zero; got:\n{smt}");
+        // i8 MIN = #x80, -1 = #xFF.
+        let smt = emit_overflow_problem("i8", ArithOp::Div).expect("i8");
+        assert!(smt.contains("(= lhs #x80)") && smt.contains("(= rhs #xFF)"), "i8 MIN/-1; got:\n{smt}");
+        // u64 shift width = 64 = #x0000000000000040.
+        let smt = emit_overflow_problem("u64", ArithOp::Shl).expect("u64");
+        assert!(smt.contains("(bvuge rhs #x0000000000000040)"), "u64 width; got:\n{smt}");
     }
     /// Pin the IndexBound SMT-LIB shape. Catches accidental
     /// changes to the bit-width, variable names, or safety

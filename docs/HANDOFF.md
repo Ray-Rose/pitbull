@@ -21,8 +21,8 @@ Q.4 ensures-MVP), and several deep-audit cleanup passes. Branch
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch (Z3 today). See `docs/PSS-1.md` for the
   specification.
-- **State:** 185 tests passing (1 + 122 subset-lib + 27 integration
-  + 35 vc), both lanes warning-clean, clippy error-clean. Done:
+- **State:** 191 tests passing (1 + 123 subset-lib + 29 integration
+  + 38 vc), both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
   and **Option C complete** — the predicate-grammar
@@ -35,25 +35,25 @@ Q.4 ensures-MVP), and several deep-audit cleanup passes. Branch
   M-RT-Q.A–D/M-1/M-2/L-1/L-2 and the latest silent-skip closures
   (div/rem/shift coverage notes, divergent-ensures fail-closed,
   exclude-count visibility).
-- **Rules that DISCHARGE end-to-end under Z3:** exactly 2 — PB049
-  (arithmetic overflow, Add/Sub/Mul) and PB054 (slice index bound),
-  both with `pitbull.toml`/attribute preconditions. PB043 / PB041 /
-  PB076 emit obligations that `compile` returns `None` for (reported
-  "pending"). The other ~71 rules are syntactic visitor rejects.
-- **Next task (recommended):** the full-codebase audit surfaced that
-  div/rem/shift have NO obligation encoding yet — a real AoRTE gap
-  now made *visible* (audit notes) but not *closed*. The highest-
-  leverage next move is one of:
-  1. **Division/over-shift obligation encoding** — closes a genuine
-     AoRTE hole and adds discharging rules (simple QF_BV: `rhs != 0`,
-     signed `MIN/-1`, `shift < width`). Recommended: most directly
-     strengthens the core "absence of runtime errors" claim.
-  2. **Multi-solver 2-of-3 agreement** (Z3 + CVC5 + Alt-Ergo) —
+- **Rules that DISCHARGE end-to-end under Z3:** PB049 (arithmetic
+  AoRTE) and PB054 (slice index bound), both with
+  `pitbull.toml`/attribute preconditions. PB049 now covers the full
+  arithmetic family — Add/Sub/Mul overflow PLUS Div/Rem
+  division-by-zero + signed `MIN/-1` and Shl/Shr over-shift (Task R,
+  2026-05-28). PB043 / PB041 / PB076 emit obligations that `compile`
+  returns `None` for (reported "pending"). The other ~71 rules are
+  syntactic visitor rejects.
+- **Next task (recommended):** Task R closed the division/over-shift
+  AoRTE hole the audit found. The remaining highest-leverage moves:
+  1. **Multi-solver 2-of-3 agreement** (Z3 + CVC5 + Alt-Ergo) —
      closes the loudest TCB hole (a hostile `z3` on PATH is fully
-     trusted today) and is mostly mechanical against the 2 working
-     rules.
-  3. **Proof certificates + `replay`** — replayable per-obligation
+     trusted today) and is mostly mechanical against the rules that
+     already discharge. Recommended next.
+  2. **Proof certificates + `replay`** — replayable per-obligation
      artifacts; the differentiator no competing Rust verifier ships.
+  3. **Q.4a ensures SMT discharge** + **mixed-width over-shift
+     encoding** (Task R deferred the `u32 << u8` case to a
+     zero-extend follow-up; same-type shifts discharge today).
   See Section 5 for the full menu.
 - **First commands to run in a fresh session:** see
   [Section 4: Smoke test in a fresh session](#4-smoke-test-in-a-fresh-session).
@@ -131,12 +131,12 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **185 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **191 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --tests` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The 185 breaks down: 1 (cargo-pitbull bin) + 122 (subset lib) + 27 (integration) + 35 (vc) = 185. The +8 over the 177 mid-Q baseline are the Q.4 ensures tests plus the full-codebase-sweep audit-cleanup pins (div/rem/shift coverage note, divergent-ensures fail-closed, ensures non-primitive-return, JSON round-trips).
+The 191 breaks down: 1 (cargo-pitbull bin) + 123 (subset lib) + 29 (integration) + 38 (vc) = 191. The +6 over the 185 post-sweep baseline are Task R (division/over-shift obligation encoding): vc gains 3 SMT-shape tests (div-by-zero, signed MIN/-1, over-shift, width-correctness), subset gains the same-type-emit + mixed-width-fallback pair, and integration gains the two div-by-zero discharge capstones.
 
 ---
 
@@ -267,7 +267,7 @@ git log --oneline -1
 # Expected: a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
 ```
 
-### Step 4.2 — Stable test suite (the 185-test baseline)
+### Step 4.2 — Stable test suite (the 191-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
@@ -346,7 +346,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 185 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 191 passing.
 ```
 
 If any of these steps fail, the project state is degraded. Don't proceed to new tasks until baseline is green.
@@ -391,7 +391,7 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 185 passing (same as without Z3 — the new tests
+# Expected: 191 passing (same as without Z3 — the new tests
 # also pass via graceful-skip if Z3 absent, but with Z3 they
 # exercise the real `unsat` verdict path).
 ```
