@@ -334,6 +334,30 @@ fn nightly_sysroot() -> Option<PathBuf> {
     }
     Some(PathBuf::from(trimmed))
 }
+/// True when the wrapper reported that NO SMT solver was available
+/// to discharge obligations, so any solver-dependent assertion must
+/// be skipped-with-pass. Matches the multi-solver dispatch's
+/// "no configured solver is installed" banner and per-obligation
+/// "undischarged (no solver)" line (Task S, 2026-05-28), plus the
+/// legacy single-solver "z3 not installed" text for safety.
+fn no_solver_available(stderr: &str) -> bool {
+    stderr.contains("no configured solver is installed")
+        || stderr.contains("undischarged (no solver)")
+        || stderr.contains("z3 not installed")
+}
+/// True when `program` is invocable on PATH (mirrors how the wrapper
+/// spawns solvers). Used to gate the multi-solver agreement e2e test
+/// on BOTH solvers being present — it skips cleanly otherwise.
+fn solver_on_path(program: &str) -> bool {
+    std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
 /// Strip `#[pitbull::*]` and `#[pitbull_spec::*]` attributes from
 /// a source string. The corpus uses them as forward-looking
 /// annotations; the v0.2 visitor uses verify_roots config instead.
@@ -618,6 +642,10 @@ fn dispatch_refuses_contradictory_preconditions() {
 name = "corpus_test"
 toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 
+[verification]
+solvers = ["z3"]
+solver_agreement = 1
+
 [verification.preconditions]
 "corpus_test::add_one" = ["(assert false)"]
 "#
@@ -634,12 +662,12 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
     // Z3 may not be installed on every dev/CI machine. The
     // consistency-check path only fires when Z3 is reachable
     // (NotInstalled bypasses the check). Skip-with-pass if so.
-    let z3_available = !stderr.contains("z3 not installed");
-    if !z3_available {
+    let solver_available = !no_solver_available(&stderr);
+    if !solver_available {
         eprintln!(
             "dispatch_refuses_contradictory_preconditions: SKIPPED \
-             (z3 not installed; the consistency-check guard \
-             requires the solver to detect the contradiction)",
+             (no solver installed; the consistency-check guard \
+             requires a solver to detect the contradiction)",
         );
         return;
     }
@@ -873,6 +901,10 @@ fn wrapper_proves_division_safe_under_precondition() {
 name = "corpus_test"
 toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 
+[verification]
+solvers = ["z3"]
+solver_agreement = 1
+
 [verification.preconditions]
 "corpus_test::d" = ["b > 0"]
 "#
@@ -886,8 +918,8 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
     .expect("wrapper should spawn");
     let _ = fs::remove_file(&cfg_path);
     let _ = fs::remove_file(&probe_rs);
-    if stderr.contains("z3 not installed") {
-        eprintln!("wrapper_proves_division_safe_under_precondition: SKIPPED (no z3)");
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_proves_division_safe_under_precondition: SKIPPED (no solver)");
         return;
     }
     // The division obligation is a PB049 `pb049-div-*` and must
@@ -923,8 +955,8 @@ fn wrapper_division_without_precondition_not_discharged() {
     let (stderr, code) = run_one_corpus_file_full(&env, &probe_rs, &[])
         .expect("wrapper should spawn");
     let _ = fs::remove_file(&probe_rs);
-    if stderr.contains("z3 not installed") {
-        eprintln!("wrapper_division_without_precondition_not_discharged: SKIPPED (no z3)");
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_division_without_precondition_not_discharged: SKIPPED (no solver)");
         return;
     }
     assert!(
@@ -1364,6 +1396,10 @@ fn wrapper_proves_add_one_safe_under_precondition() {
 name = "corpus_test"
 toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 
+[verification]
+solvers = ["z3"]
+solver_agreement = 1
+
 [verification.preconditions]
 "corpus_test::add_one" = ["x < 100"]
 "#,
@@ -1377,10 +1413,10 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
     .expect("wrapper should spawn");
     let _ = fs::remove_file(&cfg_path);
     let _ = fs::remove_file(&probe_rs);
-    if stderr.contains("z3 not installed") {
+    if no_solver_available(&stderr) {
         eprintln!(
             "wrapper_proves_add_one_safe_under_precondition: SKIPPED \
-             (z3 not on PATH; install Z3 to exercise this end-to-end test)",
+             (no solver on PATH; install z3 to exercise this end-to-end test)",
         );
         return;
     }
@@ -1447,6 +1483,10 @@ fn wrapper_proves_bounded_index_safe_under_precondition() {
 name = "corpus_test"
 toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 
+[verification]
+solvers = ["z3"]
+solver_agreement = 1
+
 [verification.preconditions]
 "corpus_test::at" = ["(assert (bvult i len))"]
 "#,
@@ -1460,10 +1500,10 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
     .expect("wrapper should spawn");
     let _ = fs::remove_file(&cfg_path);
     let _ = fs::remove_file(&probe_rs);
-    if stderr.contains("z3 not installed") {
+    if no_solver_available(&stderr) {
         eprintln!(
             "wrapper_proves_bounded_index_safe_under_precondition: SKIPPED \
-             (z3 not on PATH; install Z3 to exercise this end-to-end test)",
+             (no solver on PATH; install z3 to exercise this end-to-end test)",
         );
         return;
     }
@@ -1541,6 +1581,10 @@ fn wrapper_proves_bounded_index_via_predicate_form() {
 name = "corpus_test"
 toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 
+[verification]
+solvers = ["z3"]
+solver_agreement = 1
+
 [verification.preconditions]
 "corpus_test::at" = ["i < len"]
 "#,
@@ -1554,10 +1598,10 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
     .expect("wrapper should spawn");
     let _ = fs::remove_file(&cfg_path);
     let _ = fs::remove_file(&probe_rs);
-    if stderr.contains("z3 not installed") {
+    if no_solver_available(&stderr) {
         eprintln!(
             "wrapper_proves_bounded_index_via_predicate_form: SKIPPED \
-             (z3 not on PATH)",
+             (no solver on PATH)",
         );
         return;
     }
@@ -1574,6 +1618,101 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
         code,
         Some(0),
         "Phase B: fully-discharged obligation should exit 0. Got {code:?}",
+    );
+}
+/// Task S capstone (2026-05-28): the MULTI-SOLVER AGREEMENT GATE
+/// proven end-to-end. `fn d(a, b) { a / b }` with `requires("b > 0")`
+/// is discharged ONLY when BOTH z3 AND cvc5 independently return
+/// `unsat` (agreement threshold 2 of the configured pool
+/// `["z3", "cvc5"]`). The verdict line must report a `2-solver
+/// agreement`, proving the discharge rests on two independent
+/// provers — not a single (possibly buggy or hostile) solver
+/// rubber-stamping unsafe code (Safety Manual §3.3, the soundness
+/// motivation for the gate).
+///
+/// Gated on BOTH solvers being present; skips cleanly otherwise so
+/// the suite stays green on machines with only one (or no) solver.
+#[test]
+fn wrapper_two_solver_agreement_discharges_division() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_two_solver_agreement_discharges_division: SKIPPED (no wrapper)");
+        return;
+    };
+    // The gate needs two independent provers. If either is absent we
+    // cannot exercise 2-of-2 agreement — skip with pass.
+    if !(solver_on_path("z3") && solver_on_path("cvc5")) {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!(
+                "PITBULL_REQUIRE_E2E set but the 2-solver agreement test \
+                 needs BOTH z3 and cvc5 on PATH",
+            );
+        }
+        eprintln!(
+            "wrapper_two_solver_agreement_discharges_division: SKIPPED \
+             (needs BOTH z3 and cvc5 on PATH)",
+        );
+        return;
+    }
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-s-agree-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-s-agree-{}.rs", std::process::id()));
+    fs::write(&probe_rs, "pub fn d(a: u32, b: u32) -> u32 { a / b }\n")
+        .expect("write probe.rs");
+    // Explicitly pin the agreement pool to z3 + cvc5 with threshold 2
+    // so the discharge requires BOTH to vote unsat.
+    let cfg_text = r#"
+[project]
+name = "corpus_test"
+toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
+
+[verification]
+solvers = ["z3", "cvc5"]
+solver_agreement = 2
+
+[verification.preconditions]
+"corpus_test::d" = ["b > 0"]
+"#
+    .to_string();
+    fs::write(&cfg_path, cfg_text).expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    // Both solvers are present (asserted above), so the no-solver
+    // path must NOT trigger.
+    assert!(
+        !no_solver_available(&stderr),
+        "Task S: both z3 and cvc5 are on PATH; the wrapper should not \
+         report a missing solver. stderr:\n{stderr}",
+    );
+    // The division obligation must discharge AND the verdict must
+    // record a 2-solver agreement — the whole point of the gate.
+    assert!(
+        stderr.contains("pb049-div-0")
+            && stderr.contains("discharged (unsat")
+            && stderr.contains("2-solver agreement"),
+        "Task S: `a / b` under `b > 0` must discharge via 2-solver \
+         agreement (z3 + cvc5). Got code {code:?}, stderr:\n{stderr}",
+    );
+    // No counterexample and — critically — no DISAGREEMENT: the two
+    // solvers must concur, not split.
+    assert!(
+        !stderr.contains("NOT DISCHARGED") && !stderr.contains("DISAGREEMENT"),
+        "Task S: z3 and cvc5 must agree (no split, no counterexample). \
+         stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "Task S: a 2-solver-discharged obligation should exit 0. Got {code:?}",
     );
 }
 /// Regression test for audit finding H3: when a hostile build.rs

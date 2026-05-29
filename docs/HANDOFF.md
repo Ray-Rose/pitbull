@@ -6,23 +6,25 @@ verifier where the previous session left off. Read top to
 bottom on first sit-down; refer back to individual sections
 during work.
 
-Last known-good commit at hand-off: **`b080d1a`** (full-codebase
-audit-cleanup: closed silent-skip soundness gaps — div/rem/shift
-audit notes, divergent-`ensures` fail-closed, exclude-count
-visibility). The v0.2 state ships the deductive backend, full PB054
-end-to-end discharge (P / P.1 / P.2), the Option-C attribute suite
-(Phase B grammar, Q.1 trusted, Q.2 impl-methods, Q.3 expression-form,
-Q.4 ensures-MVP), and several deep-audit cleanup passes. Branch
-`main`, local repo only (no remote).
+Last known-good commit at hand-off: the latest on `main` — run
+`git log -1`. The most recent milestone is **Task S** (multi-solver
+2-of-N agreement gate); the prior one is **`11aed4c`** (Task R,
+division/over-shift obligation encoding). The v0.2 state ships the
+deductive backend, full PB054 end-to-end discharge (P / P.1 / P.2),
+the Option-C attribute suite (Phase B grammar, Q.1 trusted, Q.2
+impl-methods, Q.3 expression-form, Q.4 ensures-MVP), the full
+arithmetic AoRTE family (Task R), the **multi-solver agreement gate**
+(Task S), and several deep-audit cleanup passes. Branch `main`, local
+repo only (no remote).
 
 ## TL;DR
 
 - **What it is:** Pitbull is a SPARK-style deductive verifier for Rust.
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
-  spine and SMT dispatch (Z3 today). See `docs/PSS-1.md` for the
-  specification.
-- **State:** 191 tests passing (1 + 123 subset-lib + 29 integration
-  + 38 vc), both lanes warning-clean, clippy error-clean. Done:
+  spine and SMT dispatch through a **multi-solver agreement gate**
+  (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
+- **State:** 200 tests passing (1 + 123 subset-lib + 30 integration
+  + 46 vc), both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
   and **Option C complete** — the predicate-grammar
@@ -44,14 +46,16 @@ Q.4 ensures-MVP), and several deep-audit cleanup passes. Branch
   returns `None` for (reported "pending"). The other ~71 rules are
   syntactic visitor rejects.
 - **Next task (recommended):** Task R closed the division/over-shift
-  AoRTE hole the audit found. The remaining highest-leverage moves:
-  1. **Multi-solver 2-of-3 agreement** (Z3 + CVC5 + Alt-Ergo) —
-     closes the loudest TCB hole (a hostile `z3` on PATH is fully
-     trusted today) and is mostly mechanical against the rules that
-     already discharge. Recommended next.
-  2. **Proof certificates + `replay`** — replayable per-obligation
+  AoRTE hole; **Task S closed the loudest TCB hole** — a single
+  hostile/buggy `z3` on PATH can no longer rubber-stamp unsafe code,
+  because discharge now requires `threshold` independent solvers to
+  agree `unsat` with zero `sat` votes (default `[z3, cvc5]`,
+  threshold 2; a sat/unsat split is a loud `DISAGREEMENT` that fails
+  closed). The remaining highest-leverage moves:
+  1. **Proof certificates + `replay`** — replayable per-obligation
      artifacts; the differentiator no competing Rust verifier ships.
-  3. **Q.4a ensures SMT discharge** + **mixed-width over-shift
+     Recommended next.
+  2. **Q.4a ensures SMT discharge** + **mixed-width over-shift
      encoding** (Task R deferred the `u32 << u8` case to a
      zero-extend follow-up; same-type shifts discharge today).
   See Section 5 for the full menu.
@@ -131,12 +135,13 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **191 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **200 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
-| `cargo +stable clippy --workspace --all-features --tests` | clippy-clean (no `error:` lines) |
+| `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
+| `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The 191 breaks down: 1 (cargo-pitbull bin) + 123 (subset lib) + 29 (integration) + 38 (vc) = 191. The +6 over the 185 post-sweep baseline are Task R (division/over-shift obligation encoding): vc gains 3 SMT-shape tests (div-by-zero, signed MIN/-1, over-shift, width-correctness), subset gains the same-type-emit + mixed-width-fallback pair, and integration gains the two div-by-zero discharge capstones.
+The 200 breaks down: 1 (cargo-pitbull bin) + 123 (subset lib) + 30 (integration) + 46 (vc) = 200. The +9 over the 191 Task-R baseline are Task S (multi-solver agreement gate): vc gains 8 `vote()` unit tests pinning the agreement policy (two-unsat-meets-threshold, single-unsat-inconclusive, unsat+sat-disagreement, all-sat-refuted, sat+unknown-refuted, threshold-1-discharges, no-decisions-inconclusive, known-solver-resolves), and integration gains the 2-of-N agreement discharge capstone (gated on both z3 and cvc5 present). The agreement gate's six dispatch branches (2-solver discharge, 1-solver discharge, refuted, disagreement, insufficient-agreement, consistency-refused) were additionally verified end-to-end against fake-solver shims during development.
 
 ---
 
@@ -267,11 +272,11 @@ git log --oneline -1
 # Expected: a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
 ```
 
-### Step 4.2 — Stable test suite (the 191-test baseline)
+### Step 4.2 — Stable test suite (the 200-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
-# Expected: five lines all "test result: ok. N passed" totaling 122
+# Expected: "test result: ok" lines totaling 200 passing, 0 failed, 0 ignored
 ```
 
 If you see `Application Control policy has blocked this file` on Windows: that's Smart App Control quarantining a fresh test binary. Run again — usually clears on the second try. If persistent, run `cargo +stable test --workspace --all-features` (without the -p flag) to use the workspace-mode binary path which SAC tends to accept.
@@ -346,7 +351,9 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 191 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 200 passing.
+# Note: the 2-of-N agreement capstone additionally requires BOTH z3 and
+# cvc5 on PATH; with PITBULL_REQUIRE_E2E set it panics if either is missing.
 ```
 
 If any of these steps fail, the project state is degraded. Don't proceed to new tasks until baseline is green.
@@ -391,9 +398,9 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 191 passing (same as without Z3 — the new tests
-# also pass via graceful-skip if Z3 absent, but with Z3 they
-# exercise the real `unsat` verdict path).
+# Expected: 200 passing (same as without Z3 — the new tests
+# also pass via graceful-skip if no solver is present, but with
+# z3 they exercise the real `unsat` verdict path).
 ```
 
 Additionally, run the direct smoke:
@@ -461,24 +468,30 @@ Sketch:
    posture: visitor-level reject when strict; obligation when
    non-strict).
 
-#### Option B — Multi-solver agreement (~2 days, high TCB impact)
-The SAFETY-MANUAL flags solver bugs as a real TCB hole; the
-defense is 2-of-3 agreement across Z3, CVC5, Alt-Ergo. Each
-solver adapter is similar shape (Command::new + stdin
-pipe + verdict parse). A dispatch coordinator runs all
-configured solvers in parallel, requires 2+ `unsat` votes
-to claim discharged.
+#### Option B — Multi-solver agreement ✅ DONE (Task S, 2026-05-28)
+The SAFETY-MANUAL flagged solver bugs as a real TCB hole; the
+defense is N-of-M agreement. Shipped:
+1. ✅ A generic `Solver` descriptor + `invoke_solver_with_timeout`
+   replaces the Z3-only path — Z3 (`z3 -in`), CVC5 (`cvc5
+   --lang=smt2`), and Alt-Ergo (`alt-ergo -i smtlib2`) each carry
+   their own timeout convention. `invoke_z3` is now a thin wrapper.
+   The N3 subprocess hardening (writer thread, capped readers,
+   OS-kill deadline, single-verdict parse) is preserved for all.
+2. ✅ `run_solvers` runs the configured pool in parallel; the PURE
+   `vote(results, threshold)` applies the policy: any `sat` blocks
+   discharge; a `sat`+`unsat` split is a `Disagreement` (fail
+   closed, loud); `threshold`+ `unsat` votes with zero `sat`
+   discharges; otherwise `Inconclusive`. `dispatch_vc_obligations`
+   maps the verdict to diagnostics + exit code.
+3. ✅ Default pool is `[z3, cvc5]` with threshold 2. **Alt-Ergo is
+   recognized but NOT default** — Alt-Ergo ≤ 2.4.0 has no
+   bit-vector theory ("Bitvector not yet supported"), so it can
+   never discharge a QF_BV obligation and would only dilute the
+   pool. Verified empirically 2026-05-28.
 
-Sketch:
-1. Add `pitbull-vc::solver::invoke_cvc5` and
-   `invoke_alt_ergo` adapters (different SMT-LIB
-   command-line conventions but same protocol).
-2. Extend `dispatch_vc_obligations` to invoke all enabled
-   solvers (per `cfg.verification.solvers`) and apply the
-   voting rule.
-3. Cache per-solver versions against
-   `cfg.verification.solver_versions` so a binary swap is
-   loud.
+Remaining hardening follow-up (not blocking): cache per-solver
+versions against `cfg.verification.solver_versions` so a binary
+swap is loud (the config field exists; the check is not yet wired).
 
 #### Option C — Extend O.3 attribute coverage ✅ DONE (Phase B + Q.1–Q.4)
 All four sub-items shipped:
@@ -604,7 +617,7 @@ git commit -m "..."
 
 | ID | What | Where | Why deferred |
 |---|---|---|---|
-| z3 PATH trust | Z3 binary on PATH could be a hostile substitute always returning `unsat`. | `pitbull-vc/src/solver.rs::invoke_z3` | Mitigation is the planned multi-solver agreement gate (CVC5 + Alt-Ergo). v0.2 posture is "research-grade." |
+| solver PATH trust | A solver binary on PATH could be a hostile substitute always returning `unsat`. | `pitbull-vc/src/solver.rs::{run_solvers,vote}` | **Mitigated (Task S):** discharge requires `threshold` independent solvers (default `[z3, cvc5]`, threshold 2) to agree `unsat` with zero `sat`; one corrupt solver yields at most `Inconclusive`, and a `sat`/`unsat` split is a loud `DISAGREEMENT`. Residual: a coordinated swap of ALL solvers, and the per-solver version pin (`solver_versions`) is not yet enforced. |
 | u32 file-hash collisions | `Span::file` is a u32 hash. At ~65K files, 50% collision probability. | `pitbull-subset/src/mir_api/adapter.rs` (and `mir_api.rs::Span`) | Bumping to u64 ripples through the shadow IR. Tracked. |
 | Constant operand extraction (O.2.5) | ✅ DONE in `f18a3fa`. Adapter now extracts integer values via `try_extract_integer_value`; visitor synthesizes `(assert (= rhs #x...))` pinning assertions. Sign-extension fix in `808f5dd`. | — | Closed. |
 | `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `a66a1a4`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |

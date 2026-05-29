@@ -105,19 +105,198 @@ fn process_kill_deadline(smt_timeout: Duration) -> Duration {
 /// Poll interval for `try_wait` while waiting on the child.
 /// 50ms balances responsiveness against CPU burn.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-/// Invoke Z3 with an SMT-LIB problem string on stdin. Returns the
-/// solver's verdict.
+/// How a solver expresses a per-check timeout. The OS-level kill
+/// deadline (`process_kill_deadline`) bounds every solver regardless;
+/// this is the solver-NATIVE limit that lets a well-behaved solver
+/// return `unknown` gracefully instead of being killed.
 ///
-/// Z3 is invoked with `-in` so it reads SMT-LIB from stdin. Output
-/// goes to stdout; the first non-empty trimmed line is the verdict
-/// (`sat` / `unsat` / `unknown`). Subsequent lines (`get-model`
-/// output, etc.) are ignored at this layer; counterexample
-/// rendering would consume them separately.
+/// Task S (2026-05-28).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TimeoutConvention {
+    /// Z3: prepend `(set-option :timeout <ms>)` to the SMT text.
+    Z3SmtOption,
+    /// CVC5: pass `--tlimit-per=<ms>` (per-check millisecond limit).
+    Cvc5TlimitMillis,
+    /// Alt-Ergo: pass `--timelimit=<secs>` (whole-run second limit).
+    /// Note: Alt-Ergo ≤ 2.4.0 has NO bit-vector support, so it
+    /// cannot vote on Pitbull's QF_BV problems — it returns an
+    /// error and is structurally a non-voter. The descriptor exists
+    /// for completeness / future BV-capable builds.
+    AltErgoTimelimitSecs,
+}
+/// A descriptor for an external SMT solver that reads SMT-LIB 2 from
+/// stdin and emits `sat` / `unsat` / `unknown`. Task S multi-solver
+/// agreement (2026-05-28).
+#[derive(Clone, Debug)]
+pub struct Solver {
+    /// Display name used in verdict lines and config (`"z3"`,
+    /// `"cvc5"`, `"alt-ergo"`).
+    pub name: &'static str,
+    /// Executable to spawn (looked up on `PATH`).
+    program: &'static str,
+    /// Fixed CLI args that put the solver in SMT-LIB2/stdin mode.
+    base_args: &'static [&'static str],
+    /// How this solver expresses a per-check timeout.
+    timeout: TimeoutConvention,
+}
+/// Z3: `z3 -in` reads SMT-LIB2 from stdin; timeout via SMT option.
+pub const Z3: Solver = Solver {
+    name: "z3",
+    program: "z3",
+    base_args: &["-in"],
+    timeout: TimeoutConvention::Z3SmtOption,
+};
+/// CVC5: `cvc5 --lang=smt2` reads SMT-LIB2 from stdin. Modern CVC5
+/// supports the bit-vector overflow predicates (`bvuaddo`, …) that
+/// Pitbull emits, so it is a full peer to Z3 for QF_BV.
+pub const CVC5: Solver = Solver {
+    name: "cvc5",
+    program: "cvc5",
+    base_args: &["--lang=smt2"],
+    timeout: TimeoutConvention::Cvc5TlimitMillis,
+};
+/// Alt-Ergo: `alt-ergo -i smtlib2 -o smtlib2` reads SMT-LIB2 from
+/// stdin. WARNING: Alt-Ergo ≤ 2.4.0 lacks bit-vector support and
+/// will return an error (non-vote) on Pitbull's QF_BV problems.
+/// Recognized for config completeness; not in the default pool.
+pub const ALT_ERGO: Solver = Solver {
+    name: "alt-ergo",
+    program: "alt-ergo",
+    base_args: &["-i", "smtlib2", "-o", "smtlib2"],
+    timeout: TimeoutConvention::AltErgoTimelimitSecs,
+};
+/// Resolve a config solver name to its descriptor. Unknown names
+/// return `None` so the caller can surface a clear error rather
+/// than silently dropping a solver from the agreement pool.
+#[must_use]
+pub fn known_solver(name: &str) -> Option<Solver> {
+    match name {
+        "z3" => Some(Z3),
+        "cvc5" => Some(CVC5),
+        "alt-ergo" => Some(ALT_ERGO),
+        _ => None,
+    }
+}
+/// The verdict of a multi-solver agreement vote over one obligation.
+///
+/// Soundness rationale (Safety Manual §3.3): the whole point of the
+/// gate is to defend against a single buggy/hostile solver that
+/// wrongly reports `unsat` (claims an unsafe operation safe). So:
+/// `Discharged` requires `threshold` independent `unsat` votes AND
+/// zero `sat` votes; any `sat` is a counterexample that blocks
+/// discharge; a `sat`+`unsat` split is a `Disagreement` (a red
+/// flag — a solver bug or a missed counterexample — that must fail
+/// closed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgreementVerdict {
+    /// `threshold`+ solvers returned `unsat` and none returned
+    /// `sat`. The obligation is proven safe.
+    Discharged {
+        /// How many solvers confirmed `unsat`.
+        unsat_votes: usize,
+    },
+    /// At least one solver returned `sat` (a counterexample) and
+    /// none returned `unsat`. The obligation is genuinely refuted.
+    Refuted,
+    /// Solvers DISAGREED: at least one `sat` and at least one
+    /// `unsat`. Never discharge — one of them is wrong, and we
+    /// cannot tell which. Fail closed and shout.
+    Disagreement {
+        /// Solvers that said `unsat`.
+        unsat: Vec<String>,
+        /// Solvers that said `sat`.
+        sat: Vec<String>,
+    },
+    /// Not enough `unsat` votes to reach `threshold` (and no `sat`).
+    /// E.g. only one solver could decide, or solvers returned
+    /// unknown/timeout/error/not-installed. Undischarged —
+    /// insufficient independent confirmation.
+    Inconclusive {
+        /// How many `unsat` votes were obtained.
+        unsat_votes: usize,
+        /// The threshold that was required.
+        threshold: usize,
+    },
+}
+/// Apply the agreement policy to a set of per-solver results.
+///
+/// PURE function (no I/O) so the soundness-critical voting logic is
+/// exhaustively unit-testable without any solver installed.
+///
+/// `threshold` is the minimum number of independent `unsat` votes
+/// required to discharge. It is a FIXED floor — it does NOT adapt
+/// down to the number of solvers that happened to answer, because
+/// adapting would reintroduce the single-solver-trust hole the gate
+/// exists to close.
+#[must_use]
+pub fn vote(results: &[(String, SolverResult)], threshold: usize) -> AgreementVerdict {
+    let unsat: Vec<String> = results
+        .iter()
+        .filter(|(_, r)| *r == SolverResult::Unsat)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let sat: Vec<String> = results
+        .iter()
+        .filter(|(_, r)| *r == SolverResult::Sat)
+        .map(|(n, _)| n.clone())
+        .collect();
+    if !sat.is_empty() && !unsat.is_empty() {
+        return AgreementVerdict::Disagreement { unsat, sat };
+    }
+    if !sat.is_empty() {
+        return AgreementVerdict::Refuted;
+    }
+    if unsat.len() >= threshold {
+        AgreementVerdict::Discharged { unsat_votes: unsat.len() }
+    } else {
+        AgreementVerdict::Inconclusive { unsat_votes: unsat.len(), threshold }
+    }
+}
+/// Run every solver in `solvers` on the same SMT problem, in
+/// parallel, and collect `(name, result)` pairs. Each solver runs
+/// in its own thread (they are independent processes); the wall
+/// clock is the slowest solver, not the sum. Task S.
+#[must_use]
+pub fn run_solvers(
+    solvers: &[Solver],
+    smt: &str,
+    timeout: Duration,
+) -> Vec<(String, SolverResult)> {
+    let handles: Vec<_> = solvers
+        .iter()
+        .map(|solver| {
+            // Each solver runs in its own spawned (`'static`) thread,
+            // so it needs an OWNED copy rather than a borrow of
+            // `solvers`. Clone inside the closure (not via a
+            // `.cloned()` adapter) to satisfy clippy::redundant_iter_cloned.
+            let solver = solver.clone();
+            let smt = smt.to_string();
+            std::thread::spawn(move || {
+                let r = invoke_solver_with_timeout(&solver, &smt, timeout);
+                (solver.name.to_string(), r)
+            })
+        })
+        .collect();
+    handles
+        .into_iter()
+        .map(|h| {
+            h.join().unwrap_or_else(|_| {
+                // A coordinator thread panicking is itself a fault;
+                // surface it as an Error result (non-vote) rather
+                // than crashing the whole dispatch.
+                (
+                    "<panicked>".to_string(),
+                    SolverResult::Error("solver coordinator thread panicked".into()),
+                )
+            })
+        })
+        .collect()
+}
+/// Invoke Z3 with an SMT-LIB problem string on stdin. Returns the
+/// solver's verdict. Back-compat wrapper over `invoke_solver`.
 ///
 /// If Z3 isn't on PATH, returns `SolverResult::NotInstalled` —
-/// caller decides whether that's fatal. This matters: the v0.2
-/// scaffold ships before Z3 becomes a hard requirement, and the
-/// existing test suite must keep passing without it.
+/// caller decides whether that's fatal.
 #[must_use]
 pub fn invoke_z3(smt: &str) -> SolverResult {
     invoke_z3_with_timeout(smt, DEFAULT_TIMEOUT)
@@ -141,32 +320,63 @@ pub fn invoke_z3(smt: &str) -> SolverResult {
 ///   truncated output.
 #[must_use]
 pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
-    // Inject the timeout via SMT-LIB's `set-option :timeout`.
-    // Milliseconds, applied to subsequent `check-sat` calls. We
-    // prepend rather than append so any timeout the caller wrote
-    // wins (last-write-wins semantics in Z3).
+    invoke_solver_with_timeout(&Z3, smt, timeout)
+}
+/// Invoke an arbitrary `Solver` with an SMT-LIB problem on stdin,
+/// applying the same N3 hardening as the original Z3 path: a
+/// dedicated stdin writer thread, capped stdout/stderr reader
+/// threads, an OS-level kill deadline, and strict single-verdict
+/// parsing. The only per-solver differences are the program/args
+/// and how the timeout is expressed. Task S (2026-05-28).
+#[must_use]
+pub fn invoke_solver_with_timeout(
+    solver: &Solver,
+    smt: &str,
+    timeout: Duration,
+) -> SolverResult {
+    let name = solver.name;
     let timeout_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
+    // Build the SMT text. Z3 takes its timeout as an SMT option
+    // prepended to the problem; other solvers take it as a CLI arg
+    // (added below), so their text is the problem verbatim.
     let mut full = String::with_capacity(smt.len() + 64);
-    full.push_str(&format!("(set-option :timeout {timeout_ms})\n"));
+    if solver.timeout == TimeoutConvention::Z3SmtOption {
+        // Prepend so a caller-supplied `:timeout` wins
+        // (last-write-wins in Z3).
+        full.push_str(&format!("(set-option :timeout {timeout_ms})\n"));
+    }
     full.push_str(smt);
-    // Audit finding H-RT3 (2026-05-26): refuse oversized SMT
-    // input. A malicious pitbull.toml precondition can ship a
-    // multi-gigabyte assertion that F2 validates (it IS a single
-    // balanced `(assert ...)` form) but would OOM the wrapper as
-    // the writer thread holds it in memory. Cap at 64 MiB —
-    // legitimate Pitbull-emitted problems are <4 KiB.
+    // Audit finding H-RT3 (2026-05-26): refuse oversized SMT input.
+    // A malicious pitbull.toml precondition can ship a multi-GB
+    // assertion that F2 validates but would OOM the wrapper as the
+    // writer thread holds it in memory. Cap at 64 MiB — legitimate
+    // Pitbull problems are <4 KiB.
     if full.len() > SMT_INPUT_CAP_BYTES {
         return SolverResult::Error(format!(
             "smt input exceeded {} MiB cap (got {} bytes); refusing \
-             to invoke z3. Pitbull's own emitted problems are under \
-             4 KiB; an input this large indicates a pathological \
+             to invoke {name}. Pitbull's own emitted problems are \
+             under 4 KiB; an input this large indicates a pathological \
              precondition (see pitbull.toml `[verification.preconditions]`).",
             SMT_INPUT_CAP_BYTES / (1024 * 1024),
             full.len(),
         ));
     }
-    let mut child = match Command::new("z3")
-        .arg("-in")
+    // Assemble CLI args: the solver's base args plus any
+    // timeout-expressing arg.
+    let mut args: Vec<String> = solver.base_args.iter().map(|s| (*s).to_string()).collect();
+    match solver.timeout {
+        TimeoutConvention::Z3SmtOption => {}
+        TimeoutConvention::Cvc5TlimitMillis => {
+            args.push(format!("--tlimit-per={timeout_ms}"));
+        }
+        TimeoutConvention::AltErgoTimelimitSecs => {
+            // Whole seconds, rounded up, minimum 1.
+            let secs = timeout.as_secs().max(1);
+            args.push(format!("--timelimit={secs}"));
+        }
+    }
+    let mut child = match Command::new(solver.program)
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -176,7 +386,7 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return SolverResult::NotInstalled;
         }
-        Err(e) => return SolverResult::Error(format!("spawn z3: {e}")),
+        Err(e) => return SolverResult::Error(format!("spawn {name}: {e}")),
     };
     // Move stdin into a dedicated writer thread.
     //
@@ -242,7 +452,7 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
                 let _ = stdout_handle.map(std::thread::JoinHandle::join);
                 let _ = stderr_handle.map(std::thread::JoinHandle::join);
                 let _ = writer_handle.map(std::thread::JoinHandle::join);
-                return SolverResult::Error(format!("try_wait z3: {e}"));
+                return SolverResult::Error(format!("try_wait {name}: {e}"));
             }
         }
     };
@@ -281,11 +491,11 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
     });
     let (stdout_bytes, stdout_capped) = match stdout_result {
         Ok(v) => v,
-        Err(e) => return SolverResult::Error(format!("read z3 stdout: {e}")),
+        Err(e) => return SolverResult::Error(format!("read {name} stdout: {e}")),
     };
     let (stderr_bytes, _stderr_capped) = match stderr_result {
         Ok(v) => v,
-        Err(e) => return SolverResult::Error(format!("read z3 stderr: {e}")),
+        Err(e) => return SolverResult::Error(format!("read {name} stderr: {e}")),
     };
     // N3 red-team finding H3 (carried through to the threaded
     // design): if the writer failed for a reason OTHER than
@@ -295,7 +505,7 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
     if !hit_deadline {
         if let Some(Err(e)) = &writer_result {
             if e.kind() != std::io::ErrorKind::BrokenPipe {
-                return SolverResult::Error(format!("write z3 stdin: {e}"));
+                return SolverResult::Error(format!("write {name} stdin: {e}"));
             }
         }
     }
@@ -304,7 +514,7 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
     }
     if stdout_capped {
         return SolverResult::Error(format!(
-            "z3 stdout exceeded {} MiB cap; refusing to interpret \
+            "{name} stdout exceeded {} MiB cap; refusing to interpret \
              possibly-truncated verdict. This usually indicates a \
              pathological SMT problem (e.g. unbounded model output).",
             STDOUT_CAP_BYTES / (1024 * 1024),
@@ -337,16 +547,16 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
             let status_code = exit_status.and_then(|s| s.code());
             if stdout.contains("error") || stderr_str.contains("error") {
                 SolverResult::Error(format!(
-                    "z3 emitted no verdict; output contained errors. \
+                    "{name} emitted no verdict; output contained errors. \
                      stdout: {stdout:?}, stderr: {stderr_str:?}",
                 ))
             } else if status_success {
                 SolverResult::Error(format!(
-                    "no verdict from z3 (stdout: {stdout:?}, stderr: {stderr_str:?})",
+                    "no verdict from {name} (stdout: {stdout:?}, stderr: {stderr_str:?})",
                 ))
             } else {
                 SolverResult::Error(format!(
-                    "z3 exited {status_code:?} with no verdict in output: {stdout}",
+                    "{name} exited {status_code:?} with no verdict in output: {stdout}",
                 ))
             }
         }
@@ -356,7 +566,7 @@ pub fn invoke_z3_with_timeout(smt: &str, timeout: Duration) -> SolverResult {
             // `(check-sat)` directive intends to confuse our parser
             // into picking the WRONG verdict.
             SolverResult::Error(format!(
-                "z3 emitted {} verdict lines (expected exactly 1); \
+                "{name} emitted {} verdict lines (expected exactly 1); \
                  refusing to interpret. Verdicts: {many:?}",
                 many.len(),
             ))
@@ -578,5 +788,98 @@ mod tests {
             }
             other => panic!("expected Unsat or NotInstalled; got {other:?}"),
         }
+    }
+    // ===== Task S: multi-solver agreement voting (pure logic) =========
+    // These exercise the soundness-critical voting policy WITHOUT any
+    // solver installed — `vote` is a pure function over results.
+    fn r(name: &str, res: SolverResult) -> (String, SolverResult) {
+        (name.to_string(), res)
+    }
+    /// Two independent `unsat` votes meet threshold 2 → Discharged.
+    #[test]
+    fn vote_two_unsat_meets_threshold_2() {
+        let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
+        assert_eq!(
+            vote(&results, 2),
+            AgreementVerdict::Discharged { unsat_votes: 2 },
+        );
+    }
+    /// ONE `unsat` vote does NOT meet threshold 2 → Inconclusive.
+    /// This is the core defense: a single solver (even an honest one)
+    /// cannot discharge under a 2-of-N policy.
+    #[test]
+    fn vote_single_unsat_below_threshold_is_inconclusive() {
+        let results = [
+            r("z3", SolverResult::Unsat),
+            r("cvc5", SolverResult::Error("no bv".into())),
+        ];
+        assert_eq!(
+            vote(&results, 2),
+            AgreementVerdict::Inconclusive { unsat_votes: 1, threshold: 2 },
+        );
+    }
+    /// A hostile/buggy solver saying `unsat` while another finds a
+    /// `sat` counterexample is a DISAGREEMENT — never discharge.
+    /// This is exactly the scenario the gate exists to catch.
+    #[test]
+    fn vote_unsat_plus_sat_is_disagreement() {
+        let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Sat)];
+        match vote(&results, 2) {
+            AgreementVerdict::Disagreement { unsat, sat } => {
+                assert_eq!(unsat, vec!["z3"]);
+                assert_eq!(sat, vec!["cvc5"]);
+            }
+            other => panic!("expected Disagreement, got {other:?}"),
+        }
+    }
+    /// All-`sat` (no unsat) is a genuine refutation, not a
+    /// disagreement.
+    #[test]
+    fn vote_all_sat_is_refuted() {
+        let results = [r("z3", SolverResult::Sat), r("cvc5", SolverResult::Sat)];
+        assert_eq!(vote(&results, 2), AgreementVerdict::Refuted);
+    }
+    /// One `sat` + one no-opinion (unknown) is still Refuted — a
+    /// counterexample from any solver blocks discharge, and there's
+    /// no competing `unsat` to make it a disagreement.
+    #[test]
+    fn vote_sat_plus_unknown_is_refuted() {
+        let results = [r("z3", SolverResult::Sat), r("cvc5", SolverResult::Unknown)];
+        assert_eq!(vote(&results, 2), AgreementVerdict::Refuted);
+    }
+    /// Threshold 1 (single-solver back-compat mode): one `unsat`
+    /// discharges.
+    #[test]
+    fn vote_threshold_one_single_unsat_discharges() {
+        let results = [r("z3", SolverResult::Unsat)];
+        assert_eq!(
+            vote(&results, 1),
+            AgreementVerdict::Discharged { unsat_votes: 1 },
+        );
+    }
+    /// All non-deciding (unknown/timeout/error/not-installed) →
+    /// Inconclusive with zero unsat votes.
+    #[test]
+    fn vote_no_decisions_is_inconclusive_zero() {
+        let results = [
+            r("z3", SolverResult::Unknown),
+            r("cvc5", SolverResult::NotInstalled),
+            r("alt-ergo", SolverResult::Error("no bv".into())),
+        ];
+        assert_eq!(
+            vote(&results, 2),
+            AgreementVerdict::Inconclusive { unsat_votes: 0, threshold: 2 },
+        );
+    }
+    /// `known_solver` resolves the three built-ins and rejects
+    /// unknown names (so the wrapper surfaces a clear config error
+    /// rather than silently dropping a solver).
+    #[test]
+    fn known_solver_resolves_builtins() {
+        assert_eq!(known_solver("z3").unwrap().name, "z3");
+        assert_eq!(known_solver("cvc5").unwrap().name, "cvc5");
+        assert_eq!(known_solver("alt-ergo").unwrap().name, "alt-ergo");
+        assert!(known_solver("bogus-solver").is_none());
+        assert!(known_solver("Z3").is_none(), "name match is case-sensitive");
     }
 }

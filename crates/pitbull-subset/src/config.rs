@@ -124,7 +124,16 @@ impl Default for VerificationSection {
 fn default_vc_timeout() -> u64 { 60 }
 fn default_solver_agreement() -> u8 { 2 }
 fn default_solvers() -> Vec<String> {
-    vec!["z3".into(), "cvc5".into(), "alt-ergo".into()]
+    // Default agreement pool: z3 + cvc5. Both fully support the
+    // QF_BV bit-vector logic Pitbull emits (verified empirically
+    // 2026-05-28: both decide `bvuaddo`/`bvsdiv`/`bvshl` problems).
+    // Alt-Ergo is intentionally NOT in the default set — Alt-Ergo
+    // 2.4.0 has no bit-vector theory ("Bitvector not yet supported",
+    // "Undefined sort BitVec"), so it can never discharge an
+    // overflow/index obligation and would only ever dilute the
+    // agreement pool. Users targeting a future BV-capable Alt-Ergo
+    // can add it explicitly via `[verification] solvers`.
+    vec!["z3".into(), "cvc5".into()]
 }
 /// `[subset]` — PSS-1 enforcement knobs.
 #[derive(Clone, Debug, Serialize, Deserialize)]

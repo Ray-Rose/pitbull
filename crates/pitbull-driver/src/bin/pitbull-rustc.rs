@@ -286,13 +286,13 @@ impl PitbullCallbacks {
         // before the MIR pass and emit PB001 violations directly into
         // the report. tcx.hir_visit_all_item_likes_in_crate is callable
         // here because tcx remains valid inside rustc_internal::run.
-        let (
-            hir_pb001_errors,
-            hir_filename_partials,
-            hir_preconditions,
-            hir_trusted,
-            hir_ensures,
-        ) = collect_hir_pre_pass(tcx);
+        let HirPrePass {
+            violations: hir_pb001_errors,
+            filename_table: hir_filename_partials,
+            preconditions: hir_preconditions,
+            trusted: hir_trusted,
+            ensures: hir_ensures,
+        } = collect_hir_pre_pass(tcx);
         self.hir_unsafe_blocks = hir_pb001_errors.len();
         // CrateDef gives `name()`, `span()`, `def_id()` as trait methods.
         // `ty()` is exposed as an inherent method on CrateItem (via the
@@ -543,7 +543,30 @@ impl PitbullCallbacks {
         // PanicReachability) surfaces as "pending" — the obligation
         // is recorded but no SMT was generated.
         if !report.vc_obligations.is_empty() {
-            self.undischarged_obligations += dispatch_vc_obligations(&report);
+            // Build the solver pool from config (Task S). Each
+            // configured name maps to a known descriptor; an
+            // unknown name is surfaced as a hard error (do NOT
+            // silently drop a solver — that would shrink the
+            // agreement pool below what the user asked for and
+            // could weaken the gate). If, after dropping unknowns,
+            // the pool is empty, fall back to nothing — the
+            // dispatch will then report every obligation as
+            // "no solver" / undischarged (fail closed).
+            let mut solvers = Vec::new();
+            for name in &cfg.verification.solvers {
+                match pitbull_vc::solver::known_solver(name) {
+                    Some(s) => solvers.push(s),
+                    None => eprintln!(
+                        "pitbull-rustc: WARNING: unknown solver `{name}` in \
+                         [verification] solvers — ignoring. Known: z3, cvc5, alt-ergo.",
+                    ),
+                }
+            }
+            let threshold = usize::from(cfg.verification.solver_agreement).max(1);
+            let timeout =
+                std::time::Duration::from_secs(cfg.verification.vc_timeout_seconds);
+            self.undischarged_obligations +=
+                dispatch_vc_obligations(&report, &solvers, threshold, timeout);
         }
         // Optional SARIF emission. When `PITBULL_SARIF_OUT` is set,
         // write the (minimal) SARIF report to that path. Each wrapper
@@ -595,21 +618,53 @@ impl PitbullCallbacks {
 /// Free function (not a method on `PitbullCallbacks`) because it
 /// only reads the report and accumulates a result — no callback
 /// state mutation needed.
+/// Short tag for a `SolverResult`, for the per-solver breakdown line.
 #[cfg(rustc_public_real)]
-fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
+fn solver_result_tag(r: &pitbull_vc::SolverResult) -> &'static str {
+    match r {
+        pitbull_vc::SolverResult::Sat => "sat",
+        pitbull_vc::SolverResult::Unsat => "unsat",
+        pitbull_vc::SolverResult::Unknown => "unknown",
+        pitbull_vc::SolverResult::NotInstalled => "not-installed",
+        pitbull_vc::SolverResult::Timeout => "timeout",
+        pitbull_vc::SolverResult::Error(_) => "error",
+    }
+}
+/// Render a per-solver breakdown like `z3=unsat cvc5=unsat alt-ergo=error`.
+#[cfg(rustc_public_real)]
+fn solver_breakdown(results: &[(String, pitbull_vc::SolverResult)]) -> String {
+    results
+        .iter()
+        .map(|(n, r)| format!("{n}={}", solver_result_tag(r)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+/// Compile each `VcObligation`, then discharge it through the
+/// MULTI-SOLVER AGREEMENT GATE (Task S, 2026-05-28): every
+/// configured solver runs the same problem in parallel, and an
+/// obligation is reported `discharged` only when at least
+/// `threshold` solvers independently return `unsat` AND none
+/// returns `sat`. This closes the TCB hole where a single hostile
+/// or buggy `z3` on `PATH` could rubber-stamp unsafe code by
+/// wrongly returning `unsat` (Safety Manual §3.3).
+///
+/// Returns the number of undischarged obligations for the
+/// wrapper's exit-code calculation (F10).
+#[cfg(rustc_public_real)]
+fn dispatch_vc_obligations(
+    report: &pitbull_subset::SubsetReport,
+    solvers: &[pitbull_vc::solver::Solver],
+    threshold: usize,
+    timeout: std::time::Duration,
+) -> usize {
+    use pitbull_vc::solver::{run_solvers, vote, AgreementVerdict};
     let mut solver_missing_announced = false;
     let mut discharged = 0usize;
     let mut undischarged = 0usize;
     for obligation in &report.vc_obligations {
-        // Canonical PSS-1 rule ID (uppercase `PBxxx`) surfaced
-        // alongside the obligation id on every verdict line.
-        // Two purposes:
-        //   1. Integration tests (and SARIF consumers) that
-        //      look for the canonical rule string in stderr
-        //      can match it without needing to parse the
-        //      obligation id format.
-        //   2. Auditors reading the dispatch log don't have to
-        //      mentally map `pb054-idx-0` → PB054.
+        // Canonical PSS-1 rule ID (uppercase `PBxxx`) on every
+        // verdict line, so tests/SARIF consumers and auditors don't
+        // have to map `pb054-idx-0` → PB054.
         let rule = obligation.kind.rule_id();
         let Some(goal) = pitbull_vc::compile(obligation) else {
             eprintln!(
@@ -619,71 +674,39 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
             undischarged += 1;
             continue;
         };
-        // Soundness guard (red-team F1): if assumptions are
-        // present, FIRST verify they are jointly satisfiable.
-        // Contradictory preconditions (`(assert false)`, mutually
-        // exclusive constraints, etc.) would make the main check
-        // vacuously unsat — silently "verifying" unsafe code. By
-        // running the consistency check first and treating its
-        // `Unsat` as a hard refusal, we close that hole.
-        //
-        // The consistency check is omitted when there are zero
-        // assumptions (trivially consistent — see compile()).
+        // Soundness guard (red-team F1), now multi-solver: if
+        // assumptions are present, FIRST verify they are jointly
+        // satisfiable. Contradictory preconditions would make the
+        // main check vacuously unsat for EVERY honest solver —
+        // silently "verifying" unsafe code via vacuous implication,
+        // which the agreement gate alone would NOT catch (all
+        // honest solvers agree unsat). So: if ANY configured solver
+        // proves the assumptions contradictory (`unsat`), refuse.
+        // Erring toward detecting contradictions is the safe
+        // direction (a false refusal rejects safe code; a missed
+        // contradiction is unsound).
         if let Some(cs_smt) = &goal.consistency_check {
-            match pitbull_vc::solver::invoke_z3(cs_smt) {
-                pitbull_vc::SolverResult::Unsat => {
-                    eprintln!(
-                        "pitbull-rustc: vc {} ({rule}): REFUSED — preconditions are \
-                         contradictory (sat-check returned unsat); a discharge \
-                         claim here would be vacuously true",
-                        obligation.id,
-                    );
-                    undischarged += 1;
-                    continue;
-                }
-                pitbull_vc::SolverResult::NotInstalled => {
-                    // Solver missing — same behavior as the main
-                    // dispatch handles below; fall through to let
-                    // the main check report it once.
-                }
-                pitbull_vc::SolverResult::Sat | pitbull_vc::SolverResult::Unknown => {
-                    // Sat (or Unknown) means the assumptions are
-                    // not provably contradictory — proceed to the
-                    // main check. Unknown is conservative: we
-                    // assume the assumptions COULD be satisfiable
-                    // and let the main check decide.
-                }
-                pitbull_vc::SolverResult::Timeout => {
-                    eprintln!(
-                        "pitbull-rustc: vc {} ({rule}): undischarged (consistency check \
-                         timed out — assumption set may be too complex)",
-                        obligation.id,
-                    );
-                    undischarged += 1;
-                    continue;
-                }
-                pitbull_vc::SolverResult::Error(e) => {
-                    eprintln!(
-                        "pitbull-rustc: vc {} ({rule}): undischarged (consistency check \
-                         solver error: {e})",
-                        obligation.id,
-                    );
-                    undischarged += 1;
-                    continue;
-                }
+            let cs_results = run_solvers(solvers, cs_smt, timeout);
+            let any_unsat = cs_results
+                .iter()
+                .any(|(_, r)| *r == pitbull_vc::SolverResult::Unsat);
+            if any_unsat {
+                eprintln!(
+                    "pitbull-rustc: vc {} ({rule}): REFUSED — preconditions are \
+                     contradictory (a solver's consistency check returned unsat: \
+                     [{}]); a discharge claim here would be vacuously true",
+                    obligation.id,
+                    solver_breakdown(&cs_results),
+                );
+                undischarged += 1;
+                continue;
             }
+            // Otherwise proceed to the main check (sat/unknown/error/
+            // not-installed on the consistency check are all
+            // "not provably contradictory" — the main check decides).
         }
-        // Build a "[N assumption(s)]" suffix so every verdict
-        // line carries visible audit-trail context: how many
-        // hypotheses (constant pins + user preconditions) the
-        // solver received. Empty when there are no assumptions
-        // — keeps verdict lines for unconstrained obligations
-        // terse.
-        //
-        // Resolves the v0.2.5 audit's L-3 finding ("assumptions
-        // not surfaced in stderr / SARIF") — at least the count
-        // is now visible. Verbose-mode full-text dump remains a
-        // future follow-up.
+        // "[N assumption(s)]" suffix surfaces how many hypotheses
+        // the solvers received (audit finding L-3 visibility).
         let n_assumptions = obligation.assumptions.len();
         let assumption_suffix = if n_assumptions == 0 {
             String::new()
@@ -693,64 +716,84 @@ fn dispatch_vc_obligations(report: &pitbull_subset::SubsetReport) -> usize {
                 if n_assumptions == 1 { "" } else { "s" },
             )
         };
-        match pitbull_vc::solver::invoke_z3(&goal.smt) {
-            pitbull_vc::SolverResult::Unsat => {
+        // Main check through the agreement gate.
+        let results = run_solvers(solvers, &goal.smt, timeout);
+        let breakdown = solver_breakdown(&results);
+        // If EVERY solver is not-installed, that's the "no solver"
+        // case — announce the install hint once.
+        let all_missing = !results.is_empty()
+            && results
+                .iter()
+                .all(|(_, r)| *r == pitbull_vc::SolverResult::NotInstalled);
+        match vote(&results, threshold) {
+            AgreementVerdict::Discharged { unsat_votes } => {
+                // Format note: the verdict keeps the literal substring
+                // `discharged (unsat` first so existing integration
+                // assertions and SARIF consumers that match on it keep
+                // working; the agreement count is appended.
                 eprintln!(
-                    "pitbull-rustc: vc {} ({rule}): discharged (unsat — safety property holds){assumption_suffix}",
+                    "pitbull-rustc: vc {} ({rule}): discharged (unsat — safety property \
+                     holds; {unsat_votes}-solver agreement){assumption_suffix} [{breakdown}]",
                     obligation.id,
                 );
                 discharged += 1;
             }
-            pitbull_vc::SolverResult::Sat => {
+            AgreementVerdict::Refuted => {
                 eprintln!(
-                    "pitbull-rustc: vc {} ({rule}): NOT DISCHARGED (sat — counterexample exists){assumption_suffix}",
+                    "pitbull-rustc: vc {} ({rule}): NOT DISCHARGED (sat — counterexample \
+                     exists){assumption_suffix} [{breakdown}]",
                     obligation.id,
                 );
                 undischarged += 1;
             }
-            pitbull_vc::SolverResult::NotInstalled => {
-                if !solver_missing_announced {
+            AgreementVerdict::Disagreement { unsat, sat } => {
+                // The loudest possible diagnostic: solvers split on
+                // the same problem. One is wrong; we cannot tell
+                // which, so we MUST fail closed. This is precisely
+                // the event the gate exists to surface.
+                eprintln!(
+                    "pitbull-rustc: vc {} ({rule}): DISAGREEMENT — solvers split on the \
+                     same problem (unsat: {unsat:?}; sat: {sat:?}). Refusing to trust \
+                     either verdict; treat as UNVERIFIED and investigate (likely a \
+                     solver bug or a missed counterexample).{assumption_suffix} [{breakdown}]",
+                    obligation.id,
+                );
+                undischarged += 1;
+            }
+            AgreementVerdict::Inconclusive { unsat_votes, threshold } => {
+                if all_missing {
+                    if !solver_missing_announced {
+                        eprintln!(
+                            "pitbull-rustc: no configured solver is installed; VC \
+                             obligations cannot be discharged. Install at least \
+                             {threshold} of the configured solvers (e.g. z3, cvc5) \
+                             and add them to PATH.",
+                        );
+                        solver_missing_announced = true;
+                    }
                     eprintln!(
-                        "pitbull-rustc: z3 not installed; VC obligations cannot \
-                         be discharged. Install z3 (https://github.com/Z3Prover/z3) \
-                         and add it to PATH.",
+                        "pitbull-rustc: vc {} ({rule}): undischarged (no solver){assumption_suffix} [{breakdown}]",
+                        obligation.id,
                     );
-                    solver_missing_announced = true;
+                } else {
+                    eprintln!(
+                        "pitbull-rustc: vc {} ({rule}): undischarged (insufficient \
+                         agreement: {unsat_votes}/{threshold} unsat votes — need \
+                         {threshold} independent solvers to agree){assumption_suffix} [{breakdown}]",
+                        obligation.id,
+                    );
                 }
-                eprintln!(
-                    "pitbull-rustc: vc {} ({rule}): undischarged (no solver){assumption_suffix}",
-                    obligation.id,
-                );
-                undischarged += 1;
-            }
-            pitbull_vc::SolverResult::Unknown => {
-                eprintln!(
-                    "pitbull-rustc: vc {} ({rule}): undischarged (solver returned unknown){assumption_suffix}",
-                    obligation.id,
-                );
-                undischarged += 1;
-            }
-            pitbull_vc::SolverResult::Timeout => {
-                eprintln!(
-                    "pitbull-rustc: vc {} ({rule}): undischarged (timeout){assumption_suffix}",
-                    obligation.id,
-                );
-                undischarged += 1;
-            }
-            pitbull_vc::SolverResult::Error(e) => {
-                eprintln!(
-                    "pitbull-rustc: vc {} ({rule}): undischarged (solver error: {e}){assumption_suffix}",
-                    obligation.id,
-                );
                 undischarged += 1;
             }
         }
     }
     eprintln!(
-        "pitbull-rustc: VC summary: {} obligation(s), {} discharged, {} undischarged",
+        "pitbull-rustc: VC summary: {} obligation(s), {} discharged, {} undischarged \
+         (agreement threshold {threshold} of {} solver(s))",
         report.vc_obligations.len(),
         discharged,
         undischarged,
+        solvers.len(),
     );
     undischarged
 }
@@ -986,16 +1029,26 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 /// `adapter::take_filename_table()` for SARIF URIs), and the
 /// HIR-derived precondition map (merged with
 /// `cfg.verification.preconditions` per call site).
+/// Result of the HIR pre-pass. A named struct rather than a bare
+/// 5-tuple: two of the fields (`preconditions` and `ensures`) share
+/// the identical type `HashMap<String, Vec<String>>`, so a positional
+/// tuple invited a silent swap — exactly the kind of mistake a
+/// soundness tool must not ship. (Also clears clippy::type_complexity.)
 #[cfg(rustc_public_real)]
-fn collect_hir_pre_pass<'tcx>(
-    tcx: rustc_middle::ty::TyCtxt<'tcx>,
-) -> (
-    Vec<pitbull_subset::SubsetError>,
-    std::collections::HashMap<u32, String>,
-    std::collections::HashMap<String, Vec<String>>,
-    std::collections::HashSet<String>,
-    std::collections::HashMap<String, Vec<String>>,
-) {
+struct HirPrePass {
+    /// PB001 (`unsafe {}` block) violations found at HIR level.
+    violations: Vec<pitbull_subset::SubsetError>,
+    /// Partial DefId→filename table, merged for SARIF URIs.
+    filename_table: std::collections::HashMap<u32, String>,
+    /// `#[pitbull::requires(...)]` preconditions by fn path.
+    preconditions: std::collections::HashMap<String, Vec<String>>,
+    /// `#[pitbull::trusted]` function paths.
+    trusted: std::collections::HashSet<String>,
+    /// `#[pitbull::ensures(...)]` postconditions by fn path.
+    ensures: std::collections::HashMap<String, Vec<String>>,
+}
+#[cfg(rustc_public_real)]
+fn collect_hir_pre_pass(tcx: rustc_middle::ty::TyCtxt<'_>) -> HirPrePass {
     let mut visitor = HirPreVisitor {
         tcx,
         violations: Vec::new(),
@@ -1005,13 +1058,13 @@ fn collect_hir_pre_pass<'tcx>(
         trusted: std::collections::HashSet::new(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
-    (
-        visitor.violations,
-        visitor.filename_table,
-        visitor.preconditions,
-        visitor.trusted,
-        visitor.ensures,
-    )
+    HirPrePass {
+        violations: visitor.violations,
+        filename_table: visitor.filename_table,
+        preconditions: visitor.preconditions,
+        trusted: visitor.trusted,
+        ensures: visitor.ensures,
+    }
 }
 #[cfg(rustc_public_real)]
 struct HirPreVisitor<'tcx> {

@@ -1365,6 +1365,21 @@ the std form and now also matches. No shadow type changes.
   amount, is a tracked follow-up). e2e capstones:
   `wrapper_proves_division_safe_under_precondition` and
   `wrapper_division_without_precondition_not_discharged`.
+- ✅ Multi-solver agreement gate (Task S, 2026-05-28). Discharge no
+  longer trusts a single solver: `pitbull-vc::solver` gained a generic
+  `Solver` descriptor (Z3 / CVC5 / Alt-Ergo, each with its own timeout
+  convention), `run_solvers` (parallel pool), and a PURE
+  `vote(results, threshold)` policy — any `sat` blocks discharge, a
+  `sat`+`unsat` split is a loud `Disagreement` (fail closed),
+  `threshold`+ `unsat` with zero `sat` discharges, else `Inconclusive`.
+  `dispatch_vc_obligations` maps the verdict to diagnostics + exit code,
+  and the consistency-check guard now refuses if ANY solver proves the
+  preconditions contradictory. Default pool `[z3, cvc5]`, threshold 2;
+  **Alt-Ergo is recognized but excluded by default** — Alt-Ergo ≤ 2.4.0
+  has no bit-vector theory, so it can never discharge QF_BV. The policy
+  is pinned by 8 `vote()` unit tests; the e2e capstone
+  `wrapper_two_solver_agreement_discharges_division` proves 2-of-2
+  agreement (gated on both z3 and cvc5).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1372,7 +1387,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  191 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  200 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1385,14 +1400,17 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 191 passing, 0 warnings, clippy clean
+# Stable: 200 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
-cargo +stable clippy --workspace --all-features --tests
-# Nightly + opt-in: wrapper builds, end-to-end PB049/PB054 discharge
-# under Z3 (graceful skip when Z3 isn't on PATH).
+cargo +stable clippy --workspace --all-features --all-targets
+# Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054
+# discharge through the multi-solver gate (graceful skip when no
+# solver is on PATH).
+PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc
 PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
 ```
 Future-roadmap detail lives in `docs/HANDOFF.md`; multi-solver
-agreement and the v0.3 path-sensitive panic-reachability backend
-are the next two strategic directions.
+agreement shipped (Task S). **Proof certificates + `replay`** and the
+v0.3 path-sensitive panic-reachability backend are the next two
+strategic directions.
