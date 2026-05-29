@@ -23,8 +23,8 @@ repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 200 tests passing (1 + 123 subset-lib + 30 integration
-  + 46 vc), both lanes warning-clean, clippy error-clean. Done:
+- **State:** 202 tests passing (1 + 123 subset-lib + 30 integration
+  + 48 vc), both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
   and **Option C complete** — the predicate-grammar
@@ -135,13 +135,13 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **200 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **202 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The 200 breaks down: 1 (cargo-pitbull bin) + 123 (subset lib) + 30 (integration) + 46 (vc) = 200. The +9 over the 191 Task-R baseline are Task S (multi-solver agreement gate): vc gains 8 `vote()` unit tests pinning the agreement policy (two-unsat-meets-threshold, single-unsat-inconclusive, unsat+sat-disagreement, all-sat-refuted, sat+unknown-refuted, threshold-1-discharges, no-decisions-inconclusive, known-solver-resolves), and integration gains the 2-of-N agreement discharge capstone (gated on both z3 and cvc5 present). The agreement gate's six dispatch branches (2-solver discharge, 1-solver discharge, refuted, disagreement, insufficient-agreement, consistency-refused) were additionally verified end-to-end against fake-solver shims during development.
+The 202 breaks down: 1 (cargo-pitbull bin) + 123 (subset lib) + 30 (integration) + 48 (vc) = 202. The +11 over the 191 Task-R baseline are Task S (multi-solver agreement gate) plus its post-commit red-team hardening: vc gains 10 `vote()` unit tests — the 8 agreement-policy cases (two-unsat-meets-threshold, single-unsat-inconclusive, unsat+sat-disagreement, all-sat-refuted, sat+unknown-refuted, threshold-1-discharges, no-decisions-inconclusive, known-solver-resolves) plus two soundness regression guards (duplicate-solver-name-counts-once, empty-results-inconclusive) — and integration gains the 2-of-N agreement discharge capstone (gated on both z3 and cvc5 present). A 4-agent red-team of the gate (2026-05-29) found and fixed **two CRITICALs**: a consistency-check fail-open (Timeout/Error/Unknown on the precondition consistency check used to fall through to the main check, risking a *vacuous* discharge of contradictory preconditions) and duplicate-solver vote inflation (`solvers=["z3","z3"]` counted one binary as two independent votes). Both are verified closed; the six dispatch branches plus the two fixes were exercised across 7 fake-solver scenarios end-to-end.
 
 ---
 
@@ -272,11 +272,11 @@ git log --oneline -1
 # Expected: a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
 ```
 
-### Step 4.2 — Stable test suite (the 200-test baseline)
+### Step 4.2 — Stable test suite (the 202-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
-# Expected: "test result: ok" lines totaling 200 passing, 0 failed, 0 ignored
+# Expected: "test result: ok" lines totaling 202 passing, 0 failed, 0 ignored
 ```
 
 If you see `Application Control policy has blocked this file` on Windows: that's Smart App Control quarantining a fresh test binary. Run again — usually clears on the second try. If persistent, run `cargo +stable test --workspace --all-features` (without the -p flag) to use the workspace-mode binary path which SAC tends to accept.
@@ -351,7 +351,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 200 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 202 passing.
 # Note: the 2-of-N agreement capstone additionally requires BOTH z3 and
 # cvc5 on PATH; with PITBULL_REQUIRE_E2E set it panics if either is missing.
 ```
@@ -398,7 +398,7 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 200 passing (same as without Z3 — the new tests
+# Expected: 202 passing (same as without Z3 — the new tests
 # also pass via graceful-skip if no solver is present, but with
 # z3 they exercise the real `unsat` verdict path).
 ```
@@ -617,7 +617,7 @@ git commit -m "..."
 
 | ID | What | Where | Why deferred |
 |---|---|---|---|
-| solver PATH trust | A solver binary on PATH could be a hostile substitute always returning `unsat`. | `pitbull-vc/src/solver.rs::{run_solvers,vote}` | **Mitigated (Task S):** discharge requires `threshold` independent solvers (default `[z3, cvc5]`, threshold 2) to agree `unsat` with zero `sat`; one corrupt solver yields at most `Inconclusive`, and a `sat`/`unsat` split is a loud `DISAGREEMENT`. Residual: a coordinated swap of ALL solvers, and the per-solver version pin (`solver_versions`) is not yet enforced. |
+| solver PATH trust | A solver binary on PATH could be a hostile substitute always returning `unsat`. | `pitbull-vc/src/solver.rs::{run_solvers,vote}` | **Mitigated (Task S + 2026-05-29 audit):** discharge requires `threshold` *distinct* solvers (default `[z3, cvc5]`, threshold 2) to agree `unsat` with zero `sat`; one corrupt solver yields at most `Inconclusive`, and a `sat`/`unsat` split is a loud `DISAGREEMENT`. `vote` counts distinct solver names and the driver dedups the pool, so a duplicate config entry (`["z3","z3"]`) cannot inflate the vote. The precondition consistency check fails closed unless `threshold` solvers confirm satisfiability, so a timed-out/errored consistency check cannot yield a vacuous discharge. Residual: a coordinated swap of ALL distinct solvers, and the per-solver version pin (`solver_versions`) is not yet enforced. |
 | u32 file-hash collisions | `Span::file` is a u32 hash. At ~65K files, 50% collision probability. | `pitbull-subset/src/mir_api/adapter.rs` (and `mir_api.rs::Span`) | Bumping to u64 ripples through the shadow IR. Tracked. |
 | Constant operand extraction (O.2.5) | ✅ DONE in `f18a3fa`. Adapter now extracts integer values via `try_extract_integer_value`; visitor synthesizes `(assert (= rhs #x...))` pinning assertions. Sign-extension fix in `808f5dd`. | — | Closed. |
 | `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `a66a1a4`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |

@@ -1377,9 +1377,23 @@ the std form and now also matches. No shadow type changes.
   preconditions contradictory. Default pool `[z3, cvc5]`, threshold 2;
   **Alt-Ergo is recognized but excluded by default** — Alt-Ergo ≤ 2.4.0
   has no bit-vector theory, so it can never discharge QF_BV. The policy
-  is pinned by 8 `vote()` unit tests; the e2e capstone
+  is pinned by `vote()` unit tests; the e2e capstone
   `wrapper_two_solver_agreement_discharges_division` proves 2-of-2
   agreement (gated on both z3 and cvc5).
+- ✅ Task S red-team hardening (2026-05-29). A 4-agent audit of the
+  gate found and closed two CRITICAL soundness holes: (a) a
+  consistency-check *fail-open* — `Timeout`/`Error`/`Unknown` on the
+  precondition consistency check fell through to the main check, so a
+  contradictory precondition that timed out could be discharged
+  *vacuously*; now the wrapper requires `threshold` independent solvers
+  to confirm the assumptions satisfiable (positive `sat` evidence)
+  before trusting the main `unsat`, else it fails closed. (b)
+  duplicate-solver *vote inflation* — `solvers=["z3","z3"]` ran one
+  binary twice and counted its single `unsat` as two votes; now `vote`
+  counts DISTINCT solver names and the driver dedups the pool (with a
+  warning). Both verified closed across 7 fake-solver scenarios;
+  regression-guarded by `vote_duplicate_solver_name_counts_once` and
+  `vote_empty_results_is_inconclusive`.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1387,7 +1401,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  200 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  202 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1400,7 +1414,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 200 passing, 0 warnings, clippy clean
+# Stable: 202 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

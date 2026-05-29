@@ -230,16 +230,28 @@ pub enum AgreementVerdict {
 /// exists to close.
 #[must_use]
 pub fn vote(results: &[(String, SolverResult)], threshold: usize) -> AgreementVerdict {
-    let unsat: Vec<String> = results
+    // Count DISTINCT solver names per verdict, NOT raw result entries.
+    // Soundness (audit 2026-05-29, Critical): if the pool ever contains
+    // the same solver twice (e.g. `solvers = ["z3", "z3"]`), one binary's
+    // single `unsat` must NOT count as two independent votes — that would
+    // let a duplicate config entry defeat the agreement threshold and
+    // collapse the gate back to single-solver trust (the exact hole this
+    // gate exists to close). Deduping by name here makes the policy immune
+    // to upstream duplication no matter how the pool was assembled.
+    let mut unsat: Vec<String> = results
         .iter()
         .filter(|(_, r)| *r == SolverResult::Unsat)
         .map(|(n, _)| n.clone())
         .collect();
-    let sat: Vec<String> = results
+    unsat.sort();
+    unsat.dedup();
+    let mut sat: Vec<String> = results
         .iter()
         .filter(|(_, r)| *r == SolverResult::Sat)
         .map(|(n, _)| n.clone())
         .collect();
+    sat.sort();
+    sat.dedup();
     if !sat.is_empty() && !unsat.is_empty() {
         return AgreementVerdict::Disagreement { unsat, sat };
     }
@@ -881,5 +893,41 @@ mod tests {
         assert_eq!(known_solver("alt-ergo").unwrap().name, "alt-ergo");
         assert!(known_solver("bogus-solver").is_none());
         assert!(known_solver("Z3").is_none(), "name match is case-sensitive");
+    }
+    /// SOUNDNESS REGRESSION GUARD (audit 2026-05-29, Critical):
+    /// the SAME solver appearing twice (`solvers = ["z3", "z3"]`)
+    /// must count as ONE distinct vote, never two. Otherwise a
+    /// duplicate config entry would let a single binary's `unsat`
+    /// reach a threshold-2 gate and rubber-stamp unsafe code —
+    /// exactly the single-solver-trust hole the gate closes.
+    #[test]
+    fn vote_duplicate_solver_name_counts_once() {
+        let results = [r("z3", SolverResult::Unsat), r("z3", SolverResult::Unsat)];
+        assert_eq!(
+            vote(&results, 2),
+            AgreementVerdict::Inconclusive { unsat_votes: 1, threshold: 2 },
+            "two entries for the same solver must count as one distinct vote",
+        );
+        // And under threshold 1 the single distinct vote still discharges.
+        assert_eq!(
+            vote(&results, 1),
+            AgreementVerdict::Discharged { unsat_votes: 1 },
+        );
+    }
+    /// Empty result set (e.g. an empty solver pool) is Inconclusive
+    /// with zero votes — fail-closed, never a vacuous discharge.
+    /// (A threshold of 0 is impossible at the call site, which
+    /// applies `.max(1)`; this pins the empty-input behavior.)
+    #[test]
+    fn vote_empty_results_is_inconclusive() {
+        let results: [(String, SolverResult); 0] = [];
+        assert_eq!(
+            vote(&results, 2),
+            AgreementVerdict::Inconclusive { unsat_votes: 0, threshold: 2 },
+        );
+        assert_eq!(
+            vote(&results, 1),
+            AgreementVerdict::Inconclusive { unsat_votes: 0, threshold: 1 },
+        );
     }
 }

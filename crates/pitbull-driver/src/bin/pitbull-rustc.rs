@@ -544,27 +544,69 @@ impl PitbullCallbacks {
         // is recorded but no SMT was generated.
         if !report.vc_obligations.is_empty() {
             // Build the solver pool from config (Task S). Each
-            // configured name maps to a known descriptor; an
-            // unknown name is surfaced as a hard error (do NOT
-            // silently drop a solver — that would shrink the
-            // agreement pool below what the user asked for and
-            // could weaken the gate). If, after dropping unknowns,
-            // the pool is empty, fall back to nothing — the
-            // dispatch will then report every obligation as
-            // "no solver" / undischarged (fail closed).
-            let mut solvers = Vec::new();
+            // configured name maps to a known descriptor; an unknown
+            // name is surfaced as a loud WARNING and skipped. DUPLICATE
+            // names are deduped (audit 2026-05-29, Critical): without
+            // this, `solvers = ["z3","z3"]` would spawn one binary
+            // twice and let its single `unsat` count as two independent
+            // votes, collapsing the gate back to single-solver trust.
+            // `vote` also counts distinct names as a backstop, but we
+            // dedup here so we don't run the same binary twice and so
+            // the duplicate is reported. If the resulting pool is empty
+            // — or smaller than the agreement threshold — every
+            // obligation will (soundly) fail to discharge; we say so up
+            // front rather than letting it read as a silent
+            // "nothing verifies".
+            let mut solvers: Vec<pitbull_vc::solver::Solver> = Vec::new();
             for name in &cfg.verification.solvers {
                 match pitbull_vc::solver::known_solver(name) {
-                    Some(s) => solvers.push(s),
+                    Some(s) => {
+                        if solvers.iter().any(|existing| existing.name == s.name) {
+                            eprintln!(
+                                "pitbull-rustc: WARNING: duplicate solver `{name}` in \
+                                 [verification] solvers — counted once (a duplicate \
+                                 cannot provide independent agreement).",
+                            );
+                        } else {
+                            solvers.push(s);
+                        }
+                    }
                     None => eprintln!(
                         "pitbull-rustc: WARNING: unknown solver `{name}` in \
                          [verification] solvers — ignoring. Known: z3, cvc5, alt-ergo.",
                     ),
                 }
             }
+            if cfg.verification.solver_agreement == 0 {
+                eprintln!(
+                    "pitbull-rustc: WARNING: [verification] solver_agreement = 0 is \
+                     invalid; using 1 (a 0 threshold would vacuously discharge).",
+                );
+            }
             let threshold = usize::from(cfg.verification.solver_agreement).max(1);
-            let timeout =
-                std::time::Duration::from_secs(cfg.verification.vc_timeout_seconds);
+            if solvers.is_empty() {
+                eprintln!(
+                    "pitbull-rustc: WARNING: no usable solver in [verification] \
+                     solvers — every obligation will be undischarged (fail closed).",
+                );
+            } else if solvers.len() < threshold {
+                eprintln!(
+                    "pitbull-rustc: WARNING: agreement threshold {threshold} exceeds \
+                     the {} usable solver(s) in the pool — NO obligation can \
+                     discharge. Install more solvers or lower \
+                     [verification] solver_agreement.",
+                    solvers.len(),
+                );
+            }
+            let raw_timeout = cfg.verification.vc_timeout_seconds;
+            if raw_timeout == 0 {
+                eprintln!(
+                    "pitbull-rustc: WARNING: [verification] vc_timeout_seconds = 0; \
+                     using 1s (0 disables some solvers' check-sat timeout \
+                     asymmetrically).",
+                );
+            }
+            let timeout = std::time::Duration::from_secs(raw_timeout.max(1));
             self.undischarged_obligations +=
                 dispatch_vc_obligations(&report, &solvers, threshold, timeout);
         }
@@ -687,6 +729,10 @@ fn dispatch_vc_obligations(
         // contradiction is unsound).
         if let Some(cs_smt) = &goal.consistency_check {
             let cs_results = run_solvers(solvers, cs_smt, timeout);
+            // (1) Refuse if ANY solver proves the assumptions
+            // contradictory: a vacuously-unsat main check would
+            // otherwise silently "verify" unsafe code. Erring toward
+            // refusal is the safe direction.
             let any_unsat = cs_results
                 .iter()
                 .any(|(_, r)| *r == pitbull_vc::SolverResult::Unsat);
@@ -701,9 +747,51 @@ fn dispatch_vc_obligations(
                 undischarged += 1;
                 continue;
             }
-            // Otherwise proceed to the main check (sat/unknown/error/
-            // not-installed on the consistency check are all
-            // "not provably contradictory" — the main check decides).
+            // (2) To PROCEED soundly we need POSITIVE evidence the
+            // assumptions are jointly satisfiable. If they are NOT
+            // (contradictory) but no solver managed to return `unsat`
+            // — e.g. the consistency check timed out, errored, or
+            // returned `unknown` — then the main check
+            // `assumptions ∧ ¬safety` could be vacuously `unsat` and
+            // we would falsely discharge. So require the SAME
+            // `threshold` of independent solvers to agree `sat` that
+            // we require for the safety property; one solver's `sat`
+            // is not trusted (audit 2026-05-29, Critical regression:
+            // Timeout/Error/Unknown on the consistency check used to
+            // fall through to the main check and risk a vacuous
+            // discharge). The all-not-installed case is exempt: there
+            // is no solver at all, so we fall through and let the main
+            // check emit the canonical "no solver" verdict (also
+            // undischarged — still fail-closed).
+            let all_not_installed = !cs_results.is_empty()
+                && cs_results
+                    .iter()
+                    .all(|(_, r)| *r == pitbull_vc::SolverResult::NotInstalled);
+            if !all_not_installed {
+                let mut sat_voters: Vec<&str> = cs_results
+                    .iter()
+                    .filter(|(_, r)| *r == pitbull_vc::SolverResult::Sat)
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                sat_voters.sort_unstable();
+                sat_voters.dedup();
+                if sat_voters.len() < threshold {
+                    eprintln!(
+                        "pitbull-rustc: vc {} ({rule}): undischarged — could not \
+                         confirm the preconditions are jointly satisfiable \
+                         ({}/{threshold} independent solvers returned sat: [{}]); \
+                         refusing to risk a vacuous discharge",
+                        obligation.id,
+                        sat_voters.len(),
+                        solver_breakdown(&cs_results),
+                    );
+                    undischarged += 1;
+                    continue;
+                }
+            }
+            // Otherwise: `threshold` solvers confirmed the assumptions
+            // satisfiable (or no solver is installed at all). Proceed
+            // to the main check.
         }
         // "[N assumption(s)]" suffix surfaces how many hypotheses
         // the solvers received (audit finding L-3 visibility).
@@ -719,10 +807,13 @@ fn dispatch_vc_obligations(
         // Main check through the agreement gate.
         let results = run_solvers(solvers, &goal.smt, timeout);
         let breakdown = solver_breakdown(&results);
-        // If EVERY solver is not-installed, that's the "no solver"
-        // case — announce the install hint once.
-        let all_missing = !results.is_empty()
-            && results
+        // If the pool is empty, OR every solver is not-installed,
+        // that's the "no solver" case — announce the install hint once.
+        // (Empty `results` means an empty pool; treating it here as
+        // "no solver" — not "insufficient agreement" — keeps the
+        // diagnostic accurate; audit 2026-05-29.)
+        let all_missing = results.is_empty()
+            || results
                 .iter()
                 .all(|(_, r)| *r == pitbull_vc::SolverResult::NotInstalled);
         match vote(&results, threshold) {
