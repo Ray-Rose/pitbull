@@ -146,17 +146,22 @@ pub enum VcObligationKind {
         /// `None` when the return type is NOT a primitive integer
         /// (struct, tuple, slice, `()`, etc.). Audit-cleanup
         /// post-Q audit finding M-2 (2026-05-26): this used to be
-        /// an EMPTY STRING sentinel, which a future encoder could
-        /// misread as "no constraint on `result`" and produce a
-        /// vacuously-`unsat` problem — a latent false-discharge
-        /// trap for Q.4a. Making it `Option<String>` forces the
-        /// encoder to handle the unsupported case explicitly:
-        /// `pitbull-vc::compile` refuses to produce a goal for an
-        /// `EnsuresPostcondition` whose `ret_ty_name` is `None`
-        /// (fail-closed by construction, not by comment). The
-        /// obligation is still EMITTED (so the auditor sees the
-        /// gap) but can never discharge until the encoder gains
-        /// non-int-return support.
+        /// an EMPTY STRING sentinel, which the future Q.4a encoder
+        /// could misread as "no constraint on `result`" and produce
+        /// a vacuously-`unsat` problem — a latent false-discharge
+        /// trap. `Option<String>` removes the ambiguity: there is
+        /// no in-band "valid" value that means "unsupported".
+        ///
+        /// Note on TODAY's behavior: `pitbull-vc::compile` returns
+        /// `None` for the ENTIRE `EnsuresPostcondition` kind (it
+        /// matches `{ .. }` and does not yet inspect this field),
+        /// so the MVP fail-closes at the kind level regardless of
+        /// `ret_ty_name`. The `Option` is defensive prep so that
+        /// when Q.4a's encoder DOES inspect the field, it must
+        /// handle `None` explicitly (the type system forces a
+        /// match arm) rather than silently accept an empty string.
+        /// The obligation is always EMITTED (auditor sees the gap);
+        /// it can never discharge until Q.4a lands.
         ret_ty_name: Option<String>,
     },
 }

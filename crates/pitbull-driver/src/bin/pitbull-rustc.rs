@@ -477,6 +477,21 @@ impl PitbullCallbacks {
                 walked,
                 filtered_out,
             );
+        } else if filtered_out > 0 {
+            // Audit finding (2026-05-26 full-codebase sweep): when
+            // `verify_roots` is empty but `exclude` patterns dropped
+            // items, the count was previously NOT surfaced — items
+            // vanished from verification silently. The project's
+            // posture is "no silent skips": a config that excludes
+            // (intentionally or by a too-broad glob like
+            // `mycrate::*`) must make the dropped count VISIBLE so an
+            // auditor cannot mistake "excluded" for "verified clean".
+            eprintln!(
+                "pitbull-rustc: {} item(s) excluded by `[reachability] exclude` \
+                 patterns and NOT verified — confirm this is intended; an \
+                 over-broad exclude glob can silently skip the whole crate.",
+                filtered_out,
+            );
         }
         let mut report = visitor.into_report();
         // Append HIR-derived PB001 violations to the MIR-derived

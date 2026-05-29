@@ -374,15 +374,29 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // the "no silent skips" invariant once Q.4a's encoder makes
         // the obligation dischargeable.)
         if !self.current_body_ensures.is_empty() && !self.saw_return_with_ensures {
+            // Audit finding (2026-05-26 full-codebase sweep,
+            // sharpening the earlier M-1): a returning body with
+            // `#[ensures]` emits a "pending" obligation → undischarged
+            // → exit 1, but a divergent body previously emitted only
+            // a NON-BLOCKING audit note → exit 0. That asymmetry is
+            // wrong under fail-closed posture: "we emitted zero
+            // obligations for a declared ensures" could mean the
+            // function genuinely diverges OR that the adapter missed
+            // a Return terminator (our bug). Either way we must NOT
+            // claim success. Emit the obligation at the body span so
+            // it flows through the same pending → undischarged → exit-1
+            // path as a returning body, then add the explanatory note.
+            self.emit_ensures_obligation(body.span);
             self.audit_note(
                 body.span,
                 "PB076: function declares `#[pitbull::ensures]` but its body \
                  has no return point (it diverges — infinite loop, always \
-                 panics, or `-> !`). The postcondition is vacuously \
-                 unchecked: no exit point exists to assert it at. If this \
-                 is intentional (a diverging function legitimately has no \
-                 postcondition to discharge), the ensures is dead and \
-                 should be removed.",
+                 panics, or `-> !`), OR the MIR adapter did not surface a \
+                 return terminator. The postcondition obligation is emitted \
+                 at the body span and reported undischarged (fail closed): \
+                 we will not report success for a declared postcondition we \
+                 could not attach to an exit point. If the divergence is \
+                 intentional, the ensures is dead and should be removed.",
             );
         }
         // Audit finding H-RT2 (2026-05-26): clear preconditions
@@ -1299,15 +1313,68 @@ impl<'cfg> SubsetVisitor<'cfg> {
         rhs: &Operand,
         span: Span,
     ) {
+        use crate::mir_api::BinOp;
         let arith_op = match binop {
-            crate::mir_api::BinOp::Add => crate::vc::ArithOp::Add,
-            crate::mir_api::BinOp::Sub => crate::vc::ArithOp::Sub,
-            crate::mir_api::BinOp::Mul => crate::vc::ArithOp::Mul,
-            // Div / Rem have division-by-zero obligations (different
-            // encoding shape); Shl / Shr have over-shift obligations
-            // (likewise). Both land in a follow-up commit. Bitwise
-            // and comparison ops have no overflow obligation.
-            _ => return,
+            BinOp::Add => crate::vc::ArithOp::Add,
+            BinOp::Sub => crate::vc::ArithOp::Sub,
+            BinOp::Mul => crate::vc::ArithOp::Mul,
+            // Audit finding (2026-05-26 full-codebase sweep): Div / Rem
+            // carry a division-by-zero obligation AND, for signed
+            // types, a `MIN / -1` overflow obligation; Shl / Shr
+            // carry an over-shift obligation (shift amount >= bit
+            // width is UB-adjacent and panics in debug). These have
+            // a DIFFERENT SMT shape than the bvXaddo/bvXsubo/bvXmulo
+            // overflow predicates, so they are not yet encoded.
+            // Pre-fix, this arm was a silent `_ => return`, so
+            // reachable `a / b` / `a % b` / `a << n` produced ZERO
+            // obligations and ZERO audit notes — reported "verified"
+            // for code that can panic at runtime (an AoRTE hole and
+            // a "no silent skips" violation). Until the encoding
+            // lands, surface an audit note so the gap is visible.
+            BinOp::Div | BinOp::Rem => {
+                self.audit_note(
+                    span,
+                    format!(
+                        "PB049: `{binop:?}` carries a division-by-zero \
+                         obligation (and signed `MIN / -1` overflow) that \
+                         the v0.2 SMT encoder does not yet emit. The \
+                         operation is NOT proven panic-free — this is a \
+                         known coverage gap, tracked for the div/shift \
+                         obligation encoding. Treat as unverified.",
+                    ),
+                );
+                return;
+            }
+            BinOp::Shl | BinOp::Shr => {
+                self.audit_note(
+                    span,
+                    format!(
+                        "PB049: `{binop:?}` carries an over-shift obligation \
+                         (shift amount must be < bit width) that the v0.2 \
+                         SMT encoder does not yet emit. The operation is \
+                         NOT proven panic-free — known coverage gap. Treat \
+                         as unverified.",
+                    ),
+                );
+                return;
+            }
+            // Bitwise and comparison ops have no overflow/panic
+            // obligation — they are total functions over their input
+            // bit-patterns. `Offset` is pointer arithmetic, which is
+            // unreachable here because raw pointers are PB004-rejected
+            // upstream; if it somehow appears it has no integer-overflow
+            // obligation either. Silent acceptance of these is correct
+            // (they cannot panic), not a skip.
+            BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Eq
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Ne
+            | BinOp::Ge
+            | BinOp::Gt
+            | BinOp::Offset => return,
         };
         let lhs_name = self.operand_primitive_int_name(lhs);
         let rhs_name = self.operand_primitive_int_name(rhs);
@@ -3809,20 +3876,25 @@ mod tests {
     }
     /// M-1 (audit-cleanup 2026-05-26): a divergent body (no
     /// `TerminatorKind::Return`) that declares `#[pitbull::ensures]`
-    /// must NOT silently emit zero obligations — it surfaces an
-    /// audit note so the "postcondition vacuously unchecked" gap is
-    /// visible. `empty_body()` has no blocks, hence no Return, which
-    /// models the diverging case (infinite loop / always-panics /
-    /// `-> !`).
+    /// must FAIL CLOSED: emit a (pending, undischarged) PB076
+    /// obligation AND surface an explanatory audit note. The earlier
+    /// M-1 fix only emitted the note (non-blocking → exit 0); the
+    /// full-codebase sweep sharpened it to also emit the obligation
+    /// so a divergent body with ensures is no less strict than a
+    /// returning one. `empty_body()` has no blocks, hence no Return,
+    /// modelling the diverging case (infinite loop / always-panics /
+    /// `-> !`) — or an adapter that missed a return terminator.
     #[test]
-    fn ensures_on_divergent_body_emits_audit_note_not_silent() {
+    fn ensures_on_divergent_body_fails_closed_with_obligation_and_note() {
         let cfg = SubsetConfig::default_for_test();
         let mut v = SubsetVisitor::new(&cfg);
         v.set_current_ensures(vec!["result < 101".to_string()]);
         let body = empty_body(); // no blocks → no Return terminator
         v.visit_body(&body, false);
         let report = v.into_report();
-        // No PB076 obligation could be emitted (no return point).
+        // Fail closed: the obligation IS emitted (at body span) so it
+        // flows through the pending → undischarged → exit-1 path,
+        // exactly like a returning body's ensures in the MVP.
         let pb076_count = report
             .vc_obligations
             .iter()
@@ -3832,20 +3904,71 @@ mod tests {
             ))
             .count();
         assert_eq!(
-            pb076_count, 0,
-            "divergent body has no return point → no PB076 obligation",
+            pb076_count, 1,
+            "divergent body with ensures must STILL emit a (pending) PB076 \
+             obligation — fail closed, no exit-0 asymmetry vs returning bodies",
         );
-        // But the gap must be VISIBLE as an audit note.
+        // And the gap must be explained as an audit note.
         let has_divergent_note = report
             .audit_notes
             .iter()
             .any(|n| n.message.contains("no return point"));
         assert!(
             has_divergent_note,
-            "M-1: divergent body with ensures must surface a 'no return point' \
+            "divergent body with ensures must surface a 'no return point' \
              audit note; got notes: {:?}",
             report.audit_notes,
         );
+    }
+    /// Companion: div/rem/shift binops surface an audit note (no
+    /// silent skip) since the v0.2 encoder doesn't yet emit their
+    /// division-by-zero / over-shift obligations. Pins the
+    /// full-codebase-sweep fix that replaced the silent `_ => return`.
+    #[test]
+    fn div_rem_shift_binops_audit_note_not_silent() {
+        use crate::mir_api::{BinOp, UintTy};
+        let cfg = SubsetConfig::default_for_test();
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        for op in [BinOp::Div, BinOp::Rem, BinOp::Shl, BinOp::Shr] {
+            let mut v = SubsetVisitor::new(&cfg);
+            let body = Body {
+                def_id: DefId(0),
+                arg_tys: vec![u32_ty.clone(), u32_ty.clone()],
+                arg_names: vec!["a".into(), "b".into()],
+                return_ty: u32_ty.clone(),
+                is_unsafe: false,
+                is_async: false,
+                locals: vec![
+                    LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                    LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                    LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                ],
+                blocks: vec![BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::BinaryOp(
+                                op,
+                                Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                                Operand::Copy(Place { local: Local(2), projection: vec![] }),
+                            ),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator { kind: TerminatorKind::Return, span: Span::default() },
+                }],
+                span: Span::default(),
+            };
+            v.visit_body(&body, false);
+            let report = v.into_report();
+            assert!(
+                report.audit_notes.iter().any(|n| n.message.contains("PB049")
+                    && (n.message.contains("division-by-zero") || n.message.contains("over-shift"))),
+                "{op:?} must surface a div/shift coverage audit note (no silent skip); \
+                 got notes: {:?}",
+                report.audit_notes,
+            );
+        }
     }
     /// M-1 positive control: a body WITH a Return terminator and an
     /// ensures emits the PB076 obligation and does NOT surface the
