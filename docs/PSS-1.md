@@ -344,6 +344,21 @@ UX are in place.
 **Future.** Permanent.
 ### PB075 — Unsigned cache entry under `--release`
 **Future.** Permanent.
+### PB076 — Postcondition unmet
+Added in v0.2 alongside `#[pitbull::ensures("...")]` (Task Q.4).
+Category: Control flow (registered as the 76th rule; `RULE_COUNT = 76`).
+A spec-declared postcondition must hold at every function exit — every
+`TerminatorKind::Return`, including the implicit return at end-of-body.
+The visitor emits one `VcObligationKind::EnsuresPostcondition` per
+return site (and, fail-closed, one at the body span when a body with
+an `ensures` diverges / has no return terminator). The special binding
+`result` denotes the return value.
+**v0.2 status.** Obligation is *emitted* but `pitbull-vc::compile`
+returns `None` for it (reported "pending") — the body-effect SMT
+encoder that models `result` as a bit-vector over the body's effects
+lands in Task Q.4a. Until then a function with `#[ensures]` reports
+"undischarged" (exit 1), never a false "verified".
+**Future.** Permanent.
 ## 14. Audit methodology
 Each rule is implemented in `pitbull-subset` as a single explicit arm
 in the visitor's exhaustive dispatch. The dispatch table is over the
@@ -1303,6 +1318,41 @@ the std form and now also matches. No shadow type changes.
   so both walks share the SARIF filename table. PB001 violations are
   appended to the report alongside the MIR-derived ones; the
   per-crate summary now reports unsafe-block count separately.
+- ✅ Predicate grammar `<ident> <cmp> <ident>` (Phase B). The v0.2
+  grammar was `<ident> <cmp> <int>` only, forcing raw-SMT for
+  `i < len`-shaped index preconditions. Phase B adds the
+  ident-vs-ident form so `#[pitbull::requires("i < len")]` (PB054)
+  parses and translates without raw SMT-LIB.
+- ✅ `#[pitbull::trusted]` (Task Q.1). Marks a body so the visitor
+  checks its signature but skips the MIR walk (FFI shims / opaque
+  bodies). Trust does NOT admit `unsafe`: PB002/PB026 are
+  signature-level and still fire. Q.1 also fixed a latent adapter
+  soundness gap — `body()` hardcoded `is_unsafe`/`is_async = false`;
+  the wrapper now extracts the real flags via `tcx.fn_sig().safety`
+  and `tcx.asyncness()`, so PB002/PB026 fire on real MIR.
+- ✅ Impl-method attribute extraction (Task Q.2). `visit_impl_item`
+  extracts `requires`/`ensures`/`trusted` from `impl` methods, with
+  a `visit_nested_impl_item` no-op override to prevent the
+  nested-visit double-fire.
+- ✅ Expression-form attributes (Task Q.3). `#[pitbull::requires(x < 100)]`
+  (no quotes) is accepted by pretty-printing the attribute token
+  tree via `rustc_ast_pretty::pprust::tts_to_string` and feeding it
+  through the same predicate pipeline as the string-literal form.
+- ✅ `#[pitbull::ensures("...")]` MVP (Task Q.4, rule PB076). The
+  visitor emits a `VcObligationKind::EnsuresPostcondition` at every
+  return (and fail-closed at the body span for divergent bodies);
+  `result` binds the return value. `pitbull-vc::compile` returns
+  `None` (reported "pending") — the SMT body-effect encoder is the
+  remaining Q.4a slice. A function with `#[ensures]` reports
+  "undischarged" (exit 1), never a false "verified".
+- ✅ Full-codebase audit sweep cleanup (post-Q). Closed three
+  "no silent skip" gaps the foundational-code audit found:
+  (a) Div/Rem/Shl/Shr produced no obligation AND no audit note —
+  now they emit a coverage audit note ("treat as unverified")
+  pending the division-by-zero / over-shift obligation encoding;
+  (b) the divergent-`ensures` exit-0 asymmetry (now fail-closed);
+  (c) `[reachability] exclude` dropped items with no surfaced count
+  when `verify_roots` was empty (now printed with a warning).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1310,18 +1360,20 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  177 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  185 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
-  red-team cleanup, and the Q-series Option C expansion: Phase B
+  red-team cleanup, the Q-series Option C expansion (Phase B
   ident-vs-ident predicate grammar, Q.1 `#[pitbull::trusted]` +
   adapter is_unsafe/is_async fix, Q.2 impl-method attribute
-  extraction, Q.3 expression-form attributes, and the M-RT-Q.A→D
-  post-Q.3 audit cleanup). The driver-side test harness is the
+  extraction, Q.3 expression-form attributes, Q.4 `#[pitbull::ensures]`
+  MVP), and the full-codebase-sweep cleanup closing div/rem/shift
+  silent-skips, the divergent-ensures fail-closed asymmetry, and
+  exclude-count visibility). The driver-side test harness is the
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 177 passing, 0 warnings, clippy clean
+# Stable: 185 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --tests
 # Nightly + opt-in: wrapper builds, end-to-end PB049/PB054 discharge

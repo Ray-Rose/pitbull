@@ -6,13 +6,14 @@ verifier where the previous session left off. Read top to
 bottom on first sit-down; refer back to individual sections
 during work.
 
-Last known-good commit at hand-off: **`e6f9154`** (audit-cleanup
-pass) plus follow-up commits closing N3 (Z3 timeout + output cap) and
-H-RT1 / H-RT2 / H-RT3 / M-RT3 from the post-interruption red-team.
-The post-P.2 state ships Tasks P / P.1 / P.2 (PB054 end-to-end:
-visitor → SMT compile → operand binding → Z3 discharge) plus an
-audit-cleanup pass that closed N1 / N2 / F3 / F4 / F5–F13 from
-the deep audit. Branch `main`, local repo only (no remote).
+Last known-good commit at hand-off: **`b080d1a`** (full-codebase
+audit-cleanup: closed silent-skip soundness gaps — div/rem/shift
+audit notes, divergent-`ensures` fail-closed, exclude-count
+visibility). The v0.2 state ships the deductive backend, full PB054
+end-to-end discharge (P / P.1 / P.2), the Option-C attribute suite
+(Phase B grammar, Q.1 trusted, Q.2 impl-methods, Q.3 expression-form,
+Q.4 ensures-MVP), and several deep-audit cleanup passes. Branch
+`main`, local repo only (no remote).
 
 ## TL;DR
 
@@ -20,25 +21,40 @@ the deep audit. Branch `main`, local repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch (Z3 today). See `docs/PSS-1.md` for the
   specification.
-- **State:** 177 tests passing, both lanes warning-clean, clippy
-  clean. Milestone-2 work through Tasks P.2 + Q.3 is done —
-  including: the v0.2 deductive backend (Tasks M + N), spec-context
-  narrowing (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge
-  (P / P.1 / P.2), the predicate-grammar `<ident> <cmp> <ident>`
-  extension (Phase B), `#[pitbull::trusted]` (Q.1) with adapter
-  fix for `is_unsafe`/`is_async`, impl-method attribute extraction
-  (Q.2), expression-form attributes (Q.3), and the post-audit
-  cleanups closing F1 / F2 / F7 / H3 / N1 / N2 / N3 / F3 / F4 /
-  F8 / F11 / H-RT1 / H-RT2 / H-RT3 / M-RT3 / M-RT-Q.A / M-RT-Q.B
-  / M-RT-Q.C / M-RT-Q.D.
-- **Next task:** Pick a strategic direction from Section 5's menu.
-  PB049 overflow and PB054 index-bound both discharge end-to-end
-  under Z3 with preconditions in `pitbull.toml`. Reasonable next
-  steps: PB043 (panic reachability — path-sensitive backend),
-  multi-solver agreement (CVC5 + Alt-Ergo voting), expanded O.3
-  attribute coverage (`ensures` / `trusted` / impl methods), or
-  predicate-grammar extension to `<ident> <cmp> <ident>` form
-  so `i < len`-style preconditions don't need raw-SMT.
+- **State:** 185 tests passing (1 + 122 subset-lib + 27 integration
+  + 35 vc), both lanes warning-clean, clippy error-clean. Done:
+  the v0.2 deductive backend (Tasks M + N), spec-context narrowing
+  (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
+  and **Option C complete** — the predicate-grammar
+  `<ident> <cmp> <ident>` extension (Phase B), `#[pitbull::trusted]`
+  (Q.1, with the adapter fix for real `is_unsafe`/`is_async`),
+  impl-method attribute extraction (Q.2), expression-form
+  attributes (Q.3), and `#[pitbull::ensures]` emission (Q.4 MVP —
+  obligation emitted, discharge pending Q.4a). Plus deep-audit
+  cleanups F1/F2/F7/H3/N1/N2/N3/F3/F4/F8/F11/H-RT1–3/M-RT3/
+  M-RT-Q.A–D/M-1/M-2/L-1/L-2 and the latest silent-skip closures
+  (div/rem/shift coverage notes, divergent-ensures fail-closed,
+  exclude-count visibility).
+- **Rules that DISCHARGE end-to-end under Z3:** exactly 2 — PB049
+  (arithmetic overflow, Add/Sub/Mul) and PB054 (slice index bound),
+  both with `pitbull.toml`/attribute preconditions. PB043 / PB041 /
+  PB076 emit obligations that `compile` returns `None` for (reported
+  "pending"). The other ~71 rules are syntactic visitor rejects.
+- **Next task (recommended):** the full-codebase audit surfaced that
+  div/rem/shift have NO obligation encoding yet — a real AoRTE gap
+  now made *visible* (audit notes) but not *closed*. The highest-
+  leverage next move is one of:
+  1. **Division/over-shift obligation encoding** — closes a genuine
+     AoRTE hole and adds discharging rules (simple QF_BV: `rhs != 0`,
+     signed `MIN/-1`, `shift < width`). Recommended: most directly
+     strengthens the core "absence of runtime errors" claim.
+  2. **Multi-solver 2-of-3 agreement** (Z3 + CVC5 + Alt-Ergo) —
+     closes the loudest TCB hole (a hostile `z3` on PATH is fully
+     trusted today) and is mostly mechanical against the 2 working
+     rules.
+  3. **Proof certificates + `replay`** — replayable per-obligation
+     artifacts; the differentiator no competing Rust verifier ships.
+  See Section 5 for the full menu.
 - **First commands to run in a fresh session:** see
   [Section 4: Smoke test in a fresh session](#4-smoke-test-in-a-fresh-session).
 
@@ -63,7 +79,16 @@ the deep audit. Branch `main`, local repo only (no remote).
 ### Recent commit log (newest first)
 
 ```
-<this commit> N3 + H-RT1/H-RT2/H-RT3/M-RT3 (post-interruption red-team cleanup)
+b080d1a Audit-cleanup: close silent-skip soundness gaps (div/rem/shift notes, divergent-ensures fail-closed, exclude-count)
+49fbf09 Audit-cleanup post-Q: close M-1/M-2/L-1/L-2 (divergent-ensures note, ret_ty_name Option, ascii assert)
+dfef08b Milestone 2 Task Q.4 MVP: #[pitbull::ensures(...)] postcondition obligations (PB076)
+1ba425e Audit-cleanup pass after Q.1-Q.3 (M-RT-Q.A–D)
+4ba79ba Milestone 2 Task Q.3: expression-form #[pitbull::requires(x < 100)] without quotes
+39ab294 Milestone 2 Task Q.2: #[pitbull::requires]/#[trusted] on impl methods
+99c7b28 Milestone 2 Task Q.1: #[pitbull::trusted] + adapter is_unsafe/is_async fix
+73a5568 Phase B: predicate grammar <ident> <cmp> <ident> form
+c43f051 chore: remove orphan deps (sha2/trybuild/insta/syn/quote/proc-macro2)
+0767285 N3 + H-RT1/H-RT2/H-RT3/M-RT3 (post-interruption red-team cleanup)
 e6f9154 Audit-cleanup pass after P/P.1/P.2 (N1/N2/F3/F4/F5–F13 closed)
 c05bd13 Milestone 2 Task P.2: PB054 operand binding — IndexBound discharges end-to-end
 f0b7dc7 Milestone 2 Task P.1: PB054 SMT discharge — IndexBound compiles to QF_BV
@@ -106,12 +131,12 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **177 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **185 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --tests` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The 177 breaks down: 1 (spec/cargo-pitbull bin) + 116 (subset lib) + 25 (integration) + 35 (vc) = 177. Compared to the 160-baseline at commit 0767285: +7 subset (Phase B grammar tests + Q-series), +9 integration (Phase B + Q.1 + Q.2 + Q.3 e2e + audit-cleanup pins), +1 vc (M-RT-Q.B alias-collision skip test).
+The 185 breaks down: 1 (cargo-pitbull bin) + 122 (subset lib) + 27 (integration) + 35 (vc) = 185. The +8 over the 177 mid-Q baseline are the Q.4 ensures tests plus the full-codebase-sweep audit-cleanup pins (div/rem/shift coverage note, divergent-ensures fail-closed, ensures non-primitive-return, JSON round-trips).
 
 ---
 
@@ -242,7 +267,7 @@ git log --oneline -1
 # Expected: a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
 ```
 
-### Step 4.2 — Stable test suite (the 122-test baseline)
+### Step 4.2 — Stable test suite (the 185-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
@@ -321,7 +346,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 177 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 185 passing.
 ```
 
 If any of these steps fail, the project state is degraded. Don't proceed to new tasks until baseline is green.
@@ -366,7 +391,7 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 130 passing (same as without Z3 — the new tests
+# Expected: 185 passing (same as without Z3 — the new tests
 # also pass via graceful-skip if Z3 absent, but with Z3 they
 # exercise the real `unsat` verdict path).
 ```
@@ -455,18 +480,21 @@ Sketch:
    `cfg.verification.solver_versions` so a binary swap is
    loud.
 
-#### Option C — Extend O.3 attribute coverage (~half day)
-Today O.3 only extracts `#[pitbull::requires]` on top-level
-`ItemKind::Fn`. Extend to:
-1. `#[pitbull::ensures("...")]` postconditions (different
-   semantics — apply at return, model the return value as a
-   special SMT variable).
-2. `#[pitbull::trusted]` opt-out (mark a function so the
-   subset checker only checks its signature, not the body).
-3. Methods on impl blocks (`ItemKind::Impl` contains
-   `ImplItemKind::Fn`).
-4. Rust-expression-form arguments (`#[pitbull::requires(x < 100)]`
-   without quotes). Requires real attribute parsing — bigger.
+#### Option C — Extend O.3 attribute coverage ✅ DONE (Phase B + Q.1–Q.4)
+All four sub-items shipped:
+1. ✅ `#[pitbull::ensures("...")]` postconditions — Q.4 MVP emits the
+   PB076 obligation at every return (and fail-closed for divergent
+   bodies); the SMT discharge (modelling `result` as a BV variable)
+   is the remaining Q.4a slice.
+2. ✅ `#[pitbull::trusted]` opt-out — Q.1, with the adapter fix that
+   makes real `is_unsafe`/`is_async` flow so PB002/PB026 still fire
+   on trusted signatures (trust never admits unsafe).
+3. ✅ Methods on impl blocks — Q.2 (`visit_impl_item`, with the
+   double-fire fix for nested-visit).
+4. ✅ Rust-expression-form arguments — Q.3 (token-tree pretty-print
+   via `rustc_ast_pretty`).
+Plus Phase B added the `<ident> <cmp> <ident>` predicate grammar so
+`i < len`-style preconditions no longer need raw-SMT.
 
 #### Option D — Corpus expansion (~half day per rule, mechanical)
 The `tests/corpus/` directory should have ≥10 reject + ≥5
@@ -596,7 +624,7 @@ git commit -m "..."
 | Mutation testing harness wiring | `pitbull-subset/src/mutation.rs` | MEDIUM. Module exists; cargo-mutants integration is the missing piece. |
 | Corpus expansion | `tests/corpus/{accept,reject}/` | LOW (ongoing). Want ≥10 reject + ≥5 accept per rule per PSS-1 §15. |
 | `cargo pitbull check` subcommand wires verdict aggregation | `pitbull-driver/src/main.rs` | MEDIUM. Subcommand exists but uses status.success() rather than per-crate Pitbull output. |
-| Documentation: per-rule rationale | `docs/PSS-1.md` | LOW. Each of the 75 rules has a description; some lack the "why" explanation. |
+| Documentation: per-rule rationale | `docs/PSS-1.md` | LOW. Each of the 76 rules has a description; some lack the "why" explanation. |
 
 ### Test infrastructure
 
@@ -690,7 +718,7 @@ Example commit titles:
 
 | Looking for... | Look in... |
 |---|---|
-| The 75 PSS-1 rule definitions | `crates/pitbull-subset/src/rules.rs` |
+| The 76 PSS-1 rule definitions | `crates/pitbull-subset/src/rules.rs` |
 | Per-rule rationale + status | `docs/PSS-1.md` (long) |
 | The exhaustive MIR visitor dispatch | `crates/pitbull-subset/src/visitor.rs` |
 | Shadow IR types (Body, Span, Operand, etc.) | `crates/pitbull-subset/src/mir_api.rs` |

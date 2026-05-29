@@ -69,8 +69,14 @@ pub fn requires(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// The expression is evaluated in spec mode and must hold at every function
 /// exit (every `return`, including the implicit return). The special
-/// identifier `result` binds to the returned value; `old(e)` refers to the
-/// value of `e` at function entry.
+/// identifier `result` binds to the returned value.
+///
+/// v0.2 status: extracted by the HIR pre-pass and emitted as a PB076
+/// `EnsuresPostcondition` obligation, currently reported "pending" — the
+/// SMT body-effect encoder that discharges it lands in a follow-up. The
+/// `old(e)` form (value of `e` at function entry) is **planned, not yet
+/// implemented**: the v0.2 predicate grammar has no `old()` and a spec
+/// using it will not parse.
 #[proc_macro_attribute]
 pub fn ensures(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
@@ -118,6 +124,12 @@ pub fn pure(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Trust budget is surfaced in the report and may cause builds to fail per
 /// PSS-1 PB068.
+///
+/// Trust applies to the BODY's contract only — it never admits `unsafe`.
+/// A `#[trusted] unsafe fn` is still rejected by PB002 (and `async fn` by
+/// PB026), because those are signature-level subset rules that fire before
+/// the trusted-body short-circuit. Trust lets you assume an opaque body
+/// satisfies its spec (e.g. an FFI shim); it does not widen the subset.
 #[proc_macro_attribute]
 pub fn trusted(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item

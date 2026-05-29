@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 /// Identifier for a PSS-1 rule.
 ///
-/// Rules are numbered `PB001` through `PB075` in v0.1. The numeric value is
+/// Rules are numbered `PB001` through `PB076` (PB076 — "postcondition
+/// unmet" — was added in v0.2 alongside `#[pitbull::ensures]`). The
+/// numeric value is
 /// stable across releases: a rule's number never changes once published, and
 /// retired rules are kept in the registry as `FuturePlan::Retired` rather
 /// than renumbered.

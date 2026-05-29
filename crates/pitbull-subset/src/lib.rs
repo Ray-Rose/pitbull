@@ -29,7 +29,7 @@
 //!
 //! ## Module map
 //!
-//! - [`rules`]         — the rule registry: PB001..=PB075 as static data.
+//! - [`rules`]         — the rule registry: PB001..=PB076 as static data.
 //! - [`visitor`]       — the exhaustive MIR / item / type visitor.
 //! - [`reachability`]  — call-graph traversal from `#[pitbull::verify]` roots.
 //! - [`config`]        — `pitbull.toml` parsing.
