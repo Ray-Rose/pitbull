@@ -58,6 +58,7 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod cert;
 pub mod smt;
 pub mod solver;
 pub mod vc;
@@ -65,5 +66,6 @@ pub mod vc;
 // Re-export the typed-obligation half from pitbull-subset so
 // downstream code can import the whole VC surface from one place.
 pub use pitbull_subset::{ArithOp, VcObligation, VcObligationKind};
+pub use cert::{CertificateBundle, ObligationCertificate, ReplayOutcome};
 pub use solver::SolverResult;
 pub use vc::{compile, VcGoal};
