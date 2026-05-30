@@ -279,6 +279,13 @@ impl PitbullCallbacks {
         let mut visitor = pitbull_subset::SubsetVisitor::new(&cfg);
         let mut walked = 0usize;
         let mut filtered_out = 0usize;
+        // Track which function paths were actually walked, so we can warn
+        // about `[verification.preconditions]` keys that matched nothing
+        // (a typo, or a function filtered out by verify_roots) — those
+        // preconditions silently never applied, which the project's
+        // "no silent skips" posture forbids (audit 2026-05-29).
+        let mut walked_fn_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         // HIR pre-pass: rustc_public's MIR has already discarded
         // HIR-level `unsafe { ... }` block markers (operations inside
         // an unsafe block fire their own rules — PB004/PB007/PB009 —
@@ -360,6 +367,7 @@ impl PitbullCallbacks {
                     );
                     self.bodies_walked += 1;
                     walked += 1;
+                    walked_fn_paths.insert(item_path.clone());
                     // O.1 + O.3: install spec-derived preconditions
                     // for this body so VC obligations emitted from
                     // its walk carry the assumptions. Two sources
@@ -493,6 +501,23 @@ impl PitbullCallbacks {
                 filtered_out,
             );
         }
+        // Warn about precondition keys that matched no walked function
+        // (a typo, or a function filtered out by verify_roots/exclude):
+        // those preconditions silently never applied (audit 2026-05-29,
+        // "no silent skips"). The direction is safe — a missing
+        // precondition means the obligation is checked with FEWER
+        // assumptions (over-approximate / fail-closed) — but the user
+        // must learn their key didn't bind rather than see an
+        // unexpectedly-undischarged obligation with no explanation.
+        for key in cfg.verification.preconditions.keys() {
+            if !walked_fn_paths.contains(key) {
+                eprintln!(
+                    "pitbull-rustc: WARNING: [verification.preconditions] key `{key}` \
+                     matched no verified function — its preconditions were NOT applied \
+                     (check for a typo, or that the function is reached and not excluded).",
+                );
+            }
+        }
         let mut report = visitor.into_report();
         // Append HIR-derived PB001 violations to the MIR-derived
         // violations. The two walks see distinct constructs (HIR
@@ -576,6 +601,42 @@ impl PitbullCallbacks {
                          [verification] solvers — ignoring. Known: z3, cvc5, alt-ergo.",
                     ),
                 }
+            }
+            // Enforce [verification.solver_versions] pins (hardening
+            // 2026-05-29). For each pooled solver with a pinned version,
+            // probe `--version`; if the pinned string is not present in
+            // the output, the binary is NOT the pinned build, so DROP it
+            // from the pool. This is fail-closed: a non-pinned (possibly
+            // swapped/buggy) solver's vote is not trusted, and a smaller
+            // pool only makes the agreement threshold HARDER to reach
+            // (never a false discharge). The dropped solver is surfaced
+            // loudly. (No pin for a solver ⇒ it runs unchecked, matching
+            // the documented opt-in behavior.)
+            if !cfg.verification.solver_versions.is_empty() {
+                solvers.retain(|s| match cfg.verification.solver_versions.get(s.name) {
+                    None => true,
+                    Some(pinned) => match pitbull_vc::solver::probe_version(s) {
+                        Some(out) if out.contains(pinned.as_str()) => true,
+                        Some(out) => {
+                            eprintln!(
+                                "pitbull-rustc: WARNING: solver `{}` version mismatch — \
+                                 pinned `{pinned}`, reported `{out}`; dropping it from the \
+                                 agreement pool (its vote will not count).",
+                                s.name,
+                            );
+                            false
+                        }
+                        None => {
+                            eprintln!(
+                                "pitbull-rustc: WARNING: solver `{}` is pinned to `{pinned}` \
+                                 but its version could not be determined (not installed, or \
+                                 `--version` failed); dropping it from the pool.",
+                                s.name,
+                            );
+                            false
+                        }
+                    },
+                });
             }
             if cfg.verification.solver_agreement == 0 {
                 eprintln!(

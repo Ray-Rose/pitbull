@@ -624,6 +624,36 @@ fn read_capped<R: Read>(mut reader: R, cap_bytes: u64) -> std::io::Result<(Vec<u
     }
     Ok((buf, was_capped))
 }
+/// Probe a solver's reported version by running `<program> --version`
+/// and returning its trimmed stdout (e.g. `"Z3 version 4.13.4 - 64 bit"`).
+/// Returns `None` if the solver isn't installed or the call fails.
+///
+/// Used to enforce `[verification.solver_versions]` pins (hardening
+/// 2026-05-29): the caller checks whether the pinned version string
+/// appears in this output and drops a mismatched solver from the
+/// agreement pool. `--version` output is small and the call is
+/// one-shot per run, so the heavy N3 hardening of the solve path is
+/// unnecessary here; output is still bounded by the OS pipe and we
+/// only read stdout.
+#[must_use]
+pub fn probe_version(solver: &Solver) -> Option<String> {
+    let output = Command::new(solver.program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

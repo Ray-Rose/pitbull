@@ -87,10 +87,12 @@ solver_agreement = 2
 # supported"), so it can never discharge an overflow/index obligation and would
 # only dilute the pool — leave it out unless you have a BV-capable build.
 solvers = ["z3", "cvc5"]
-# Pinned solver versions. NOT YET ENFORCED (tracked for v0.3): this table is
-# parsed but the wrapper does not yet check each solver's `--version` against it.
-# Planned behavior is to refuse to run (or taint the report) on a mismatch so a
-# silent binary swap is loud. Until then, entries here are documentation only.
+# Pinned solver versions. ENFORCED (2026-05-29): before dispatch, the wrapper
+# runs each pinned solver's `--version` and checks the pinned string appears in
+# the output. A solver whose version does NOT match is DROPPED from the
+# agreement pool (its vote will not count) with a loud warning — fail-closed,
+# since a smaller pool only makes the agreement threshold harder to reach. A
+# solver with no entry here runs unchecked (pinning is opt-in, per-solver).
 [verification.solver_versions]
 z3        = "4.13.4"
 cvc5      = "1.2.0"
