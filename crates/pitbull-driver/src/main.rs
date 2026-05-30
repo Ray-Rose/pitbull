@@ -15,6 +15,10 @@
 //!
 //! v0.1 ships `check`, `rules`, and a stub `verify` that delegates to
 //! `check` plus a warning that translation is still in development.
+//! `replay` is functional (Task T.2): it re-executes a proof
+//! certificate produced by `check` (with `PITBULL_CERT_OUT` set) and
+//! confirms each recorded agreement verdict reproduces — on stable
+//! Rust, no nightly toolchain required.
 //!
 //! ## Exit codes
 //!
@@ -59,8 +63,14 @@ enum Cmd {
     Check,
     /// Run the full pipeline (subset + translation + SMT). Stub in v0.1.
     Verify,
-    /// Re-execute committed proof certificates.
-    Replay,
+    /// Re-execute a committed proof certificate: re-run each recorded
+    /// SMT problem through the solver pool and confirm the agreement
+    /// verdict reproduces. Exits 1 if any obligation fails to reproduce.
+    Replay {
+        /// Path to the proof-certificate JSON (produced by
+        /// `cargo pitbull check` with `PITBULL_CERT_OUT` set).
+        cert: PathBuf,
+    },
     /// Print the rule registry.
     Rules,
 }
@@ -75,10 +85,13 @@ fn main() -> ExitCode {
     }
 }
 fn dispatch(cli: Cli) -> Result<ExitCode> {
-    match cli.cmd {
+    // Match by reference so the `Replay { cert }` arm can borrow the
+    // path without partially moving `cli` (the run_* helpers take
+    // `&cli`).
+    match &cli.cmd {
         Cmd::Check => run_check(&cli),
         Cmd::Verify => run_verify_stub(&cli),
-        Cmd::Replay => run_replay_stub(&cli),
+        Cmd::Replay { cert } => run_replay(&cli, cert),
         Cmd::Rules => run_rules(&cli),
     }
 }
@@ -174,9 +187,85 @@ fn run_verify_stub(cli: &Cli) -> Result<ExitCode> {
     eprintln!("pitbull verify: translation + SMT dispatch land in v0.2.");
     run_check(cli)
 }
-fn run_replay_stub(_cli: &Cli) -> Result<ExitCode> {
-    eprintln!("pitbull replay: certificate replay arrives with v0.2 translation backend.");
-    Ok(ExitCode::from(0))
+/// Re-execute a proof certificate. Reads the bundle, rebuilds the
+/// solver pool from the bundle's recorded solver names, re-runs each
+/// recorded SMT problem, and confirms the agreement verdict
+/// reproduces. Exits 0 if every obligation reproduces, 1 if any does
+/// not (solver drift, a missing solver, or a tampered certificate).
+///
+/// Replay runs entirely on STABLE Rust — it needs only the solvers and
+/// the recorded SMT, never the nightly `rustc_public` lane — so a
+/// certificate produced on one machine can be independently re-checked
+/// anywhere the solvers are installed.
+fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
+    let text = std::fs::read_to_string(cert_path)
+        .with_context(|| format!("reading certificate {}", cert_path.display()))?;
+    let bundle = pitbull_vc::cert::CertificateBundle::from_json(&text)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!(
+        "pitbull replay: {} — crate `{}`, {} obligation(s), agreement threshold {}, \
+         recorded solver pool {:?}",
+        cert_path.display(),
+        bundle.crate_name,
+        bundle.obligations.len(),
+        bundle.threshold,
+        bundle.solvers,
+    );
+    // Rebuild the solver pool from the bundle's recorded names. Replay
+    // reproduces the ORIGINAL decision, so we use the recorded pool and
+    // each certificate's own recorded threshold (via `replay_bundle`).
+    let mut solvers = Vec::new();
+    for name in &bundle.solvers {
+        match pitbull_vc::solver::known_solver(name) {
+            Some(s) => solvers.push(s),
+            None => eprintln!(
+                "pitbull replay: WARNING: bundle references unknown solver `{name}` — \
+                 it cannot be re-run, which may turn a recorded discharge into a MISMATCH.",
+            ),
+        }
+    }
+    if solvers.is_empty() {
+        anyhow::bail!(
+            "no usable solver from the recorded pool {:?}; install at least one of them \
+             (e.g. z3, cvc5) to replay this certificate",
+            bundle.solvers,
+        );
+    }
+    // The certificate does not record the original per-check timeout;
+    // use a generous fixed budget. A solver that times out on replay
+    // surfaces as a MISMATCH (correctly — the proof did not reproduce
+    // within budget).
+    let timeout = std::time::Duration::from_secs(60);
+    let outcomes = pitbull_vc::cert::replay_bundle(&bundle, &solvers, timeout);
+    let mut mismatches = 0usize;
+    for (id, outcome) in &outcomes {
+        match outcome {
+            pitbull_vc::cert::ReplayOutcome::Match { verdict } => {
+                println!("  MATCH     {id}: reproduced `{verdict}`");
+            }
+            pitbull_vc::cert::ReplayOutcome::Mismatch { recorded, replayed } => {
+                mismatches += 1;
+                println!(
+                    "  MISMATCH  {id}: recorded `{recorded}`, replayed `{replayed}`",
+                );
+            }
+        }
+    }
+    if mismatches == 0 {
+        eprintln!(
+            "pitbull replay: OK — all {} obligation(s) reproduced their recorded verdict.",
+            outcomes.len(),
+        );
+        Ok(ExitCode::from(0))
+    } else {
+        eprintln!(
+            "pitbull replay: FAILED — {mismatches} of {} obligation(s) did NOT reproduce \
+             (possible solver drift/version skew, a missing solver, or a tampered \
+             certificate). Treat the affected proofs as UNVERIFIED.",
+            outcomes.len(),
+        );
+        Ok(ExitCode::from(1))
+    }
 }
 fn run_rules(cli: &Cli) -> Result<ExitCode> {
     if cli.json {

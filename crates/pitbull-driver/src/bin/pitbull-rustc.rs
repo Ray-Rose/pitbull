@@ -607,8 +607,48 @@ impl PitbullCallbacks {
                 );
             }
             let timeout = std::time::Duration::from_secs(raw_timeout.max(1));
-            self.undischarged_obligations +=
+            let (undischarged, certs) =
                 dispatch_vc_obligations(&report, &solvers, threshold, timeout);
+            self.undischarged_obligations += undischarged;
+            // Optional proof-certificate emission (Task T.2). When
+            // PITBULL_CERT_OUT is set, write the replayable certificate
+            // bundle (one entry per main-check obligation) as JSON.
+            // Same H3 path-safety guard as PITBULL_SARIF_OUT: the env
+            // var is adversarially controllable via build.rs, so refuse
+            // paths that don't end in `.json` or that contain `..`.
+            // Emission is best-effort (warn, don't abort) — the verdict
+            // and exit code do not depend on the certificate file.
+            if let Some(out) = std::env::var_os("PITBULL_CERT_OUT") {
+                let out_path = std::path::PathBuf::from(&out);
+                if let Err(e) = check_env_path("PITBULL_CERT_OUT", &out_path, &["json"]) {
+                    eprintln!("pitbull-rustc: refusing certificate write: {e}");
+                } else {
+                    let crate_name = std::env::var("CARGO_PKG_NAME")
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    let mut bundle = pitbull_vc::cert::CertificateBundle::new(
+                        env!("CARGO_PKG_VERSION"),
+                        crate_name,
+                        threshold,
+                        solvers.iter().map(|s| s.name.to_string()).collect(),
+                    );
+                    bundle.obligations = certs;
+                    match bundle.to_json() {
+                        Ok(text) => match std::fs::write(&out_path, text) {
+                            Ok(()) => eprintln!(
+                                "pitbull-rustc: proof certificate ({} obligation(s)) \
+                                 written to {}",
+                                bundle.obligations.len(),
+                                out_path.display(),
+                            ),
+                            Err(e) => eprintln!(
+                                "pitbull-rustc: failed to write certificate to {}: {e}",
+                                out_path.display(),
+                            ),
+                        },
+                        Err(e) => eprintln!("pitbull-rustc: certificate serialize failed: {e}"),
+                    }
+                }
+            }
         }
         // Optional SARIF emission. When `PITBULL_SARIF_OUT` is set,
         // write the (minimal) SARIF report to that path. Each wrapper
@@ -698,11 +738,18 @@ fn dispatch_vc_obligations(
     solvers: &[pitbull_vc::solver::Solver],
     threshold: usize,
     timeout: std::time::Duration,
-) -> usize {
+) -> (usize, Vec<pitbull_vc::cert::ObligationCertificate>) {
     use pitbull_vc::solver::{run_solvers, vote, AgreementVerdict};
     let mut solver_missing_announced = false;
     let mut discharged = 0usize;
     let mut undischarged = 0usize;
+    // Proof certificates (Task T.2): one per obligation that reaches
+    // the MAIN agreement check. The early-exit paths above (compilation
+    // pending, consistency-refused, consistency-unconfirmed) do not
+    // produce a main-check certificate — they have no `goal.smt`
+    // decision to replay; their "undischarged" status is recorded on
+    // stderr. Certifying those refusal decisions is a future extension.
+    let mut certs: Vec<pitbull_vc::cert::ObligationCertificate> = Vec::new();
     for obligation in &report.vc_obligations {
         // Canonical PSS-1 rule ID (uppercase `PBxxx`) on every
         // verdict line, so tests/SARIF consumers and auditors don't
@@ -807,6 +854,18 @@ fn dispatch_vc_obligations(
         // Main check through the agreement gate.
         let results = run_solvers(solvers, &goal.smt, timeout);
         let breakdown = solver_breakdown(&results);
+        // Record a replayable proof certificate for this obligation
+        // (Task T.2). Built from the SAME results the verdict below is
+        // derived from, so the certificate's recorded decision exactly
+        // matches the live one. Emitted to disk by the caller when
+        // PITBULL_CERT_OUT is set.
+        certs.push(pitbull_vc::cert::ObligationCertificate::from_run(
+            obligation.id.as_str(),
+            rule,
+            goal.smt.as_str(),
+            &results,
+            threshold,
+        ));
         // If the pool is empty, OR every solver is not-installed,
         // that's the "no solver" case — announce the install hint once.
         // (Empty `results` means an empty pool; treating it here as
@@ -886,7 +945,7 @@ fn dispatch_vc_obligations(
         undischarged,
         solvers.len(),
     );
-    undischarged
+    (undischarged, certs)
 }
 /// Load pitbull.toml from `$PITBULL_TOML` (if set) or from `./pitbull.toml`
 /// in the current working directory. Falls back to the default test

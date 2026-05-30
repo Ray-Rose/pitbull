@@ -393,7 +393,11 @@ events.
 ## 17. Open issues for v0.2
 The following are tracked but not in v0.1:
 - Translation backend (MIR → Coma → Why3 → SMT).
-- Proof certificate format and replay command.
+- Proof certificate format and replay command. **MVP shipped (Task T.1
+  + T.2):** `pitbull-vc::cert` defines the replayable bundle and the
+  wrapper emits it to `PITBULL_CERT_OUT`; `cargo pitbull replay` re-runs
+  each recorded SMT and confirms the verdict reproduces (on stable Rust).
+  Cryptographic signing of certificates is the remaining T.3 layer.
 - Counterexample rendering.
 - Tree-Borrows-aware soundness cross-check protocol.
 - Trusted-build-script hash verification.
@@ -1420,7 +1424,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  204 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  211 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1433,7 +1437,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 204 passing, 0 warnings, clippy clean
+# Stable: 211 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054
@@ -1444,6 +1448,8 @@ PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --b
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
 ```
 Future-roadmap detail lives in `docs/HANDOFF.md`; multi-solver
-agreement shipped (Task S). **Proof certificates + `replay`** and the
-v0.3 path-sensitive panic-reachability backend are the next two
-strategic directions.
+agreement shipped (Task S) and **proof certificates + `replay`** have a
+working MVP (Task T.1 + T.2 — emission to `PITBULL_CERT_OUT` and
+`cargo pitbull replay`). The next strategic directions are
+certificate **signing** (T.3) and the v0.3 path-sensitive
+panic-reachability backend.
