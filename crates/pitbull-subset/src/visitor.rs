@@ -828,7 +828,21 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 self.maybe_emit_overflow_obligation(*binop, lhs, rhs, span);
             }
             Rvalue::NullaryOp(_, ty) => self.visit_ty(ty, span),
-            Rvalue::UnaryOp(_, op) => self.visit_operand(op, span),
+            Rvalue::UnaryOp(unop, op) => {
+                self.visit_operand(op, span);
+                // Exhaustive over `UnOp` (no `_` wildcard — audit
+                // 2026-05-29). Unary negation of a signed integer can
+                // overflow (`-(iN::MIN)`), so it carries a PB049
+                // obligation. `Not` (bitwise/logical complement) and
+                // `PtrMetadata` are total — they cannot panic or
+                // overflow — so they emit nothing.
+                match unop {
+                    crate::mir_api::UnOp::Neg => {
+                        self.maybe_emit_neg_overflow_obligation(op, span);
+                    }
+                    crate::mir_api::UnOp::Not | crate::mir_api::UnOp::PtrMetadata => {}
+                }
+            }
             Rvalue::Discriminant(place) => self.visit_place(place, span),
             Rvalue::Aggregate(kind, operands) => {
                 for op in operands {
@@ -1571,6 +1585,95 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // is "no silent skips" — if a config has a malformed
         // assumption, the auditor learns about it via the report
         // rather than the precondition silently vanishing.
+        for msg in pending_audit_notes {
+            self.audit_note(span, msg);
+        }
+    }
+    /// Emit a PB049 `ArithmeticOverflow` obligation for unary
+    /// negation `-(op)` (audit 2026-05-29). The single operand is
+    /// carried in the `lhs` SMT position; `pitbull-vc` encodes the
+    /// violation predicate `(= lhs iN::MIN)` (the only value whose
+    /// negation overflows a signed integer). Mirrors the binary
+    /// `maybe_emit_overflow_obligation` for the single-operand case:
+    /// constant-pins the operand and binds a precondition on the
+    /// operand's source name to `lhs` so `requires("x > -128")`-style
+    /// contracts can discharge.
+    fn maybe_emit_neg_overflow_obligation(&mut self, op: &Operand, span: Span) {
+        let Some(ty_name) = self.operand_primitive_int_name(op) else {
+            // Operand type unresolvable (projected operand, or a
+            // non-primitive-int type such as a float — float negation
+            // cannot overflow). Audit-safe direction: surface the gap
+            // rather than silently treat the negation as verified,
+            // matching the binary path's N1 posture.
+            self.audit_note(
+                span,
+                "PB049: unary negation skipped — operand type unresolvable \
+                 (projected operand, or a non-primitive-int type like a float \
+                 whose negation cannot overflow). The v0.2 visitor emits the \
+                 negation-overflow obligation only for direct reads of \
+                 signed-integer locals; this gap is tracked for v0.3+."
+                    .to_string(),
+            );
+            return;
+        };
+        // Only SIGNED integer negation can overflow (`-(iN::MIN)`).
+        // Rust has no unsigned unary `-`, so MIR never produces Neg on
+        // an unsigned type; if one somehow appears, negation cannot
+        // panic, so there is nothing to prove. The `i` prefix is the
+        // same signedness discriminator `pitbull-vc::IntInfo` uses.
+        if !ty_name.starts_with('i') {
+            return;
+        }
+        // Constant-pin the operand if it is a literal (mirrors the
+        // binary path's O.2.5 pinning), then process preconditions:
+        // a predicate bound to the operand's source name translates
+        // against `lhs`; anything else falls back to the F2-validated
+        // raw-SMT splice; failures surface as audit notes.
+        let mut assumptions: Vec<String> = Vec::new();
+        if let Operand::Constant(c) = op {
+            if let Some(value) = c.value {
+                if let Some(assertion) =
+                    crate::predicate::operand_pin_assertion("lhs", value, &ty_name)
+                {
+                    assumptions.push(assertion);
+                }
+            }
+        }
+        let op_arg = self.operand_arg_name(op);
+        let mut pending_audit_notes: Vec<String> = Vec::new();
+        for raw in &self.current_body_preconditions {
+            match crate::predicate::parse_predicate(raw) {
+                Ok(pred) if op_arg.as_deref() == Some(pred.var.as_str()) => {
+                    match crate::predicate::predicate_to_smt_assertion(&pred, "lhs", &ty_name) {
+                        Ok(smt) => assumptions.push(smt),
+                        Err(e) => pending_audit_notes.push(format!(
+                            "rejecting precondition (parsed and bound to the negation \
+                             operand but translation failed): {e} — input: {raw:?}",
+                        )),
+                    }
+                }
+                // Parsed-but-unbound, or unparsable: try the raw
+                // SMT-LIB splice behind the F2 lex guard.
+                _ => match crate::predicate::validate_assertion_form(raw) {
+                    Ok(()) => assumptions.push(raw.clone()),
+                    Err(e) => pending_audit_notes.push(format!(
+                        "rejecting precondition (not bindable to the negation operand \
+                         and not a valid SMT-LIB `(assert ...)` form): {e} — input: {raw:?}",
+                    )),
+                },
+            }
+        }
+        let seq = self.vc_obligations.len();
+        let id = format!("pb049-{}-{}", crate::vc::ArithOp::Neg.tag(), seq);
+        self.vc_obligations.push(crate::vc::VcObligation {
+            id,
+            span,
+            kind: crate::vc::VcObligationKind::ArithmeticOverflow {
+                op: crate::vc::ArithOp::Neg,
+                ty_name,
+            },
+            assumptions,
+        });
         for msg in pending_audit_notes {
             self.audit_note(span, msg);
         }
@@ -3993,6 +4096,70 @@ mod tests {
                 report.audit_notes,
             );
         }
+    }
+    /// Audit 2026-05-29 (CRITICAL fix): unary negation `-(a)` on a
+    /// signed integer must emit a PB049 `ArithmeticOverflow` obligation
+    /// (op = Neg) — previously the `Rvalue::UnaryOp(_, _)` wildcard
+    /// swallowed it, so `-(i32::MIN)` (a runtime panic) was reported
+    /// "safe". `!a` (bitwise Not) is total and must emit nothing.
+    #[test]
+    fn neg_signed_emits_arith_obligation_not_swallowed() {
+        use crate::mir_api::{IntTy, UnOp};
+        let cfg = SubsetConfig::default_for_test();
+        let i32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Int(IntTy::I32)) };
+        let make_body = |unop: UnOp| Body {
+            def_id: DefId(0),
+            arg_tys: vec![i32_ty.clone()],
+            arg_names: vec!["a".into()],
+            return_ty: i32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl { ty: i32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                LocalDecl { ty: i32_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(0), projection: vec![] },
+                        Rvalue::UnaryOp(
+                            unop,
+                            Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                        ),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator { kind: TerminatorKind::Return, span: Span::default() },
+            }],
+            span: Span::default(),
+        };
+        // `-a` (Neg) on i32 → exactly one PB049 Neg obligation.
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&make_body(UnOp::Neg), false);
+        let report = v.into_report();
+        assert_eq!(
+            report.vc_obligations.len(), 1,
+            "`-a` must emit exactly one obligation; got {:?}", report.vc_obligations,
+        );
+        let crate::vc::VcObligationKind::ArithmeticOverflow { op, ty_name } =
+            &report.vc_obligations[0].kind
+        else {
+            panic!("`-a` must emit ArithmeticOverflow; got {:?}", report.vc_obligations[0].kind);
+        };
+        assert_eq!(*op, crate::vc::ArithOp::Neg, "negation obligation op");
+        assert_eq!(ty_name, "i32");
+        assert!(
+            report.vc_obligations[0].id.starts_with("pb049-neg-"),
+            "id should be pb049-neg-N; got {:?}", report.vc_obligations[0].id,
+        );
+        // `!a` (bitwise Not) is total → no obligation.
+        let mut v2 = SubsetVisitor::new(&cfg);
+        v2.visit_body(&make_body(UnOp::Not), false);
+        let report2 = v2.into_report();
+        assert!(
+            report2.vc_obligations.is_empty(),
+            "`!a` (Not) must emit no obligation; got {:?}", report2.vc_obligations,
+        );
     }
     /// Task R: a mixed-width shift (`u32 << u8`) cannot be encoded
     /// as a same-sort BV problem, so it emits NO obligation but

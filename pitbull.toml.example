@@ -76,11 +76,21 @@ vc_timeout_seconds = 60
 # UNSAT before accepting a proof obligation. Increase to 3 for highest-assurance
 # builds. Decrease only with documented justification.
 solver_agreement = 2
-# Solvers to run in parallel. Order is not significance; all run, fastest
-# answer wins (subject to agreement threshold).
-solvers = ["z3", "cvc5", "alt-ergo"]
-# Pinned solver versions. Pitbull refuses to run with versions not on this list
-# unless `--allow-unpinned-solvers` is passed (and that flag taints the report).
+# Solvers to run in parallel for the AGREEMENT GATE. ALL configured solvers run;
+# an obligation is discharged only when at least `solver_agreement` DISTINCT
+# solvers independently return `unsat` AND none returns `sat`. A `sat`/`unsat`
+# split is reported as a loud DISAGREEMENT and fails closed (it is NOT
+# "fastest answer wins"). Duplicate entries are deduped — a solver cannot vote
+# twice. Default pool is ["z3", "cvc5"]; both fully support the QF_BV bit-vector
+# logic Pitbull emits.
+# NOTE: Alt-Ergo <= 2.4.0 has NO bit-vector theory ("Bitvector not yet
+# supported"), so it can never discharge an overflow/index obligation and would
+# only dilute the pool — leave it out unless you have a BV-capable build.
+solvers = ["z3", "cvc5"]
+# Pinned solver versions. NOT YET ENFORCED (tracked for v0.3): this table is
+# parsed but the wrapper does not yet check each solver's `--version` against it.
+# Planned behavior is to refuse to run (or taint the report) on a mismatch so a
+# silent binary swap is loud. Until then, entries here are documentation only.
 [verification.solver_versions]
 z3        = "4.13.4"
 cvc5      = "1.2.0"
@@ -97,8 +107,10 @@ panic_strategy = "abort"
 # PSS-1 PB068: trust budget. Builds fail if trusted_lines / verified_lines
 # exceeds this fraction. Default 0.05 (5 percent).
 trust_budget_fraction = 0.05
-# PSS-1 PB059: proc macros allowed in verified code. Crates not on this list
-# cause subset rejection if they expand into reachable code.
+# PSS-1 PB059: proc macros allowed in verified code. NOT YET ENFORCED: this list
+# is parsed but the reachable-proc-macro rejection check is not yet implemented,
+# so the field is advisory for now. (Intended behavior: crates not on this list
+# that expand into reachable code cause subset rejection.)
 allowed_proc_macros = [
     "pitbull-spec",      # our own attribute macros
     "thiserror",         # widely audited, no allocation in derived bodies

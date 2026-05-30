@@ -226,6 +226,22 @@ pub fn emit_overflow_problem_with_assumptions(
             let width = bv_hex(u128::from(bits), bits);
             format!("(bvuge rhs {width})")
         }
+        // Unary negation (audit 2026-05-29). `-(x)` overflows exactly
+        // when `x == iN::MIN` — the signed minimum has no positive
+        // counterpart in two's complement, so its negation is
+        // unrepresentable and panics in debug. The operand is in the
+        // `lhs` position; `rhs` is unused. Rust has no unsigned unary
+        // `-`, so the visitor only emits this for signed types; if an
+        // unsigned type somehow reaches here, fail closed (return None
+        // → the obligation is reported "pending"/undischarged rather
+        // than encoded with a meaningless predicate).
+        ArithOp::Neg => {
+            if !info.signed {
+                return None;
+            }
+            let min = bv_hex(1u128 << (bits - 1), bits); // 100..0 = iN::MIN
+            format!("(= lhs {min})")
+        }
     };
     // QF_BV: quantifier-free bit-vector logic, the decidable
     // fragment Z3 and CVC5 both handle natively.
@@ -508,6 +524,35 @@ mod tests {
                 "u32 {op:?} must assert over-shift `(bvuge rhs 32)`; got:\n{smt}",
             );
         }
+    }
+    /// Audit 2026-05-29: unary negation `-(x)` encodes the
+    /// signed-minimum overflow `(= lhs iN::MIN)` — the only value
+    /// whose negation overflows a signed integer. Unsigned negation
+    /// does not exist in Rust, so the encoder returns `None` (fail
+    /// closed) rather than emitting a meaningless predicate.
+    #[test]
+    fn neg_emits_signed_min_overflow() {
+        // i32: MIN = #x80000000, operand declared 32 bits wide.
+        let smt = emit_overflow_problem("i32", ArithOp::Neg).expect("i32 neg supported");
+        assert!(
+            smt.contains("(assert (= lhs #x80000000))"),
+            "i32 neg must assert `(= lhs iN::MIN)`; got:\n{smt}",
+        );
+        assert!(
+            smt.contains("(declare-const lhs (_ BitVec 32))"),
+            "operand declared at the right width; got:\n{smt}",
+        );
+        // i8: MIN = #x80.
+        let smt8 = emit_overflow_problem("i8", ArithOp::Neg).expect("i8 neg supported");
+        assert!(
+            smt8.contains("(assert (= lhs #x80))"),
+            "i8 neg MIN = #x80; got:\n{smt8}",
+        );
+        // Unsigned negation is not representable in Rust → unsupported.
+        assert!(
+            emit_overflow_problem("u32", ArithOp::Neg).is_none(),
+            "unsigned neg must be unsupported (None), not encoded",
+        );
     }
     /// Task R: the division/shift constants are width-correct
     /// across the supported integer widths.

@@ -214,6 +214,13 @@ pub enum ArithOp {
     Shl,
     /// `>>` — same shape as `Shl`.
     Shr,
+    /// Unary `-` (negation). The obligation is the signed-minimum
+    /// overflow: `-(iN::MIN)` has no representable result and panics
+    /// in debug (audit 2026-05-29). Rust has no unsigned unary `-`,
+    /// so this is only ever emitted for signed integer operands; the
+    /// single operand is carried in the `lhs` SMT position (the `rhs`
+    /// position is unused for this op).
+    Neg,
 }
 impl ArithOp {
     /// Short stable tag for VC ids and certificate cross-references.
@@ -227,6 +234,7 @@ impl ArithOp {
             ArithOp::Rem => "rem",
             ArithOp::Shl => "shl",
             ArithOp::Shr => "shr",
+            ArithOp::Neg => "neg",
         }
     }
 }
@@ -281,6 +289,7 @@ mod tests {
         assert_eq!(ArithOp::Rem.tag(), "rem");
         assert_eq!(ArithOp::Shl.tag(), "shl");
         assert_eq!(ArithOp::Shr.tag(), "shr");
+        assert_eq!(ArithOp::Neg.tag(), "neg");
     }
     /// Each obligation kind maps to its PSS-1 rule ID. Pins the
     /// kind→rule mapping so the integration test's contains-check

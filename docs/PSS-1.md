@@ -1394,6 +1394,25 @@ the std form and now also matches. No shadow type changes.
   warning). Both verified closed across 7 fake-solver scenarios;
   regression-guarded by `vote_duplicate_solver_name_counts_once` and
   `vote_empty_results_is_inconclusive`.
+- ✅ Unary-negation overflow obligation (program-wide audit,
+  2026-05-29, CRITICAL fix). The visitor's `Rvalue::UnaryOp(_, _)` arm
+  matched the operator with a `_` wildcard, silently swallowing
+  `UnOp::Neg` — so `-(x)` on a signed integer emitted NO obligation,
+  NO violation, and NO audit note, and `-(iN::MIN)` (a runtime panic)
+  was reported "safe". Closed by: an exhaustive `UnOp` match in the
+  visitor; a new `ArithOp::Neg` carried through the PB049
+  `ArithmeticOverflow` machinery (single operand in the `lhs`
+  position, precondition-bindable like the binary ops); and a
+  `pitbull-vc` violation predicate `(= lhs iN::MIN)` (signed only —
+  Rust has no unsigned unary `-`; unsigned fails closed to `None`).
+  Verified e2e against fake solvers (`-x` discharges under `unsat`,
+  refutes under `sat` with the MIN counterexample); pinned by
+  `visitor::neg_signed_emits_arith_obligation_not_swallowed` and
+  `smt::neg_emits_signed_min_overflow`. The other panic/UB-capable MIR
+  operations (Add/Sub/Mul/Div/Rem/Shl/Shr, slice index, casts, panic
+  calls) were re-audited and confirmed obligated or justifiably
+  skipped; the SMT encodings (signed/unsigned overflow predicates,
+  div MIN/-1, over-shift width, index bound) were confirmed sound.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1401,7 +1420,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  202 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  204 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1414,7 +1433,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 202 passing, 0 warnings, clippy clean
+# Stable: 204 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054
