@@ -39,8 +39,61 @@
 //! than recompiling Rust. So certificates produced by the nightly
 //! wrapper can be replayed by anyone on stable Rust.
 use crate::solver::{run_solvers, vote, AgreementVerdict, Solver, SolverResult};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::time::Duration;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Lowercase-hex encode bytes (no dependency on a `hex` crate).
+#[must_use]
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode lowercase/uppercase hex; `None` on any non-hex or odd length.
+#[must_use]
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// HMAC-SHA256 of `bytes` under `key`.
+#[must_use]
+fn hmac_sha256(key: &[u8], bytes: &[u8]) -> Vec<u8> {
+    // `Hmac::new_from_slice` only errors on key lengths it cannot
+    // accept; HMAC accepts a key of ANY length (it hashes over-long
+    // keys and zero-pads short ones), so this never fails.
+    let mut mac =
+        HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(bytes);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Whether a certificate bundle carries a valid integrity signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureStatus {
+    /// No signature present — the bundle was produced without a key.
+    /// Re-run still confirms reproduction, but tampering of the
+    /// certificate is NOT detectable.
+    Unsigned,
+    /// Signature present and verified against the provided key.
+    Valid,
+    /// Signature present but does NOT verify: the certificate was
+    /// altered after signing, or a different key was used. Fail closed.
+    Invalid,
+}
 
 /// On-disk format version. Bump on any breaking schema change so a
 /// replayer can refuse a format it doesn't understand (fail closed)
@@ -299,6 +352,12 @@ pub struct CertificateBundle {
     pub solvers: Vec<String>,
     /// One entry per obligation that reached the solver.
     pub obligations: Vec<ObligationCertificate>,
+    /// Hex HMAC-SHA256 over the canonical bundle content (everything
+    /// except this field), set by [`CertificateBundle::sign`]. `None`
+    /// for an unsigned bundle; omitted from the JSON when absent so
+    /// unsigned bundles and older certs round-trip cleanly (Task T.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl CertificateBundle {
@@ -320,7 +379,63 @@ impl CertificateBundle {
             timeout_seconds,
             solvers,
             obligations: Vec::new(),
+            signature: None,
         }
+    }
+    /// Canonical bytes the signature covers: the bundle serialized with
+    /// the `signature` field cleared (so the MAC is over content only).
+    /// serde_json over a struct is deterministic (declaration field
+    /// order; the bundle holds only `Vec`s, no nondeterministic maps),
+    /// so producer and verifier agree on these bytes.
+    fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut copy = self.clone();
+        copy.signature = None;
+        serde_json::to_vec(&copy)
+    }
+    /// Sign the bundle in place with HMAC-SHA256 over its canonical
+    /// content. Makes the certificate tamper-RESISTANT for anyone who
+    /// does not hold `key` (Task T.3): altering any field — a swapped
+    /// `smt`, a lowered `threshold`, an edited `verdict` — invalidates
+    /// the signature.
+    ///
+    /// # Errors
+    /// Returns `Err` if the bundle cannot be canonicalized (serde).
+    pub fn sign(&mut self, key: &[u8]) -> Result<(), String> {
+        let bytes = self
+            .canonical_bytes()
+            .map_err(|e| format!("canonicalizing bundle for signing: {e}"))?;
+        self.signature = Some(to_hex(&hmac_sha256(key, &bytes)));
+        Ok(())
+    }
+    /// Verify the bundle's signature against `key`. Constant-time
+    /// (via the `hmac` crate's `verify_slice`). Returns `Unsigned` if no
+    /// signature is present, `Valid` if it verifies, `Invalid` if it
+    /// was tampered or signed with a different key.
+    #[must_use]
+    pub fn verify_signature(&self, key: &[u8]) -> SignatureStatus {
+        let Some(sig_hex) = &self.signature else {
+            return SignatureStatus::Unsigned;
+        };
+        let Some(sig_bytes) = from_hex(sig_hex) else {
+            return SignatureStatus::Invalid;
+        };
+        let Ok(bytes) = self.canonical_bytes() else {
+            return SignatureStatus::Invalid;
+        };
+        let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+            return SignatureStatus::Invalid;
+        };
+        mac.update(&bytes);
+        if mac.verify_slice(&sig_bytes).is_ok() {
+            SignatureStatus::Valid
+        } else {
+            SignatureStatus::Invalid
+        }
+    }
+    /// Whether the bundle carries a signature (verified or not).
+    #[must_use]
+    pub fn is_signed(&self) -> bool {
+        self.signature.is_some()
     }
     /// Serialize to pretty JSON (the on-disk certificate format).
     ///
@@ -469,6 +584,70 @@ mod tests {
         let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
         let cert = ObligationCertificate::from_run("o", "PB049", "(check-sat)", &results, 2);
         assert!(cert.check_internal_consistency().is_ok());
+    }
+
+    fn signed_bundle() -> (CertificateBundle, Vec<u8>) {
+        let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
+        let mut b = CertificateBundle::new("0.1.0", "c", 2, 60, vec!["z3".into(), "cvc5".into()]);
+        b.obligations
+            .push(ObligationCertificate::from_run("pb049-neg-0", "PB049", "(check-sat)", &results, 2));
+        let key = b"super-secret-ci-key".to_vec();
+        b.sign(&key).expect("sign");
+        (b, key)
+    }
+
+    /// Task T.3: a signed bundle verifies under the same key.
+    #[test]
+    fn sign_then_verify_is_valid() {
+        let (b, key) = signed_bundle();
+        assert!(b.is_signed());
+        assert_eq!(b.verify_signature(&key), SignatureStatus::Valid);
+    }
+
+    /// Tampering ANY signed field (here a swapped SMT — the Critical
+    /// the audit found) invalidates the signature.
+    #[test]
+    fn tampered_smt_fails_verification() {
+        let (mut b, key) = signed_bundle();
+        // The swapped-SMT attack: replace the problem with a trivially
+        // unsat one while leaving id/rule/verdict intact.
+        b.obligations[0].smt = "(assert false)\n(check-sat)\n".into();
+        assert_eq!(b.verify_signature(&key), SignatureStatus::Invalid);
+    }
+
+    /// Tampering the threshold (the High the audit found) invalidates.
+    #[test]
+    fn tampered_threshold_fails_verification() {
+        let (mut b, key) = signed_bundle();
+        b.obligations[0].threshold = 1;
+        assert_eq!(b.verify_signature(&key), SignatureStatus::Invalid);
+    }
+
+    /// A different key does not verify.
+    #[test]
+    fn wrong_key_fails_verification() {
+        let (b, _key) = signed_bundle();
+        assert_eq!(b.verify_signature(b"a-different-key"), SignatureStatus::Invalid);
+    }
+
+    /// An unsigned bundle reports `Unsigned` (not `Invalid`).
+    #[test]
+    fn unsigned_bundle_is_unsigned() {
+        let results = [r("z3", SolverResult::Unsat)];
+        let mut b = CertificateBundle::new("0.1.0", "c", 1, 60, vec!["z3".into()]);
+        b.obligations
+            .push(ObligationCertificate::from_run("o", "PB049", "(check-sat)", &results, 1));
+        assert!(!b.is_signed());
+        assert_eq!(b.verify_signature(b"any-key"), SignatureStatus::Unsigned);
+    }
+
+    /// The signature survives a JSON round-trip and still verifies.
+    #[test]
+    fn signature_survives_json_round_trip() {
+        let (b, key) = signed_bundle();
+        let json = b.to_json().expect("serialize");
+        let back = CertificateBundle::from_json(&json).expect("deserialize");
+        assert_eq!(back.verify_signature(&key), SignatureStatus::Valid);
     }
 
     /// Replay reproduces: a discharged cert, re-run with the same

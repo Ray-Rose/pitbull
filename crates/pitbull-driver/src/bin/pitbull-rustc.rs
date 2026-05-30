@@ -633,6 +633,34 @@ impl PitbullCallbacks {
                         solvers.iter().map(|s| s.name.to_string()).collect(),
                     );
                     bundle.obligations = certs;
+                    // Sign the bundle if a key is configured (Task T.3).
+                    // PITBULL_CERT_KEY is a path to a key file; an
+                    // HMAC-SHA256 over the canonical bundle makes the
+                    // certificate tamper-resistant (a swapped SMT or
+                    // edited threshold invalidates it). Without a key the
+                    // certificate is emitted UNSIGNED (still replayable,
+                    // but tampering is not detectable).
+                    if let Some(keypath) = std::env::var_os("PITBULL_CERT_KEY") {
+                        match std::fs::read(&keypath) {
+                            Ok(key) if !key.is_empty() => match bundle.sign(&key) {
+                                Ok(()) => eprintln!(
+                                    "pitbull-rustc: certificate signed (HMAC-SHA256).",
+                                ),
+                                Err(e) => eprintln!(
+                                    "pitbull-rustc: WARNING: certificate signing failed \
+                                     ({e}); emitting UNSIGNED certificate.",
+                                ),
+                            },
+                            Ok(_) => eprintln!(
+                                "pitbull-rustc: WARNING: PITBULL_CERT_KEY file is empty; \
+                                 emitting UNSIGNED certificate.",
+                            ),
+                            Err(e) => eprintln!(
+                                "pitbull-rustc: WARNING: cannot read PITBULL_CERT_KEY \
+                                 ({e}); emitting UNSIGNED certificate.",
+                            ),
+                        }
+                    }
                     match bundle.to_json() {
                         Ok(text) => match std::fs::write(&out_path, text) {
                             Ok(()) => eprintln!(

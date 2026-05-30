@@ -236,6 +236,49 @@ fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
              success for an empty certificate",
         );
     }
+    // Integrity check (Task T.3). If PITBULL_CERT_KEY is set, verify the
+    // HMAC-SHA256 signature and REFUSE (fail closed, exit 2) on a
+    // tampered/invalid signature — before running any solver. If the
+    // key is set but the cert is unsigned, or a key is absent, warn:
+    // re-run still confirms reproduction, but tampering is undetectable
+    // without the key.
+    match std::env::var_os("PITBULL_CERT_KEY") {
+        Some(keypath) => {
+            let key = std::fs::read(&keypath)
+                .with_context(|| format!("reading PITBULL_CERT_KEY {keypath:?}"))?;
+            match bundle.verify_signature(&key) {
+                pitbull_vc::cert::SignatureStatus::Valid => {
+                    eprintln!("pitbull replay: signature OK (HMAC-SHA256 verified).");
+                }
+                pitbull_vc::cert::SignatureStatus::Unsigned => {
+                    eprintln!(
+                        "pitbull replay: WARNING: certificate is UNSIGNED; re-run confirms \
+                         reproduction but tampering is not detectable.",
+                    );
+                }
+                pitbull_vc::cert::SignatureStatus::Invalid => {
+                    anyhow::bail!(
+                        "certificate signature is INVALID (tampered, or signed with a \
+                         different key) — refusing to replay",
+                    );
+                }
+            }
+        }
+        None => {
+            if bundle.is_signed() {
+                eprintln!(
+                    "pitbull replay: WARNING: certificate is SIGNED but no PITBULL_CERT_KEY \
+                     was provided — cannot verify integrity; re-running anyway.",
+                );
+            } else {
+                eprintln!(
+                    "pitbull replay: note: certificate is UNSIGNED and no key provided; \
+                     integrity not checked (set PITBULL_CERT_KEY on both `check` and \
+                     `replay` to enable tamper detection).",
+                );
+            }
+        }
+    }
     // Rebuild the solver pool from the bundle's recorded names. Replay
     // reproduces the ORIGINAL decision, so we use the recorded pool and
     // each certificate's own recorded threshold (via `replay_bundle`).

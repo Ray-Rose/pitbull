@@ -18,5 +18,14 @@ pitbull-subset = { path = "../pitbull-subset" }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 
+# Proof-certificate signing (Task T.3). HMAC-SHA256 over the canonical
+# bundle content makes a certificate tamper-RESISTANT within a trust
+# domain that holds the key (e.g. CI). These are the minimal, audited
+# pure-Rust RustCrypto primitives — a deliberate, user-approved TCB
+# dependency (the project otherwise ships no crypto). Public,
+# cross-domain verification (Ed25519) is a separate future layer.
+sha2        = "0.10"
+hmac        = "0.12"
+
 [lints]
 workspace = true
