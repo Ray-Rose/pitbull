@@ -198,19 +198,44 @@ fn run_verify_stub(cli: &Cli) -> Result<ExitCode> {
 /// certificate produced on one machine can be independently re-checked
 /// anywhere the solvers are installed.
 fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
+    // Bound the certificate file before slurping it: a multi-GB file
+    // would otherwise be read fully into memory (local DoS). 16 MiB is
+    // far above any realistic certificate (audit 2026-05-29).
+    const CERT_FILE_CAP_BYTES: u64 = 16 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(cert_path) {
+        if meta.len() > CERT_FILE_CAP_BYTES {
+            anyhow::bail!(
+                "certificate {} is {} bytes, over the {CERT_FILE_CAP_BYTES}-byte replay cap",
+                cert_path.display(),
+                meta.len(),
+            );
+        }
+    }
     let text = std::fs::read_to_string(cert_path)
         .with_context(|| format!("reading certificate {}", cert_path.display()))?;
     let bundle = pitbull_vc::cert::CertificateBundle::from_json(&text)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!(
         "pitbull replay: {} — crate `{}`, {} obligation(s), agreement threshold {}, \
-         recorded solver pool {:?}",
+         recorded solver pool {:?}, recorded timeout {}s",
         cert_path.display(),
         bundle.crate_name,
         bundle.obligations.len(),
         bundle.threshold,
         bundle.solvers,
+        bundle.timeout_seconds,
     );
+    // An empty bundle is NOT a verification success — nothing was
+    // re-verified. Fail closed (exit 2) so a CI gate keyed on the exit
+    // code cannot be fooled by a swapped-in empty (but well-formed)
+    // certificate, or by a producer that emitted zero obligations
+    // (audit 2026-05-29).
+    if bundle.obligations.is_empty() {
+        anyhow::bail!(
+            "certificate contains 0 obligations — nothing to replay; refusing to report \
+             success for an empty certificate",
+        );
+    }
     // Rebuild the solver pool from the bundle's recorded names. Replay
     // reproduces the ORIGINAL decision, so we use the recorded pool and
     // each certificate's own recorded threshold (via `replay_bundle`).
@@ -231,16 +256,19 @@ fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
             bundle.solvers,
         );
     }
-    // The certificate does not record the original per-check timeout;
-    // use a generous fixed budget. A solver that times out on replay
-    // surfaces as a MISMATCH (correctly — the proof did not reproduce
-    // within budget).
-    let timeout = std::time::Duration::from_secs(60);
+    // Replay under the RECORDED timeout (clamped to a sane range) so a
+    // non-default original budget can't cause a spurious MISMATCH
+    // (audit 2026-05-29).
+    let timeout = std::time::Duration::from_secs(bundle.timeout_seconds.clamp(1, 3600));
     let outcomes = pitbull_vc::cert::replay_bundle(&bundle, &solvers, timeout);
     let mut mismatches = 0usize;
+    let mut discharges_reproduced = 0usize;
     for (id, outcome) in &outcomes {
         match outcome {
             pitbull_vc::cert::ReplayOutcome::Match { verdict } => {
+                if verdict == "discharged" {
+                    discharges_reproduced += 1;
+                }
                 println!("  MATCH     {id}: reproduced `{verdict}`");
             }
             pitbull_vc::cert::ReplayOutcome::Mismatch { recorded, replayed } => {
@@ -251,6 +279,23 @@ fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
             }
         }
     }
+    let reproduced = outcomes.len() - mismatches;
+    eprintln!(
+        "pitbull replay: {reproduced} reproduced ({discharges_reproduced} discharge(s)), \
+         {mismatches} mismatch(es), of {} obligation(s).",
+        outcomes.len(),
+    );
+    // Scope caveat (audit 2026-05-29): replay confirms each recorded SMT
+    // still reproduces its recorded verdict under the recorded pool and
+    // threshold. It does NOT (yet) prove the recorded SMT corresponds to
+    // the source obligation it names — binding SMT to obligation is
+    // cryptographic signing (Task T.3). A clean replay (exit 0) means
+    // "recorded verdicts reproduced", NOT "the code is safe".
+    eprintln!(
+        "pitbull replay: note — confirms recorded SMT->verdict reproduction, not that each \
+         SMT matches its named obligation (that binding is signing, Task T.3); a clean \
+         replay is not itself a safety claim.",
+    );
     if mismatches == 0 {
         eprintln!(
             "pitbull replay: OK — all {} obligation(s) reproduced their recorded verdict.",
@@ -260,8 +305,8 @@ fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
     } else {
         eprintln!(
             "pitbull replay: FAILED — {mismatches} of {} obligation(s) did NOT reproduce \
-             (possible solver drift/version skew, a missing solver, or a tampered \
-             certificate). Treat the affected proofs as UNVERIFIED.",
+             (solver drift/version skew, a missing solver, a timeout-budget change, or a \
+             tampered certificate). Treat the affected proofs as UNVERIFIED.",
             outcomes.len(),
         );
         Ok(ExitCode::from(1))

@@ -629,6 +629,7 @@ impl PitbullCallbacks {
                         env!("CARGO_PKG_VERSION"),
                         crate_name,
                         threshold,
+                        raw_timeout.max(1),
                         solvers.iter().map(|s| s.name.to_string()).collect(),
                     );
                     bundle.obligations = certs;

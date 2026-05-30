@@ -74,6 +74,22 @@ pub fn agreement_tag(v: &AgreementVerdict) -> &'static str {
     }
 }
 
+/// Inverse of [`solver_result_tag`] for the internal-consistency
+/// check. Only the `Sat`/`Unsat` distinction matters for re-deriving
+/// the vote; every non-decisive tag maps to a non-voting result.
+#[must_use]
+fn solver_result_from_tag(tag: &str) -> SolverResult {
+    match tag {
+        "sat" => SolverResult::Sat,
+        "unsat" => SolverResult::Unsat,
+        "timeout" => SolverResult::Timeout,
+        "not-installed" => SolverResult::NotInstalled,
+        // "unknown", "error", and any unrecognized tag are all
+        // non-voting for `vote`'s purposes.
+        _ => SolverResult::Unknown,
+    }
+}
+
 /// Count of DISTINCT solvers that returned `unsat` — the same
 /// distinct-name counting `vote` uses (so a duplicate solver entry
 /// can't inflate the recorded vote count either).
@@ -155,6 +171,49 @@ impl ObligationCertificate {
     pub fn is_discharged(&self) -> bool {
         self.verdict == "discharged"
     }
+    /// Cheap, no-crypto internal-consistency check (audit 2026-05-29):
+    /// re-derive the agreement verdict and distinct-`unsat` count FROM
+    /// the recorded per-solver verdicts, under the recorded threshold,
+    /// and confirm they match the recorded `verdict`/`unsat_votes`. An
+    /// honest producer's output always passes (it is built by exactly
+    /// this `vote`); a HAND-FORGED or CORRUPTED certificate whose fields
+    /// disagree (e.g. `verdict:"discharged"` over `solver_results` that
+    /// don't actually meet the threshold) is rejected. NOTE: this does
+    /// NOT catch a tamper that keeps the fields mutually consistent
+    /// (e.g. lowering `threshold` 2→1, or swapping `smt` for a
+    /// trivially-unsat problem) — that is what cryptographic signing
+    /// (Task T.3) is for. This is defense-in-depth, not the whole
+    /// integrity story.
+    ///
+    /// # Errors
+    /// Returns `Err` describing the inconsistency if the recorded
+    /// verdict/vote-count cannot be re-derived from the recorded
+    /// per-solver results at the recorded threshold.
+    pub fn check_internal_consistency(&self) -> Result<(), String> {
+        let reconstructed: Vec<(String, SolverResult)> = self
+            .solver_results
+            .iter()
+            .map(|r| (r.solver.clone(), solver_result_from_tag(&r.verdict)))
+            .collect();
+        let derived = vote(&reconstructed, self.threshold);
+        let derived_tag = agreement_tag(&derived);
+        if derived_tag != self.verdict {
+            return Err(format!(
+                "certificate {} is internally inconsistent: recorded verdict \
+                 `{}` but its solver_results re-derive to `{}` at threshold {}",
+                self.id, self.verdict, derived_tag, self.threshold,
+            ));
+        }
+        let derived_votes = distinct_unsat_votes(&reconstructed);
+        if derived_votes != self.unsat_votes {
+            return Err(format!(
+                "certificate {} is internally inconsistent: recorded unsat_votes \
+                 {} but its solver_results have {} distinct unsat verdict(s)",
+                self.id, self.unsat_votes, derived_votes,
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The result of replaying one certificate.
@@ -232,6 +291,10 @@ pub struct CertificateBundle {
     pub crate_name: String,
     /// Agreement threshold in force.
     pub threshold: usize,
+    /// Per-check solver timeout (seconds) used at certification time.
+    /// Replay re-uses this so a non-default original timeout cannot
+    /// cause a spurious MISMATCH (audit 2026-05-29).
+    pub timeout_seconds: u64,
     /// Solver pool names used to certify.
     pub solvers: Vec<String>,
     /// One entry per obligation that reached the solver.
@@ -246,6 +309,7 @@ impl CertificateBundle {
         tool_version: impl Into<String>,
         crate_name: impl Into<String>,
         threshold: usize,
+        timeout_seconds: u64,
         solvers: Vec<String>,
     ) -> Self {
         Self {
@@ -253,6 +317,7 @@ impl CertificateBundle {
             tool_version: tool_version.into(),
             crate_name: crate_name.into(),
             threshold,
+            timeout_seconds,
             solvers,
             obligations: Vec::new(),
         }
@@ -280,6 +345,13 @@ impl CertificateBundle {
                  (max {CERT_FORMAT_VERSION}); refusing to replay (upgrade pitbull)",
                 bundle.format_version,
             ));
+        }
+        // Reject a bundle whose certificates are internally inconsistent
+        // (hand-forged or corrupted). Fail closed at load (audit
+        // 2026-05-29) rather than silently replaying a self-contradictory
+        // certificate.
+        for ob in &bundle.obligations {
+            ob.check_internal_consistency()?;
         }
         Ok(bundle)
     }
@@ -344,7 +416,7 @@ mod tests {
     #[test]
     fn bundle_round_trips_through_json() {
         let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
-        let mut bundle = CertificateBundle::new("0.1.0-dev", "mycrate", 2, vec![
+        let mut bundle = CertificateBundle::new("0.1.0-dev", "mycrate", 2, 60, vec![
             "z3".into(),
             "cvc5".into(),
         ]);
@@ -355,6 +427,7 @@ mod tests {
         let back = CertificateBundle::from_json(&json).expect("deserialize");
         assert_eq!(back, bundle);
         assert_eq!(back.format_version, CERT_FORMAT_VERSION);
+        assert_eq!(back.timeout_seconds, 60);
     }
 
     /// A bundle from a NEWER format version is refused (fail closed).
@@ -362,11 +435,40 @@ mod tests {
     fn from_json_refuses_newer_format() {
         let json = format!(
             "{{\"format_version\":{},\"tool_version\":\"x\",\"crate_name\":\"c\",\
-             \"threshold\":2,\"solvers\":[],\"obligations\":[]}}",
+             \"threshold\":2,\"timeout_seconds\":60,\"solvers\":[],\"obligations\":[]}}",
             CERT_FORMAT_VERSION + 1,
         );
         let err = CertificateBundle::from_json(&json).expect_err("must refuse newer format");
         assert!(err.contains("newer than this tool supports"), "got: {err}");
+    }
+
+    /// A hand-forged/corrupted certificate whose recorded verdict
+    /// disagrees with its solver_results is rejected at load (audit
+    /// 2026-05-29 defense-in-depth). Here: `verdict:"discharged"` over
+    /// solver_results that show a `sat` (which would re-derive to
+    /// `refuted`/`disagreement`, never `discharged`).
+    #[test]
+    fn from_json_rejects_internally_inconsistent_cert() {
+        let json = format!(
+            "{{\"format_version\":{CERT_FORMAT_VERSION},\"tool_version\":\"x\",\
+             \"crate_name\":\"c\",\"threshold\":1,\"timeout_seconds\":60,\
+             \"solvers\":[\"z3\"],\"obligations\":[{{\
+             \"id\":\"pb049-neg-0\",\"rule\":\"PB049\",\"smt\":\"(check-sat)\",\
+             \"solver_results\":[{{\"solver\":\"z3\",\"verdict\":\"sat\"}}],\
+             \"verdict\":\"discharged\",\"unsat_votes\":1,\"threshold\":1}}]}}",
+        );
+        let err = CertificateBundle::from_json(&json)
+            .expect_err("must reject an internally inconsistent certificate");
+        assert!(err.contains("internally inconsistent"), "got: {err}");
+    }
+
+    /// An honest producer's certificate always passes the internal
+    /// consistency check (it is built by the same `vote`).
+    #[test]
+    fn honest_cert_passes_internal_consistency() {
+        let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
+        let cert = ObligationCertificate::from_run("o", "PB049", "(check-sat)", &results, 2);
+        assert!(cert.check_internal_consistency().is_ok());
     }
 
     /// Replay reproduces: a discharged cert, re-run with the same
