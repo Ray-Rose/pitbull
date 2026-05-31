@@ -23,8 +23,8 @@ repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 219 tests passing (1 + 124 subset-lib + 30 integration
-  + 64 vc), both lanes warning-clean, clippy error-clean. Done:
+- **State:** 220 tests passing (1 + 124 subset-lib + 30 integration
+  + 65 vc), both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
   and **Option C complete** — the predicate-grammar
@@ -146,13 +146,13 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **219 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **220 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The 219 breaks down: 1 (cargo-pitbull bin) + 124 (subset lib) + 30 (integration) + 64 (vc) = 219. The +11 over the 191 Task-R baseline are Task S (multi-solver agreement gate) plus its post-commit red-team hardening: vc gains 10 `vote()` unit tests — the 8 agreement-policy cases (two-unsat-meets-threshold, single-unsat-inconclusive, unsat+sat-disagreement, all-sat-refuted, sat+unknown-refuted, threshold-1-discharges, no-decisions-inconclusive, known-solver-resolves) plus two soundness regression guards (duplicate-solver-name-counts-once, empty-results-inconclusive) — and integration gains the 2-of-N agreement discharge capstone (gated on both z3 and cvc5 present). A 4-agent red-team of the gate (2026-05-29) found and fixed **two CRITICALs**: a consistency-check fail-open (Timeout/Error/Unknown on the precondition consistency check used to fall through to the main check, risking a *vacuous* discharge of contradictory preconditions) and duplicate-solver vote inflation (`solvers=["z3","z3"]` counted one binary as two independent votes). Both are verified closed; the six dispatch branches plus the two fixes were exercised across 7 fake-solver scenarios end-to-end. A follow-on program-wide audit (2026-05-29) additionally found and fixed a CRITICAL missed obligation: unary negation `-x` was completely unobligated (the `Rvalue::UnaryOp` arm swallowed `UnOp::Neg`), so `-(iN::MIN)` was reported safe. PB049 now emits a `neg` obligation encoding `(= lhs iN::MIN)`, guarded by +1 visitor and +1 smt test (the +2 that take vc 48→49 and subset 123→124). The proof-certificate arc (Task T) then takes vc 49→64: T.1 (model + pure `replay_with_results`) +7, the red-team-T fixes (internal-consistency validation) +2, and T.3 (HMAC-SHA256 signing) +6 — exercising discharged/refuted recording, JSON round-trip + newer-format refusal, replay match/mismatch, internal-consistency rejection, and sign/verify (incl. tampered-SMT and tampered-threshold → Invalid). The produce→replay→verify loop and the signing path were verified end-to-end against fake solvers (cert emitted with the correct neg SMT; `cargo pitbull replay` re-ran/compared and verified the HMAC; a tampered field → "signature INVALID, refusing to replay", exit 2). Total: **219**.
+The 220 breaks down: 1 (cargo-pitbull bin) + 124 (subset lib) + 30 (integration) + 65 (vc) = 220. The +11 over the 191 Task-R baseline are Task S (multi-solver agreement gate) plus its post-commit red-team hardening: vc gains 10 `vote()` unit tests — the 8 agreement-policy cases (two-unsat-meets-threshold, single-unsat-inconclusive, unsat+sat-disagreement, all-sat-refuted, sat+unknown-refuted, threshold-1-discharges, no-decisions-inconclusive, known-solver-resolves) plus two soundness regression guards (duplicate-solver-name-counts-once, empty-results-inconclusive) — and integration gains the 2-of-N agreement discharge capstone (gated on both z3 and cvc5 present). A 4-agent red-team of the gate (2026-05-29) found and fixed **two CRITICALs**: a consistency-check fail-open (Timeout/Error/Unknown on the precondition consistency check used to fall through to the main check, risking a *vacuous* discharge of contradictory preconditions) and duplicate-solver vote inflation (`solvers=["z3","z3"]` counted one binary as two independent votes). Both are verified closed; the six dispatch branches plus the two fixes were exercised across 7 fake-solver scenarios end-to-end. A follow-on program-wide audit (2026-05-29) additionally found and fixed a CRITICAL missed obligation: unary negation `-x` was completely unobligated (the `Rvalue::UnaryOp` arm swallowed `UnOp::Neg`), so `-(iN::MIN)` was reported safe. PB049 now emits a `neg` obligation encoding `(= lhs iN::MIN)`, guarded by +1 visitor and +1 smt test (the +2 that take vc 48→49 and subset 123→124). The proof-certificate arc (Task T) then takes vc 49→64: T.1 (model + pure `replay_with_results`) +7, the red-team-T fixes (internal-consistency validation) +2, and T.3 (HMAC-SHA256 signing) +6 — exercising discharged/refuted recording, JSON round-trip + newer-format refusal, replay match/mismatch, internal-consistency rejection, and sign/verify (incl. tampered-SMT and tampered-threshold → Invalid). The produce→replay→verify loop and the signing path were verified end-to-end against fake solvers (cert emitted with the correct neg SMT; `cargo pitbull replay` re-ran/compared and verified the HMAC; a tampered field → "signature INVALID, refusing to replay", exit 2). A post-recovery red-team of the signing/hardening surfaces then fixed a HIGH (`from_hex` panicked on a non-ASCII signature — now fails closed to `Invalid`, +1 regression test → vc 65) plus a Medium (`probe_version` now timeout-bounded) and Lows (token-match version pins, `deny_unknown_fields`, key size-cap/min-length). Total: **220**.
 
 ---
 
@@ -283,11 +283,11 @@ git log --oneline -1
 # Expected: a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
 ```
 
-### Step 4.2 — Stable test suite (the 219-test baseline)
+### Step 4.2 — Stable test suite (the 220-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
-# Expected: "test result: ok" lines totaling 219 passing, 0 failed, 0 ignored
+# Expected: "test result: ok" lines totaling 220 passing, 0 failed, 0 ignored
 ```
 
 If you see `Application Control policy has blocked this file` on Windows: that's Smart App Control quarantining a fresh test binary. Run again — usually clears on the second try. If persistent, run `cargo +stable test --workspace --all-features` (without the -p flag) to use the workspace-mode binary path which SAC tends to accept.
@@ -362,7 +362,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 219 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 220 passing.
 # Note: the 2-of-N agreement capstone additionally requires BOTH z3 and
 # cvc5 on PATH; with PITBULL_REQUIRE_E2E set it panics if either is missing.
 ```
@@ -409,7 +409,7 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 219 passing (same as without Z3 — the new tests
+# Expected: 220 passing (same as without Z3 — the new tests
 # also pass via graceful-skip if no solver is present, but with
 # z3 they exercise the real `unsat` verdict path).
 ```

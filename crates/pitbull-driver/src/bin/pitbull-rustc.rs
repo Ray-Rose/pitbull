@@ -616,7 +616,20 @@ impl PitbullCallbacks {
                 solvers.retain(|s| match cfg.verification.solver_versions.get(s.name) {
                     None => true,
                     Some(pinned) => match pitbull_vc::solver::probe_version(s) {
-                        Some(out) if out.contains(pinned.as_str()) => true,
+                        // Token match, not a raw substring (red-team Low,
+                        // 2026-05-29): an unanchored `contains` would let a
+                        // pin of `1.0` match a reported `11.0.5`. Require the
+                        // pin to equal a whitespace-delimited version token
+                        // (surrounding punctuation trimmed; `.` kept).
+                        Some(out)
+                            if out.split_whitespace().any(|tok| {
+                                tok.trim_matches(|c: char| {
+                                    !c.is_ascii_alphanumeric() && c != '.'
+                                }) == pinned.as_str()
+                            }) =>
+                        {
+                            true
+                        }
                         Some(out) => {
                             eprintln!(
                                 "pitbull-rustc: WARNING: solver `{}` version mismatch — \
@@ -702,23 +715,28 @@ impl PitbullCallbacks {
                     // certificate is emitted UNSIGNED (still replayable,
                     // but tampering is not detectable).
                     if let Some(keypath) = std::env::var_os("PITBULL_CERT_KEY") {
-                        match std::fs::read(&keypath) {
-                            Ok(key) if !key.is_empty() => match bundle.sign(&key) {
-                                Ok(()) => eprintln!(
-                                    "pitbull-rustc: certificate signed (HMAC-SHA256).",
-                                ),
-                                Err(e) => eprintln!(
-                                    "pitbull-rustc: WARNING: certificate signing failed \
-                                     ({e}); emitting UNSIGNED certificate.",
-                                ),
-                            },
-                            Ok(_) => eprintln!(
-                                "pitbull-rustc: WARNING: PITBULL_CERT_KEY file is empty; \
-                                 emitting UNSIGNED certificate.",
-                            ),
+                        match pitbull_vc::cert::read_key_file(std::path::Path::new(&keypath)) {
+                            Ok(key) => {
+                                if key.len() < pitbull_vc::cert::MIN_RECOMMENDED_KEY_BYTES {
+                                    eprintln!(
+                                        "pitbull-rustc: WARNING: PITBULL_CERT_KEY is short \
+                                         ({} bytes); a weak key undermines the \
+                                         tamper-resistance signing is meant to provide.",
+                                        key.len(),
+                                    );
+                                }
+                                match bundle.sign(&key) {
+                                    Ok(()) => eprintln!(
+                                        "pitbull-rustc: certificate signed (HMAC-SHA256).",
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "pitbull-rustc: WARNING: certificate signing failed \
+                                         ({e}); emitting UNSIGNED certificate.",
+                                    ),
+                                }
+                            }
                             Err(e) => eprintln!(
-                                "pitbull-rustc: WARNING: cannot read PITBULL_CERT_KEY \
-                                 ({e}); emitting UNSIGNED certificate.",
+                                "pitbull-rustc: WARNING: {e}; emitting UNSIGNED certificate.",
                             ),
                         }
                     }

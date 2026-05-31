@@ -244,8 +244,15 @@ fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
     // without the key.
     match std::env::var_os("PITBULL_CERT_KEY") {
         Some(keypath) => {
-            let key = std::fs::read(&keypath)
-                .with_context(|| format!("reading PITBULL_CERT_KEY {keypath:?}"))?;
+            let key = pitbull_vc::cert::read_key_file(std::path::Path::new(&keypath))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if key.len() < pitbull_vc::cert::MIN_RECOMMENDED_KEY_BYTES {
+                eprintln!(
+                    "pitbull replay: WARNING: PITBULL_CERT_KEY is short ({} bytes); a weak \
+                     key provides little tamper-resistance.",
+                    key.len(),
+                );
+            }
             match bundle.verify_signature(&key) {
                 pitbull_vc::cert::SignatureStatus::Valid => {
                     eprintln!("pitbull replay: signature OK (HMAC-SHA256 verified).");

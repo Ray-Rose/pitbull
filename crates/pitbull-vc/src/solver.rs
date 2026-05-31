@@ -637,16 +637,45 @@ fn read_capped<R: Read>(mut reader: R, cap_bytes: u64) -> std::io::Result<(Vec<u
 /// only read stdout.
 #[must_use]
 pub fn probe_version(solver: &Solver) -> Option<String> {
-    let output = Command::new(solver.program)
+    // Bound the call (red-team Medium, 2026-05-29): a wedged or hostile
+    // solver `--version` must NOT hang the whole verification run the way
+    // a bare `Command::output()` (read-to-EOF, no timeout) would. We cap
+    // both wall-clock and bytes read; on timeout we kill and fail closed
+    // (the caller then drops the solver from the pool — a smaller pool is
+    // strictly fail-closed). `--version` output is tiny, so the cap and
+    // read-after-exit never truncate a legitimate banner.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+    const PROBE_OUTPUT_CAP: u64 = 64 * 1024;
+    let mut child = Command::new(solver.program)
         .arg("--version")
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
     }
-    let s = String::from_utf8_lossy(&output.stdout);
+    let stdout = child.stdout.take()?;
+    let (bytes, _capped) = read_capped(stdout, PROBE_OUTPUT_CAP).ok()?;
+    let s = String::from_utf8_lossy(&bytes);
     let trimmed = s.trim();
     if trimmed.is_empty() {
         None

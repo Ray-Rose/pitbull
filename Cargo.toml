@@ -32,7 +32,10 @@ members = [
 [workspace.package]
 version      = "0.1.0-dev"
 edition      = "2021"
-rust-version = "1.78"
+# MSRV 1.87: the codebase uses `{integer}::is_multiple_of` (stabilized
+# 1.87) in predicate.rs and cert.rs. Keep this honest with the real
+# floor (red-team Low, 2026-05-29).
+rust-version = "1.87"
 license      = "MIT OR Apache-2.0"
 authors      = ["The Pitbull Authors"]
 repository   = "https://github.com/pitbull-verify/pitbull"

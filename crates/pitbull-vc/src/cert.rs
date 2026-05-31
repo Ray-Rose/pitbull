@@ -58,14 +58,26 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// Decode lowercase/uppercase hex; `None` on any non-hex or odd length.
+///
+/// Operates on BYTES, not `&str` char slices. A `signature` field from
+/// an attacker-supplied certificate can contain arbitrary UTF-8, and
+/// slicing a `&str` at a non-char boundary would PANIC; byte-indexing
+/// with `to_digit` cannot panic and rejects any non-hex byte. So a
+/// malformed signature fails closed to `Invalid` rather than crashing
+/// the verifier (audit 2026-05-29, red-team HIGH).
 #[must_use]
 fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
+    (0..b.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .map(|i| {
+            let hi = char::from(b[i]).to_digit(16)?;
+            let lo = char::from(b[i + 1]).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
         .collect()
 }
 
@@ -79,6 +91,42 @@ fn hmac_sha256(key: &[u8], bytes: &[u8]) -> Vec<u8> {
         HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts a key of any length");
     mac.update(bytes);
     mac.finalize().into_bytes().to_vec()
+}
+
+/// Maximum accepted size of an HMAC key file. Keys are tiny; the cap
+/// defends against a hostile `PITBULL_CERT_KEY` (the env var is
+/// build.rs-injectable) pointing at a huge file → a memory DoS when
+/// read (red-team Low, 2026-05-29).
+pub const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
+
+/// Keys shorter than this are weak; the caller should warn (HMAC
+/// accepts any length, but a few-byte key is brute-forceable).
+pub const MIN_RECOMMENDED_KEY_BYTES: usize = 16;
+
+/// Read an HMAC key from `path`, rejecting an over-large file (size
+/// cap checked BEFORE reading) and an empty file. Shared by the
+/// signer (wrapper) and verifier (`replay`) so both apply the same
+/// bound and error shape.
+///
+/// # Errors
+/// `Err` if the file is missing, unreadable, empty, or larger than
+/// [`MAX_KEY_FILE_BYTES`].
+pub fn read_key_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("cannot stat key file {}: {e}", path.display()))?;
+    if meta.len() > MAX_KEY_FILE_BYTES {
+        return Err(format!(
+            "key file {} is {} bytes, over the {MAX_KEY_FILE_BYTES}-byte cap",
+            path.display(),
+            meta.len(),
+        ));
+    }
+    let key = std::fs::read(path)
+        .map_err(|e| format!("cannot read key file {}: {e}", path.display()))?;
+    if key.is_empty() {
+        return Err(format!("key file {} is empty", path.display()));
+    }
+    Ok(key)
 }
 
 /// Whether a certificate bundle carries a valid integrity signature.
@@ -160,6 +208,7 @@ fn distinct_unsat_votes(results: &[(String, SolverResult)]) -> usize {
 
 /// One solver's recorded verdict on a certificate's SMT problem.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SolverVerdictRecord {
     /// Solver name (`"z3"`, `"cvc5"`, ...).
     pub solver: String,
@@ -170,6 +219,7 @@ pub struct SolverVerdictRecord {
 
 /// A replayable record of one obligation's gate decision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObligationCertificate {
     /// Obligation id (e.g. `pb049-neg-0`).
     pub id: String,
@@ -335,6 +385,7 @@ pub fn replay_certificate(
 /// A bundle of certificates for one verified crate, plus the context
 /// needed to interpret and replay them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertificateBundle {
     /// Schema version (`CERT_FORMAT_VERSION`).
     pub format_version: u32,
@@ -648,6 +699,24 @@ mod tests {
         let json = b.to_json().expect("serialize");
         let back = CertificateBundle::from_json(&json).expect("deserialize");
         assert_eq!(back.verify_signature(&key), SignatureStatus::Valid);
+    }
+
+    /// A malformed/non-ASCII signature string must fail closed to
+    /// `Invalid` and MUST NOT panic the verifier (audit 2026-05-29
+    /// red-team HIGH: `from_hex` used to slice a `&str` at a
+    /// non-char-boundary, panicking on multibyte input).
+    #[test]
+    fn malformed_signature_is_invalid_not_panic() {
+        let (mut b, key) = signed_bundle();
+        // 4 bytes, even length, contains a 3-byte char — the old
+        // `&s[i..i+2]` would panic here.
+        b.signature = Some("a\u{20ac}".to_string());
+        assert_eq!(b.verify_signature(&key), SignatureStatus::Invalid);
+        // odd length, non-hex, empty — all Invalid, none panic.
+        b.signature = Some("xyz".to_string());
+        assert_eq!(b.verify_signature(&key), SignatureStatus::Invalid);
+        b.signature = Some(String::new());
+        assert_eq!(b.verify_signature(&key), SignatureStatus::Invalid);
     }
 
     /// Replay reproduces: a discharged cert, re-run with the same
