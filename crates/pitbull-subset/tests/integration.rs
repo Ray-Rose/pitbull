@@ -819,10 +819,145 @@ fn pitbull_ensures_attribute_emits_pb076_obligation() {
         stderr.contains("pb076-ensures-"),
         "Q.4: verdict line should reference the pb076-ensures-{{seq}} id format. Got stderr:\n{stderr}",
     );
-    // The MVP encoder returns None — wrapper reports as "pending".
+    // `add_one`'s body effect is `x + 1` (a BinaryOp), which Q.4a
+    // intentionally does NOT capture — wrapping-BV arithmetic lands in
+    // the Q.4b follow-up — so the obligation stays "pending" (fail
+    // closed). The discharging copy/constant shapes are exercised by the
+    // two Z3-gated tests immediately below.
     assert!(
         stderr.contains("pending"),
-        "Q.4 MVP: ensures obligation should report as `pending` (Q.4a will discharge). Got stderr:\n{stderr}",
+        "ensures over an (uncaptured) arithmetic body should report as `pending`. Got stderr:\n{stderr}",
+    );
+}
+/// Q.4a (2026-05-29) capstone — TRUE postcondition DISCHARGES (unsat).
+/// `#[pitbull::ensures("result == x")] fn copy_arg(x: u32) -> u32 { x }`:
+/// the visitor captures the body effect `result == x`, asserts it
+/// alongside the negated goal `(not (= result x))` — a contradiction —
+/// so Z3 returns `unsat` and the wrapper reports `discharged (unsat`.
+/// This is the proof that PB076 ACTUALLY discharges end-to-end, not
+/// merely emits a pending obligation. Gated on Z3 like the other
+/// discharge capstones.
+#[test]
+fn wrapper_proves_ensures_copy_arg_discharges() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_ensures_copy_arg_discharges: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-q4a-true-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-q4a-true-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::ensures(\"result == x\")]\n\
+         pub fn copy_arg(x: u32) -> u32 {\n\
+             x\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!(
+            "wrapper_proves_ensures_copy_arg_discharges: SKIPPED \
+             (no solver on PATH; install z3 to exercise this end-to-end test)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("discharged (unsat")
+            && !stderr.contains("NOT DISCHARGED"),
+        "Q.4a: `copy_arg(x){{ x }}` with `ensures(result == x)` must \
+         DISCHARGE (unsat) under Z3. Got code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "Q.4a: a fully-discharged ensures obligation should exit 0. Got {code:?}",
+    );
+}
+/// Q.4a (2026-05-29) adversarial twin — FALSE postcondition does NOT
+/// discharge (sat). `#[pitbull::ensures("result < 5")] fn copy_arg(x) { x }`:
+/// `result == x` ∧ `not(result < 5)` is satisfiable (x = 5), so Z3
+/// returns `sat` and the wrapper reports `NOT DISCHARGED (sat`. Pairing
+/// this with the TRUE test proves the discharge is REAL — the encoder
+/// distinguishes a holding postcondition from a violated one, rather
+/// than rubber-stamping everything `unsat` (the cardinal sin). Gated on
+/// Z3.
+#[test]
+fn wrapper_ensures_false_postcondition_not_discharged() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_ensures_false_postcondition_not_discharged: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-q4a-false-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-q4a-false-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::ensures(\"result < 5\")]\n\
+         pub fn copy_arg(x: u32) -> u32 {\n\
+             x\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!(
+            "wrapper_ensures_false_postcondition_not_discharged: SKIPPED (no solver on PATH)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("NOT DISCHARGED (sat")
+            && !stderr.contains("discharged (unsat"),
+        "Q.4a: `copy_arg(x){{ x }}` with `ensures(result < 5)` must NOT \
+         discharge — a counterexample (x = 5) exists. Got code {code:?}, stderr:\n{stderr}",
+    );
+    assert_ne!(
+        code,
+        Some(0),
+        "Q.4a: an undischarged ensures obligation must drive a non-zero exit. Got {code:?}",
     );
 }
 /// Q.4 trust × ensures interaction (Option C design open-question #4):

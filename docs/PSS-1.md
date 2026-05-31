@@ -363,11 +363,21 @@ The visitor emits one `VcObligationKind::EnsuresPostcondition` per
 return site (and, fail-closed, one at the body span when a body with
 an `ensures` diverges / has no return terminator). The special binding
 `result` denotes the return value.
-**v0.2 status.** Obligation is *emitted* but `pitbull-vc::compile`
-returns `None` for it (reported "pending") — the body-effect SMT
-encoder that models `result` as a bit-vector over the body's effects
-lands in Task Q.4a. Until then a function with `#[ensures]` reports
-"undischarged" (exit 1), never a false "verified".
+**v0.2 status (Q.4a — 2026-05-29).** PB076 now DISCHARGES via SMT for
+the straight-line shapes the visitor can capture *soundly*: a
+single-block body that returns a (return-typed) argument or an integer
+constant. `result` and the return-typed parameters are declared as
+bit-vectors of the return width; the visitor asserts the captured body
+effect (`(= result <expr>)`), assumes every translatable precondition
+(with the F1 consistency guard), and negates the postcondition — so
+`unsat` ⇒ discharged and `sat` ⇒ a genuine counterexample (NOT
+discharged). Anything it cannot capture with certainty — an arithmetic
+body effect (`x + 1`, deferred to Q.4b), branches/loops, calls, casts, a
+non-primitive-integer return, or an untranslatable spec — stays
+*pending* (fail closed: never a false "verified"). A wrong body-effect
+encoding would falsely discharge a wrong postcondition, so the capture
+admits only shapes it can prove exactly and invalidates on any
+projection write or uncapturable rvalue.
 **Future.** Permanent.
 ## 14. Audit methodology
 Each rule is implemented in `pitbull-subset` as a single explicit arm
@@ -1352,13 +1362,18 @@ the std form and now also matches. No shadow type changes.
   (no quotes) is accepted by pretty-printing the attribute token
   tree via `rustc_ast_pretty::pprust::tts_to_string` and feeding it
   through the same predicate pipeline as the string-literal form.
-- ✅ `#[pitbull::ensures("...")]` MVP (Task Q.4, rule PB076). The
+- ✅ `#[pitbull::ensures("...")]` (Tasks Q.4 + Q.4a, rule PB076). The
   visitor emits a `VcObligationKind::EnsuresPostcondition` at every
   return (and fail-closed at the body span for divergent bodies);
-  `result` binds the return value. `pitbull-vc::compile` returns
-  `None` (reported "pending") — the SMT body-effect encoder is the
-  remaining Q.4a slice. A function with `#[ensures]` reports
-  "undischarged" (exit 1), never a false "verified".
+  `result` binds the return value. **Q.4a DISCHARGES it via SMT** for
+  single-block bodies returning a return-typed argument or an integer
+  constant — asserting the captured body effect, the translatable
+  preconditions (F1-guarded), and the negated postcondition (`unsat` ⇒
+  holds; `sat` ⇒ counterexample). Arithmetic body effects (`x + 1`) are
+  deferred to Q.4b; anything uncapturable fails closed to "pending",
+  never a false "verified". Verified adversarially: a TRUE postcondition
+  discharges (unsat), a FALSE one does not (sat), arithmetic stays
+  pending — both unit (exact-SMT) and Z3-gated e2e tests.
 - ✅ Full-codebase audit sweep cleanup (post-Q). Closed three
   "no silent skip" gaps the foundational-code audit found:
   (a) Div/Rem/Shl/Shr produced no obligation AND no audit note;

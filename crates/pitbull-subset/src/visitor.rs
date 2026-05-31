@@ -150,6 +150,13 @@ pub struct SubsetVisitor<'cfg> {
     /// emits with empty `ret_ty_name`, the future encoder skips
     /// non-int return types with a separate audit note).
     current_body_return_ty: Option<crate::mir_api::Ty>,
+    /// Captured BODY EFFECT: the SMT expression the return value
+    /// `result` equals, in terms of (return-typed) argument names.
+    /// `Some` only for soundly-capturable straight-line shapes (a
+    /// single block returning a Copy/Move of an arg, or a constant);
+    /// `None` otherwise → the ensures obligation stays pending. Q.4a
+    /// (2026-05-29).
+    current_body_effect: Option<String>,
     /// Whether the current body has been declared `#[pitbull::trusted]`.
     /// Trusted bodies are exempt from body-level checks but their *signatures*
     /// are still subject to PSS-1.
@@ -183,6 +190,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
             current_body_preconditions: Vec::new(),
             current_body_ensures: Vec::new(),
             current_body_return_ty: None,
+            current_body_effect: None,
             current_body_trusted: false,
             saw_return_with_ensures: false,
             in_spec_context: false,
@@ -290,6 +298,10 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // for `result`. Cleared on body exit alongside other
         // per-body fields.
         self.current_body_return_ty = Some(body.return_ty.clone());
+        // Q.4a: capture the body effect (what `result` equals) for the
+        // soundly-capturable straight-line shapes, so emit_ensures_obligation
+        // can build a dischargeable SMT problem. None for anything else.
+        self.current_body_effect = self.capture_body_effect(body);
         // M-1 (2026-05-26): reset the per-body "saw a return with
         // ensures" flag. Set true in emit_ensures_obligation; checked
         // at body exit to catch divergent bodies whose ensures
@@ -421,6 +433,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
         self.current_body_preconditions.clear();
         self.current_body_ensures.clear();
         self.current_body_return_ty = None;
+        self.current_body_effect = None;
     }
     // -------------------------------------------------------------------------
     // Statement dispatch — exhaustive over all 13 StatementKind variants.
@@ -1892,54 +1905,20 @@ impl<'cfg> SubsetVisitor<'cfg> {
         self.saw_return_with_ensures = true;
         let seq = self.vc_obligations.len();
         let id = format!("pb076-ensures-{seq}");
-        // Resolve the return type name. `None` means non-primitive
-        // (e.g. struct, tuple, slice). We still emit the obligation
-        // so the auditor sees the gap, but carry the `None` through
-        // to the obligation kind — `pitbull-vc::compile` fail-closes
-        // on it (audit-cleanup M-2, 2026-05-26). When the return
-        // type is non-primitive we ALSO surface an audit note so
-        // the gap is visible NOW, not just when the encoder lands.
         let ret_ty_name = self
             .current_body_return_ty
             .as_ref()
             .and_then(primitive_int_name_from_ty);
-        if ret_ty_name.is_none() {
-            self.audit_note(
-                term_span,
-                "PB076: ensures on a function whose return type is not a \
-                 primitive integer — the v0.2 `result` binding can only \
-                 size a bit-vector for primitive-int returns, so this \
-                 postcondition cannot be discharged until the encoder \
-                 gains struct/tuple/slice support. Obligation emitted \
-                 (pending) so the gap is visible.",
-            );
-        }
-        // F2 lex validation on each ensures string + caller-side
-        // preconditions. Mirror of the PB054 dispatcher's audit
-        // posture (no silent skips). For the MVP we only do the
-        // raw-SMT validation path; the predicate-grammar
-        // dispatch lands in Q.4a together with the body-effect
-        // encoder so we can bind `result` to a real SMT
-        // expression.
-        let mut assumptions: Vec<String> = Vec::with_capacity(
-            self.current_body_preconditions.len() + self.current_body_ensures.len(),
-        );
-        let mut pending_audit_notes: Vec<String> = Vec::new();
-        for raw in self.current_body_preconditions.iter()
-            .chain(self.current_body_ensures.iter())
-        {
-            match crate::predicate::validate_assertion_form(raw) {
-                Ok(()) => assumptions.push(raw.clone()),
-                Err(e) => {
-                    pending_audit_notes.push(format!(
-                        "PB076: rejecting precondition/ensures string \
-                         (not a valid SMT-LIB `(assert ...)` form for \
-                         the MVP encoder — Q.4a's predicate-grammar \
-                         dispatcher will handle `result < 101`-style \
-                         forms): {e} — input: {raw:?}",
-                    ));
-                }
-            }
+        // Q.4a: build the dischargeable SMT problem (declarations +
+        // preconditions + captured body effect + negated postcondition).
+        // Returns `(None, None, Some(reason))` and leaves the obligation
+        // PENDING when the return type is non-primitive, the body effect
+        // wasn't captured, or a postcondition couldn't be translated —
+        // fail closed; never guess the body.
+        let (discharge_smt, consistency_smt, why_pending) =
+            self.build_ensures_smt(ret_ty_name.as_deref());
+        if let Some(reason) = why_pending {
+            self.audit_note(term_span, reason);
         }
         self.vc_obligations.push(crate::vc::VcObligation {
             id,
@@ -1947,12 +1926,187 @@ impl<'cfg> SubsetVisitor<'cfg> {
             kind: crate::vc::VcObligationKind::EnsuresPostcondition {
                 ret_name: "result".into(),
                 ret_ty_name,
+                discharge_smt,
+                consistency_smt,
             },
-            assumptions,
+            // Preconditions are baked into `discharge_smt`; the generic
+            // `assumptions` field is unused for the ensures obligation.
+            assumptions: Vec::new(),
         });
-        for msg in pending_audit_notes {
-            self.audit_note(term_span, msg);
+    }
+    /// Build the ensures discharge + consistency SMT problems (Q.4a).
+    /// Returns `(discharge, consistency, pending_reason)`. `discharge`
+    /// is `Some` only when the return type is a primitive integer, the
+    /// body effect was captured, and EVERY postcondition translated;
+    /// otherwise it is `None` (pending) and `pending_reason` explains
+    /// why (surfaced as an audit note). `consistency` is `Some` only
+    /// when there are preconditions (the F1 vacuous-precondition guard).
+    ///
+    /// SMT shape:
+    /// ```text
+    /// (set-logic QF_BV)
+    /// (declare-const result (_ BitVec W)) (declare-const <arg> ...) ...
+    /// <preconditions over args>                  ; assumed
+    /// (assert (= result <captured body effect>)) ; the body
+    /// (assert (not (and <postconditions>)))      ; negated goal
+    /// (check-sat)                                ; unsat ⇒ holds
+    /// ```
+    fn build_ensures_smt(
+        &self,
+        ret_ty: Option<&str>,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let Some(ret_ty) = ret_ty else {
+            return (
+                None,
+                None,
+                Some(
+                    "PB076: ensures on a function whose return type is not a primitive \
+                     integer — cannot size the `result` bit-vector, so the postcondition \
+                     cannot be discharged; obligation pending."
+                        .to_string(),
+                ),
+            );
+        };
+        let Some((_signed, bits)) = crate::predicate::int_type_info(ret_ty) else {
+            return (
+                None,
+                None,
+                Some(format!(
+                    "PB076: unsupported return type {ret_ty} for ensures discharge; pending.",
+                )),
+            );
+        };
+        let Some(effect) = self.current_body_effect.clone() else {
+            return (
+                None,
+                None,
+                Some(
+                    "PB076: could not capture the function's return value (body effect) — \
+                     only single-block straight-line returns of a (return-typed) argument \
+                     or a constant are captured today; arithmetic, branches, and calls stay \
+                     pending (arithmetic body effects land in the Q.4b follow-up)."
+                        .to_string(),
+                ),
+            );
+        };
+        // Known SMT variable names: `result` + return-typed parameter
+        // names (uniform `BitVec<W>` sort).
+        let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        known.insert("result".to_string());
+        let mut ret_typed_args: Vec<String> = Vec::new();
+        for (i, name) in self.current_body_arg_names.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            // `result` is the reserved SMT binding for the return value.
+            // A parameter of the same name would emit a duplicate
+            // `(declare-const result ...)` and conflate input with
+            // output — fail closed rather than risk an ambiguous encoding.
+            if name == "result" {
+                return (
+                    None,
+                    None,
+                    Some(
+                        "PB076: a function parameter is named `result`, which collides \
+                         with the reserved binding for the return value — cannot \
+                         disambiguate input from output; obligation pending."
+                            .to_string(),
+                    ),
+                );
+            }
+            // Parameter `i` is MIR local `i + 1`.
+            if let Some(ld) = self.current_body_locals.get(i + 1) {
+                if primitive_int_name_from_ty(&ld.ty).as_deref() == Some(ret_ty) {
+                    known.insert(name.clone());
+                    ret_typed_args.push(name.clone());
+                }
+            }
         }
+        // Preconditions → assumption asserts. If ANY precondition can't
+        // be translated, the WHOLE obligation is PENDING — we attempt a
+        // discharge only when EVERY assumption is faithfully encoded.
+        // Dropping an assumption is sound against false discharge (fewer
+        // assumptions only makes `unsat` harder), but it can yield a
+        // spurious counterexample/refutation; failing closed to
+        // "pending" is the more honest posture and matches the rule
+        // "fail closed for anything we can't soundly capture".
+        let mut assumptions: Vec<String> = Vec::new();
+        for raw in &self.current_body_preconditions {
+            match translate_spec_to_assert(raw, &known, ret_ty) {
+                Some(a) => assumptions.push(a),
+                None => {
+                    return (
+                        None,
+                        None,
+                        Some(format!(
+                            "PB076: precondition {raw:?} could not be translated to a \
+                             well-sorted assumption over `result`/return-typed args — use \
+                             `<ident> <cmp> <literal>` or `<ident> <cmp> <ident>` over \
+                             return-typed names (raw SMT-LIB specs are deferred); \
+                             obligation pending.",
+                        )),
+                    );
+                }
+            }
+        }
+        // Postconditions → inner terms. If ANY can't be translated, the
+        // WHOLE obligation is pending: we must never silently drop a
+        // postcondition we can't verify and then report the rest as
+        // discharged.
+        let mut post_terms: Vec<String> = Vec::new();
+        for raw in &self.current_body_ensures {
+            match translate_spec_to_term(raw, &known, ret_ty) {
+                Some(t) => post_terms.push(t),
+                None => {
+                    return (
+                        None,
+                        None,
+                        Some(format!(
+                            "PB076: postcondition {raw:?} could not be translated — use \
+                             `result <cmp> <literal>` or `result <cmp> <return-typed arg>` \
+                             (raw SMT-LIB specs are deferred); obligation pending.",
+                        )),
+                    );
+                }
+            }
+        }
+        if post_terms.is_empty() {
+            return (None, None, None);
+        }
+        let mut decls = format!("(declare-const result (_ BitVec {bits}))\n");
+        for arg in &ret_typed_args {
+            decls.push_str(&format!("(declare-const {arg} (_ BitVec {bits}))\n"));
+        }
+        let mut discharge = String::from("(set-logic QF_BV)\n");
+        discharge.push_str(&decls);
+        for a in &assumptions {
+            discharge.push_str(a);
+            if !a.ends_with('\n') {
+                discharge.push('\n');
+            }
+        }
+        discharge.push_str(&format!("(assert (= result {effect}))\n"));
+        let negated = if post_terms.len() == 1 {
+            format!("(not {})", post_terms[0])
+        } else {
+            format!("(not (and {}))", post_terms.join(" "))
+        };
+        discharge.push_str(&format!("(assert {negated})\n(check-sat)\n"));
+        let consistency = if assumptions.is_empty() {
+            None
+        } else {
+            let mut c = String::from("(set-logic QF_BV)\n");
+            c.push_str(&decls);
+            for a in &assumptions {
+                c.push_str(a);
+                if !a.ends_with('\n') {
+                    c.push('\n');
+                }
+            }
+            c.push_str("(check-sat)\n");
+            Some(c)
+        };
+        (Some(discharge), consistency, None)
     }
     /// Resolve an operand to its source-level parameter name when
     /// the operand is a direct read of a function argument (no
@@ -2041,6 +2195,186 @@ impl<'cfg> SubsetVisitor<'cfg> {
         };
         primitive_int_name_from_ty(ty)
     }
+    /// Q.4a body-effect capture (SOUNDNESS-CRITICAL). Returns the SMT
+    /// expression that the return value `result` equals, in terms of
+    /// return-typed argument names — but ONLY for shapes we can capture
+    /// with certainty. For ANY other shape it returns `None`, and the
+    /// `#[ensures]` obligation then stays pending (never a guess).
+    ///
+    /// Captured shapes (this increment): a SINGLE basic block ending in
+    /// `Return`, where the return local `_0` resolves (possibly via a
+    /// `_tmp = arg; _0 = _tmp` copy chain within that block) to a
+    /// Copy/Move of a return-typed argument, or a constant. Arithmetic
+    /// (`BinaryOp`) is intentionally NOT captured yet (the wrapping-BV
+    /// semantics is sound but deferred to the Q.4b follow-up). Multiple
+    /// blocks (branches/loops), projections, casts, calls → `None`.
+    ///
+    /// Every captured value is return-typed, so the resulting expression
+    /// is a single uniform `BitVec<ret-width>` sort — matching the
+    /// `result` declaration in the SMT problem.
+    fn capture_body_effect(&self, body: &crate::mir_api::Body) -> Option<String> {
+        use crate::mir_api::{StatementKind, TerminatorKind};
+        if body.blocks.len() != 1 {
+            return None;
+        }
+        let block = &body.blocks[0];
+        if !matches!(block.terminator.kind, TerminatorKind::Return) {
+            return None;
+        }
+        let ret_ty = primitive_int_name_from_ty(&body.return_ty)?;
+        // local index → SMT expr (all return-typed → uniform BV sort).
+        let mut env: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
+        // Seed parameters: MIR `Local(i+1)` is the i-th parameter. Only
+        // return-typed parameters can appear in a return-width expr.
+        for (i, ty) in body.arg_tys.iter().enumerate() {
+            if primitive_int_name_from_ty(ty).as_deref() == Some(ret_ty.as_str()) {
+                if let Some(name) = body.arg_names.get(i) {
+                    if !name.is_empty() {
+                        env.insert((i as u32) + 1, name.clone());
+                    }
+                }
+            }
+        }
+        // Fold the block's assignments in order; track each local's
+        // captured value (or invalidate it on a non-capturable write).
+        for stmt in &block.statements {
+            let StatementKind::Assign(place, rvalue) = &stmt.kind else {
+                continue;
+            };
+            if !place.projection.is_empty() {
+                // Write through a projection — can't track the base
+                // local's scalar value; invalidate it (fail closed).
+                env.remove(&place.local.0);
+                continue;
+            }
+            match self.capture_rvalue(rvalue, &env, &ret_ty) {
+                Some(e) => {
+                    env.insert(place.local.0, e);
+                }
+                None => {
+                    env.remove(&place.local.0);
+                }
+            }
+        }
+        // `_0` is the return slot.
+        env.get(&0).cloned()
+    }
+    /// Capture an rvalue as a return-typed SMT expression, or `None`.
+    fn capture_rvalue(
+        &self,
+        rvalue: &Rvalue,
+        env: &std::collections::HashMap<u32, String>,
+        ret_ty: &str,
+    ) -> Option<String> {
+        match rvalue {
+            Rvalue::Use(op) => self.capture_operand(op, env, ret_ty),
+            // BinaryOp (arithmetic) is deferred to Q.4b (wrapping-BV
+            // semantics); every other rvalue is uncapturable here. Fail
+            // closed — never invent a body effect.
+            _ => None,
+        }
+    }
+    /// Capture an operand as a return-typed SMT expression, or `None`.
+    /// Requires the operand's type to equal the return type, so the
+    /// expression is the same `BitVec` sort as `result`.
+    fn capture_operand(
+        &self,
+        op: &Operand,
+        env: &std::collections::HashMap<u32, String>,
+        ret_ty: &str,
+    ) -> Option<String> {
+        if self.operand_primitive_int_name(op).as_deref() != Some(ret_ty) {
+            return None;
+        }
+        match op {
+            Operand::Copy(p) | Operand::Move(p) => {
+                if !p.projection.is_empty() {
+                    return None;
+                }
+                env.get(&p.local.0).cloned()
+            }
+            Operand::Constant(c) => {
+                let v = c.value?;
+                crate::predicate::format_int_literal_for_ty(v, ret_ty)
+            }
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Q.4a spec-translation gate (SOUNDNESS-CRITICAL, free functions).
+//
+// These translate a user-authored spec string (a precondition or a
+// postcondition) into SMT-LIB, admitting ONLY forms whose every
+// identifier is one of the SMT-bound names in `known` (= {result} ∪
+// the return-typed argument names, all declared at the return width).
+// Any shape that doesn't fit returns `None`; the caller turns that
+// into "obligation pending" — never a guess about what the body or
+// the spec means. Restricting to the uniform return width keeps every
+// emitted symbol one consistent BitVec sort, so the solver can never
+// silently coerce a mismatched operand.
+// ---------------------------------------------------------------------------
+/// Strip the outer `(assert <term>)` wrapper, returning `<term>`.
+/// Delegates the single-directive / no-injection check to
+/// `validate_assertion_form`, so a multi-directive or quoted-symbol
+/// string is rejected (`None`) rather than mis-stripped.
+fn strip_assert(s: &str) -> Option<String> {
+    crate::predicate::validate_assertion_form(s).ok()?;
+    let t = s.trim();
+    // `validate_assertion_form` guarantees a leading `(assert` and a
+    // single balanced top-level directive, so the final byte is that
+    // assert's own close-paren.
+    let inner = t.strip_prefix("(assert")?.strip_suffix(')')?.trim();
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner.to_string())
+}
+/// Translate a spec string into a single SMT-LIB `(assert ...)`.
+/// Two structured forms are accepted, each over names bound in
+/// `known`: an ident-vs-ident comparison (`result <= n`, both sides
+/// bound), and an ident-vs-literal comparison (`result < 101`, the
+/// literal range-checked against `ret_ty`). Anything else — including
+/// raw `(assert ...)` SMT, deferred this increment — returns `None`.
+/// `ret_ty` drives the signed-vs-unsigned operator choice and the
+/// literal range; every ident is the same `ret_ty` width, so the
+/// produced assertion is well-sorted by construction.
+fn translate_spec_to_assert(
+    raw: &str,
+    known: &std::collections::HashSet<String>,
+    ret_ty: &str,
+) -> Option<String> {
+    // 1. ident-vs-ident (`result <= n`, `lo == hi`).
+    if let Ok(p) = crate::predicate::parse_ident_vs_ident_predicate(raw) {
+        if known.contains(&p.lhs) && known.contains(&p.rhs) {
+            return crate::predicate::ident_vs_ident_to_smt_assertion(&p, ret_ty).ok();
+        }
+        // Matched the shape but an operand isn't an SMT-bound name —
+        // fail closed rather than emit an assertion over a free
+        // (undeclared) symbol.
+        return None;
+    }
+    // 2. ident-vs-literal (`result < 101`, `result == 0`).
+    if let Ok(p) = crate::predicate::parse_predicate(raw) {
+        if known.contains(&p.var) {
+            // The SMT symbol name IS the source ident (we declared it
+            // under that exact name).
+            return crate::predicate::predicate_to_smt_assertion(&p, &p.var, ret_ty).ok();
+        }
+        return None;
+    }
+    // Raw-SMT specs and every other shape stay pending this increment.
+    None
+}
+/// Translate a spec string into the inner SMT term (no `(assert )`
+/// wrapper) for embedding in `(not (and ...))`. `None` ⇒ untranslatable.
+fn translate_spec_to_term(
+    raw: &str,
+    known: &std::collections::HashSet<String>,
+    ret_ty: &str,
+) -> Option<String> {
+    let assertion = translate_spec_to_assert(raw, known, ret_ty)?;
+    strip_assert(&assertion)
 }
 /// Whether a fully-qualified callee path names a known panic
 /// entry point. The set is curated against rustc's actual lowering
@@ -4314,6 +4648,191 @@ mod tests {
         assert!(
             report.audit_notes.iter().any(|n| n.message.contains("not a primitive integer")),
             "M-2: non-primitive return must surface an audit note; got: {:?}",
+            report.audit_notes,
+        );
+    }
+    // === Q.4a: ensures SMT discharge (body-effect capture) ===
+    //
+    // These tests pin the SOUNDNESS-CRITICAL encoding deterministically
+    // and solver-free: they assert the exact SMT the visitor builds. A
+    // wrong body-effect or postcondition encoding (the cardinal sin —
+    // falsely discharging a wrong postcondition) would change these
+    // strings and fail loudly. The LIVE `unsat`/`sat` verdicts are
+    // pinned separately by the Z3-gated wrapper e2e tests.
+    /// A single-block `fn f(x: u32) -> u32 { <stmts>; return }` body.
+    /// `_0` is the return slot, `_1` the parameter `x`, both `u32`.
+    fn q4a_u32_body(statements: Vec<Statement>) -> Body {
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let local =
+            |ty: Ty| LocalDecl { ty, span: Span::default(), mutability: Mutability::Not };
+        Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone()],
+            arg_names: vec!["x".to_string()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![local(u32_ty.clone()), local(u32_ty)],
+            blocks: vec![BasicBlockData {
+                statements,
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        }
+    }
+    /// `_0 = move _1` — return the parameter `x` verbatim.
+    fn q4a_return_x() -> Statement {
+        Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::Use(Operand::Move(Place { local: Local(1), projection: vec![] })),
+            ),
+            span: Span::default(),
+        }
+    }
+    /// Extract the (discharge_smt, consistency_smt) of the sole PB076
+    /// obligation from a finished report.
+    fn q4a_ensures_smt(report: &SubsetReport) -> (Option<String>, Option<String>) {
+        report
+            .vc_obligations
+            .iter()
+            .find_map(|o| match &o.kind {
+                crate::vc::VcObligationKind::EnsuresPostcondition {
+                    discharge_smt,
+                    consistency_smt,
+                    ..
+                } => Some((discharge_smt.clone(), consistency_smt.clone())),
+                _ => None,
+            })
+            .expect("a PB076 EnsuresPostcondition obligation must be emitted")
+    }
+    #[test]
+    fn q4a_true_postcondition_builds_structurally_unsat_discharge() {
+        // fn copy_arg(x: u32) -> u32 { x }  #[ensures("result == x")]
+        // The discharge problem asserts BOTH `(= result x)` (the body
+        // effect) and `(not (= result x))` (the negated goal) — a direct
+        // contradiction, so any sound solver returns `unsat` ⇒ the
+        // postcondition is discharged.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result == x".to_string()]);
+        v.visit_body(&q4a_u32_body(vec![q4a_return_x()]), false);
+        let (discharge, consistency) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("capturable body + translatable postcondition must discharge");
+        assert!(smt.contains("(declare-const result (_ BitVec 32))"), "smt:\n{smt}");
+        assert!(smt.contains("(declare-const x (_ BitVec 32))"), "smt:\n{smt}");
+        assert!(smt.contains("(assert (= result x))"), "body effect missing:\n{smt}");
+        assert!(smt.contains("(assert (not (= result x)))"), "negated goal missing:\n{smt}");
+        assert!(smt.trim_end().ends_with("(check-sat)"), "smt:\n{smt}");
+        assert!(consistency.is_none(), "no preconditions ⇒ no consistency check");
+    }
+    #[test]
+    fn q4a_false_postcondition_builds_satisfiable_discharge() {
+        // fn copy_arg(x: u32) -> u32 { x }  #[ensures("result < 5")]
+        // `result == x` ∧ `not(result < 5)` is satisfiable (x = 5), so
+        // the solver returns `sat` ⇒ NOT discharged — the honest verdict
+        // since `copy_arg` can return a value ≥ 5. The body effect and
+        // negated goal are independent terms (no structural contradiction).
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 5".to_string()]);
+        v.visit_body(&q4a_u32_body(vec![q4a_return_x()]), false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("capturable body + translatable postcondition");
+        assert!(smt.contains("(assert (= result x))"), "body effect missing:\n{smt}");
+        assert!(
+            smt.contains("(assert (not (bvult result #x00000005)))"),
+            "negated `result < 5` goal missing:\n{smt}",
+        );
+        assert!(
+            !smt.contains("(assert (not (= result x)))"),
+            "must NOT be the structural contradiction of the TRUE case:\n{smt}",
+        );
+    }
+    #[test]
+    fn q4a_uncapturable_arithmetic_body_stays_pending() {
+        // fn add_one(x: u32) -> u32 { x + 1 } — a BinaryOp body effect,
+        // intentionally NOT captured this increment (wrapping-BV
+        // arithmetic lands in Q.4b). Fail closed: no discharge SMT, plus
+        // an audit note explaining the gap.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 101".to_string()]);
+        let add = Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::BinaryOp(
+                    BinOp::Add,
+                    Operand::Move(Place { local: Local(1), projection: vec![] }),
+                    Operand::Constant(ConstOperand {
+                        ty: Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) },
+                        def_id: None,
+                        path: None,
+                        value: Some(1),
+                    }),
+                ),
+            ),
+            span: Span::default(),
+        };
+        v.visit_body(&q4a_u32_body(vec![add]), false);
+        let report = v.into_report();
+        let (discharge, _c) = q4a_ensures_smt(&report);
+        assert!(discharge.is_none(), "arithmetic body must NOT be captured (fail closed)");
+        assert!(
+            report.audit_notes.iter().any(|n| n.message.contains("body effect")),
+            "pending arithmetic body must surface a body-effect audit note; got: {:?}",
+            report.audit_notes,
+        );
+    }
+    #[test]
+    fn q4a_precondition_is_assumed_and_consistency_checked() {
+        // fn copy_arg(x: u32) -> u32 { x }
+        //   #[requires("x < 100")] #[ensures("result < 100")]
+        // x<100 ∧ result==x ∧ not(result<100) is unsat ⇒ discharged. A
+        // consistency check (assumptions only) is emitted for the F1
+        // vacuous-precondition guard.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_preconditions(vec!["x < 100".to_string()]);
+        v.set_current_ensures(vec!["result < 100".to_string()]);
+        v.visit_body(&q4a_u32_body(vec![q4a_return_x()]), false);
+        let (discharge, consistency) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("translatable precondition + postcondition");
+        assert!(smt.contains("(assert (bvult x #x00000064))"), "assumed precondition missing:\n{smt}");
+        assert!(smt.contains("(assert (= result x))"), "body effect missing:\n{smt}");
+        assert!(
+            smt.contains("(assert (not (bvult result #x00000064)))"),
+            "negated goal missing:\n{smt}",
+        );
+        let cs = consistency.expect("preconditions present ⇒ a consistency check is emitted");
+        assert!(cs.contains("(assert (bvult x #x00000064))"), "cs:\n{cs}");
+        assert!(cs.trim_end().ends_with("(check-sat)"), "cs:\n{cs}");
+        // The consistency check tests assumption satisfiability only — it
+        // must NOT carry the body effect or the negated goal.
+        assert!(!cs.contains("(= result x)"), "consistency check must omit body effect:\n{cs}");
+        assert!(!cs.contains("(not "), "consistency check must omit the negated goal:\n{cs}");
+    }
+    #[test]
+    fn q4a_untranslatable_precondition_fails_closed_to_pending() {
+        // A raw-SMT precondition is deferred this increment. Rather than
+        // silently DROP it (which could yield a spurious counterexample),
+        // the whole obligation stays pending — fail closed.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_preconditions(vec!["(assert (bvult x #x00000064))".to_string()]);
+        v.set_current_ensures(vec!["result < 100".to_string()]);
+        v.visit_body(&q4a_u32_body(vec![q4a_return_x()]), false);
+        let report = v.into_report();
+        let (discharge, _c) = q4a_ensures_smt(&report);
+        assert!(discharge.is_none(), "untranslatable precondition ⇒ pending (fail closed)");
+        assert!(
+            report.audit_notes.iter().any(|n| {
+                n.message.contains("precondition") && n.message.contains("could not be translated")
+            }),
+            "pending must explain the untranslatable precondition; got: {:?}",
             report.audit_notes,
         );
     }

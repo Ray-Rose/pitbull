@@ -94,19 +94,30 @@ pub fn compile(obligation: &VcObligation) -> Option<VcGoal> {
             };
             (main, consistency)
         }
-        // The following kinds need richer encodings than bit-vector
-        // arithmetic alone — path-sensitive symbolic execution
-        // for panic reachability, termination measures for
-        // recursion, and body-effect symbolic state for
-        // postconditions. Tracked as v0.2+ follow-up work.
-        // Task Q.4 (2026-05-26): EnsuresPostcondition emission is
-        // wired up to the visitor; the encoder (a body-effect
-        // summarizer for straight-line bodies that maps `result`
-        // to an SMT expression over arg values, plus the
-        // postcondition negation) lands in Q.4a.
-        VcObligationKind::PanicReachability
-        | VcObligationKind::RecursionDecreases
-        | VcObligationKind::EnsuresPostcondition { .. } => return None,
+        // Task Q.4a (2026-05-29): EnsuresPostcondition (PB076) now
+        // discharges when the visitor could SOUNDLY capture the body
+        // effect and translate every spec. The visitor owns the
+        // encoding (the SMT variable names are the function's dynamic
+        // parameter names), so `pitbull-vc` just routes the prebuilt
+        // problem through: `discharge_smt` becomes the goal's SMT and
+        // `consistency_smt` its F1 vacuous-precondition guard. When the
+        // visitor returns `discharge_smt: None` (non-int return, body
+        // effect not captured, or an untranslatable spec) we fail closed
+        // here exactly like an unsupported kind — the obligation stays
+        // pending so the auditor sees the gap.
+        VcObligationKind::EnsuresPostcondition { discharge_smt, consistency_smt, .. } => {
+            match discharge_smt {
+                Some(s) => (s.clone(), consistency_smt.clone()),
+                None => return None,
+            }
+        }
+        // These kinds need richer encodings than bit-vector arithmetic
+        // alone — path-sensitive symbolic execution for panic
+        // reachability and termination measures for recursion. Tracked
+        // as v0.2+ follow-up work.
+        VcObligationKind::PanicReachability | VcObligationKind::RecursionDecreases => {
+            return None;
+        }
     };
     Some(VcGoal {
         obligation: obligation.clone(),
@@ -385,16 +396,20 @@ mod tests {
             assumptions: Vec::new(),
         };
         assert!(compile(&rec_obl).is_none());
-        // Q.4 MVP: EnsuresPostcondition is wired through the
-        // emit path but compile returns None — wrapper reports
-        // "pending". Q.4a will replace this branch with a real
-        // SMT problem for straight-line bodies.
+        // Q.4a: an EnsuresPostcondition whose visitor-side encoding
+        // came back empty (`discharge_smt: None` — body effect not
+        // captured, non-int return, or an untranslatable spec) still
+        // compiles to None, so the wrapper reports "pending". The
+        // discharging path (`discharge_smt: Some(..)`) is exercised
+        // end-to-end by the wrapper integration tests.
         let ens_obl = VcObligation {
             id: "pb076-ensures-0".into(),
             span: Span::default(),
             kind: VcObligationKind::EnsuresPostcondition {
                 ret_name: "result".into(),
                 ret_ty_name: Some("u32".into()),
+                discharge_smt: None,
+                consistency_smt: None,
             },
             assumptions: Vec::new(),
         };

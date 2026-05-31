@@ -163,6 +163,32 @@ pub enum VcObligationKind {
         /// The obligation is always EMITTED (auditor sees the gap);
         /// it can never discharge until Q.4a lands.
         ret_ty_name: Option<String>,
+        /// Q.4a (2026-05-29): the FULL SMT-LIB discharge problem the
+        /// visitor built for this obligation — declarations for
+        /// `result` and the return-typed args, the preconditions as
+        /// assumptions, the captured BODY EFFECT (`(= result <expr>)`),
+        /// and the NEGATED postcondition, then `(check-sat)`. `unsat`
+        /// ⇒ the postcondition holds. `None` when the body effect or a
+        /// postcondition could not be soundly captured — `compile`
+        /// then returns `None` and the obligation stays pending (fail
+        /// closed: never guess the body).
+        ///
+        /// Built in the visitor (not `pitbull-vc`) because the SMT
+        /// variable names are dynamic (the function's parameter names)
+        /// and the visitor owns the predicate parser + the arg/type
+        /// context needed to translate them.
+        ///
+        /// `#[serde(default)]`: a certificate/report serialized before
+        /// Q.4a (no such field) re-loads with `None` rather than
+        /// failing to deserialize — replay back-compat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discharge_smt: Option<String>,
+        /// Consistency check (declarations + preconditions +
+        /// `(check-sat)`, no body effect / postcondition) for the F1
+        /// vacuous-precondition guard, mirroring PB049/PB054. `None`
+        /// when there are no preconditions (trivially consistent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consistency_smt: Option<String>,
     },
 }
 impl VcObligationKind {
@@ -322,6 +348,8 @@ mod tests {
             VcObligationKind::EnsuresPostcondition {
                 ret_name: "result".into(),
                 ret_ty_name: Some("u32".into()),
+                discharge_smt: None,
+                consistency_smt: None,
             }
             .rule_id(),
             "PB076",
@@ -333,6 +361,8 @@ mod tests {
             VcObligationKind::EnsuresPostcondition {
                 ret_name: "result".into(),
                 ret_ty_name: None,
+                discharge_smt: None,
+                consistency_smt: None,
             }
             .rule_id(),
             "PB076",
@@ -351,6 +381,8 @@ mod tests {
             kind: VcObligationKind::EnsuresPostcondition {
                 ret_name: "result".into(),
                 ret_ty_name: Some("u32".into()),
+                discharge_smt: None,
+                consistency_smt: None,
             },
             assumptions: vec![
                 "(assert (bvult x #x00000064))".into(),
@@ -374,6 +406,8 @@ mod tests {
             kind: VcObligationKind::EnsuresPostcondition {
                 ret_name: "result".into(),
                 ret_ty_name: None,
+                discharge_smt: None,
+                consistency_smt: None,
             },
             assumptions: Vec::new(),
         };

@@ -567,7 +567,8 @@ pub fn operand_pin_assertion(
 }
 /// Decode a Rust primitive integer type name into (signed, bits).
 /// Returns `None` for non-int types, suffixes, or unsupported widths.
-fn int_type_info(name: &str) -> Option<(bool, u32)> {
+#[must_use]
+pub fn int_type_info(name: &str) -> Option<(bool, u32)> {
     let (signed, rest) = if let Some(r) = name.strip_prefix('u') {
         (false, r)
     } else if let Some(r) = name.strip_prefix('i') {
@@ -616,6 +617,18 @@ fn legal_range_i128(signed: bool, bits: u32) -> Option<(i128, i128)> {
             Some((0, max))
         }
     }
+}
+/// Public helper (Q.4a): format an integer `value` as an SMT-LIB
+/// bit-vector literal sized for the primitive integer type `ty_name`
+/// (`"u32"`, `"i8"`, …). `None` for an unsupported type name.
+///
+/// Used by the body-effect capture to encode a constant return value
+/// (`fn f() -> u32 { 5 }` → `#x00000005`) at the correct width, so it
+/// matches the `result` bit-vector sort.
+#[must_use]
+pub fn format_int_literal_for_ty(value: i128, ty_name: &str) -> Option<String> {
+    let (_signed, bits) = int_type_info(ty_name)?;
+    Some(format_bv_literal(value, bits))
 }
 /// Format an `i128` value as an SMT-LIB bit-vector literal of the
 /// given width. Negative values get two's-complement-encoded.
