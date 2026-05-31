@@ -683,6 +683,31 @@ pub fn probe_version(solver: &Solver) -> Option<String> {
         Some(trimmed.to_string())
     }
 }
+/// Does a solver's reported `--version` output (`reported`) satisfy the
+/// pinned version string (`pinned`)?
+///
+/// Used to enforce `[verification.solver_versions]` pins (hardening
+/// 2026-05-29): the wrapper probes a solver's banner via
+/// [`probe_version`] and drops it from the agreement pool when this
+/// returns `false`.
+///
+/// ## Why a token match, not `contains`
+///
+/// Red-team Low (2026-05-29): an unanchored `reported.contains(pinned)`
+/// would let a pin of `1.0` spuriously match a reported `11.0.5` (or
+/// `0.1.0`), silently trusting the wrong binary — the opposite of what
+/// pinning is for. So we require the pin to equal a *whole*
+/// whitespace-delimited token of the banner, after trimming surrounding
+/// punctuation (keeping `.` so dotted versions survive). For
+/// `"Z3 version 4.13.4 - 64 bit"` the tokens are `Z3`, `version`,
+/// `4.13.4`, `-`, `64`, `bit`; pin `4.13.4` matches the third, pin
+/// `1.0` matches none.
+#[must_use]
+pub fn version_matches(reported: &str, pinned: &str) -> bool {
+    reported.split_whitespace().any(|tok| {
+        tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.') == pinned
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,5 +1013,42 @@ mod tests {
             vote(&results, 1),
             AgreementVerdict::Inconclusive { unsat_votes: 0, threshold: 1 },
         );
+    }
+    // ===== solver_versions pin matching (Task: version enforcement) ====
+    // `version_matches` is the pure half of the
+    // `[verification.solver_versions]` enforcement the wrapper wires in;
+    // these pin its semantics without needing a solver installed.
+    /// The pin matches the version token inside a realistic Z3 banner.
+    #[test]
+    fn version_matches_z3_banner() {
+        assert!(version_matches("Z3 version 4.13.4 - 64 bit", "4.13.4"));
+    }
+    /// CVC5 prints its version on its own short line; still a token.
+    #[test]
+    fn version_matches_cvc5_banner() {
+        assert!(version_matches("This is cvc5 version 1.2.0", "1.2.0"));
+    }
+    /// SOUNDNESS-relevant: a pin must NOT match as a substring of a
+    /// longer version token. `1.0` ⊄ `11.0.5` and ⊄ `0.1.0` — the
+    /// red-team Low (2026-05-29) the token match exists to close.
+    #[test]
+    fn version_matches_rejects_substring_of_longer_token() {
+        assert!(!version_matches("solver 11.0.5", "1.0"));
+        assert!(!version_matches("solver 0.1.0", "1.0"));
+        assert!(!version_matches("4.13.40", "4.13.4"));
+    }
+    /// An exact whole-token match still works after punctuation is
+    /// trimmed (trailing comma, surrounding parens), while `.` is kept.
+    #[test]
+    fn version_matches_trims_surrounding_punctuation() {
+        assert!(version_matches("alt-ergo (2.6.0)", "2.6.0"));
+        assert!(version_matches("v = 1.2.0, build x", "1.2.0"));
+    }
+    /// A mismatched pin (the binary-swap case) returns false so the
+    /// wrapper drops the solver from the pool.
+    #[test]
+    fn version_matches_mismatch_is_false() {
+        assert!(!version_matches("Z3 version 4.13.4 - 64 bit", "4.13.3"));
+        assert!(!version_matches("", "4.13.4"));
     }
 }

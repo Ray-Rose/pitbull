@@ -436,6 +436,36 @@ fn is_supported_toolchain(s: &str) -> bool {
 fn is_valid_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
+/// Configured `[verification.preconditions]` keys that matched no walked
+/// function path.
+///
+/// A precondition key is a fully-qualified function path; the wrapper
+/// looks it up against every function it actually walks. A key that
+/// binds to nothing — a typo, or a function filtered out by
+/// `verify_roots` / `exclude` — means the user's precondition silently
+/// never applied. The project's "no silent skips" posture (audit
+/// 2026-05-29) forbids letting that pass quietly, so the wrapper warns
+/// on each entry returned here (mirroring the exclude-glob warning).
+///
+/// Pure half of that check, extracted so it is unit-tested on the stable
+/// lane independently of the rustc-only wrapper. The result is
+/// deterministic: `BTreeMap` keys iterate in sorted order, so the
+/// returned vec is sorted with no extra work.
+///
+/// Direction note: a missing precondition is fail-safe — the obligation
+/// is then checked with *fewer* assumptions (over-approximate), so this
+/// is a usability/visibility warning, not a soundness gate.
+#[must_use]
+pub fn unmatched_precondition_keys(
+    preconditions: &std::collections::BTreeMap<String, Vec<String>>,
+    walked_fn_paths: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    preconditions
+        .keys()
+        .filter(|k| !walked_fn_paths.contains(*k))
+        .cloned()
+        .collect()
+}
 // `default_for_test` above is `cfg(any(test, feature = "test-helpers"))`. The
 // in-crate test modules in `visitor.rs`, `reachability.rs`, etc. compile under
 // `cfg(test)` and can call it directly. External crates that want the helper
@@ -577,5 +607,49 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
         let allowed = default_allowed_proc_macros(); // ["pitbull-spec"]
         assert!(!pb059_proc_macro_rejected("pitbull_spec", false, &allowed));
         assert!(pb059_proc_macro_rejected("serde_derive", false, &allowed));
+    }
+    /// A precondition key that names no walked function is reported —
+    /// the typo / filtered-out case the wrapper warns on (no silent
+    /// skip), while a key that DID bind is not.
+    #[test]
+    fn unmatched_precondition_key_reported() {
+        let mut pre: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        pre.insert("demo::typoed".to_string(), vec!["x < 1".to_string()]);
+        pre.insert("demo::real".to_string(), vec!["y < 1".to_string()]);
+        let mut walked: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        walked.insert("demo::real".to_string());
+        assert_eq!(
+            unmatched_precondition_keys(&pre, &walked),
+            vec!["demo::typoed".to_string()],
+        );
+    }
+    /// Every configured key bound to a walked function ⇒ nothing
+    /// reported.
+    #[test]
+    fn all_precondition_keys_matched_is_clean() {
+        let mut pre: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        pre.insert("demo::f".to_string(), vec!["x < 1".to_string()]);
+        let mut walked: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        walked.insert("demo::f".to_string());
+        assert!(unmatched_precondition_keys(&pre, &walked).is_empty());
+    }
+    /// Multiple unmatched keys come back sorted, so the wrapper's
+    /// warnings are deterministic regardless of insertion order.
+    #[test]
+    fn unmatched_precondition_keys_sorted() {
+        let mut pre: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        pre.insert("demo::zeta".to_string(), vec![]);
+        pre.insert("demo::alpha".to_string(), vec![]);
+        let walked: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        assert_eq!(
+            unmatched_precondition_keys(&pre, &walked),
+            vec!["demo::alpha".to_string(), "demo::zeta".to_string()],
+        );
     }
 }

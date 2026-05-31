@@ -509,14 +509,15 @@ impl PitbullCallbacks {
         // assumptions (over-approximate / fail-closed) — but the user
         // must learn their key didn't bind rather than see an
         // unexpectedly-undischarged obligation with no explanation.
-        for key in cfg.verification.preconditions.keys() {
-            if !walked_fn_paths.contains(key) {
-                eprintln!(
-                    "pitbull-rustc: WARNING: [verification.preconditions] key `{key}` \
-                     matched no verified function — its preconditions were NOT applied \
-                     (check for a typo, or that the function is reached and not excluded).",
-                );
-            }
+        for key in pitbull_subset::config::unmatched_precondition_keys(
+            &cfg.verification.preconditions,
+            &walked_fn_paths,
+        ) {
+            eprintln!(
+                "pitbull-rustc: WARNING: [verification.preconditions] key `{key}` \
+                 matched no verified function — its preconditions were NOT applied \
+                 (check for a typo, or that the function is reached and not excluded).",
+            );
         }
         let mut report = visitor.into_report();
         // Append HIR-derived PB001 violations to the MIR-derived
@@ -616,20 +617,13 @@ impl PitbullCallbacks {
                 solvers.retain(|s| match cfg.verification.solver_versions.get(s.name) {
                     None => true,
                     Some(pinned) => match pitbull_vc::solver::probe_version(s) {
-                        // Token match, not a raw substring (red-team Low,
-                        // 2026-05-29): an unanchored `contains` would let a
-                        // pin of `1.0` match a reported `11.0.5`. Require the
-                        // pin to equal a whitespace-delimited version token
-                        // (surrounding punctuation trimmed; `.` kept).
-                        Some(out)
-                            if out.split_whitespace().any(|tok| {
-                                tok.trim_matches(|c: char| {
-                                    !c.is_ascii_alphanumeric() && c != '.'
-                                }) == pinned.as_str()
-                            }) =>
-                        {
-                            true
-                        }
+                        // Version pin satisfied ⇒ keep the solver. The
+                        // token-match rationale (a pin must equal a WHOLE
+                        // version token, so `1.0` does not trust a reported
+                        // `11.0.5`) lives in `version_matches`, which is
+                        // unit-tested on the stable lane (red-team Low,
+                        // 2026-05-29).
+                        Some(out) if pitbull_vc::solver::version_matches(&out, pinned) => true,
                         Some(out) => {
                             eprintln!(
                                 "pitbull-rustc: WARNING: solver `{}` version mismatch — \
