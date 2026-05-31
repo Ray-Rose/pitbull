@@ -1715,6 +1715,44 @@ solver_agreement = 2
         "Task S: a 2-solver-discharged obligation should exit 0. Got {code:?}",
     );
 }
+/// PB059 negative e2e (2026-05-29): BUILT-IN derives (`Debug`,
+/// `Clone`, ...) and std macros (`vec!`) are defined in core/std, which
+/// the proc-macro allowlist check treats as trusted — so they must NOT
+/// fire PB059. This pins the no-false-positive guarantee on real rustc
+/// expansion data (a regression here would reject ordinary Rust).
+///
+/// The POSITIVE direction (an EXTERNAL proc-macro not on the allowlist
+/// fires PB059, and allowlisting it suppresses the violation) was
+/// verified manually against a hand-built proc-macro `.dll`; it can't
+/// run in this single-file harness (no external-crate deps), and the
+/// decision logic is unit-tested in `config::tests::pb059_*`.
+#[test]
+fn pb059_builtin_derives_and_std_macros_do_not_fire() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("pb059_builtin_derives_and_std_macros_do_not_fire: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-pb059-builtin-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]\n\
+         pub struct Point { pub x: u32, pub y: u32 }\n\
+         pub fn mk() -> Vec<u32> { vec![1u32, 2, 3] }\n",
+    )
+    .expect("write probe.rs");
+    let (stderr, _code) =
+        run_one_corpus_file_full(&env, &probe_rs, &[]).expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    assert!(
+        !stderr.contains("PB059"),
+        "PB059 must NOT fire on built-in (core/std) derives or std macros; \
+         got stderr:\n{stderr}",
+    );
+}
 /// Regression test for audit finding H3: when a hostile build.rs
 /// sets `PITBULL_TOML` to a file without a `.toml` extension (the
 /// realistic attack target being key files like `~/.ssh/id_rsa`

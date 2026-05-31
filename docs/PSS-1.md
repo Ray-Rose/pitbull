@@ -290,8 +290,18 @@ verified code.
 **Future.** v1.0.
 ## 11. Category I — Macros, const-eval, cfg
 ### PB059 — Non-allowlisted proc macros
-**Detects.** Proc macros from a crate not on
-`subset.allowed_proc_macros` in `pitbull.toml`.
+**Detects.** Derive/attribute proc-macros that expand into reachable
+code from a crate not on `subset.allowed_proc_macros` in `pitbull.toml`.
+**Status.** ENFORCED (2026-05-29). The wrapper's HIR pre-pass walks each
+reachable item's span expansion chain (`SyntaxContext` → `ExpnData` →
+`macro_def_id` → defining crate); a `Derive`/`Attr` expansion from a
+crate that is not local, not a trusted toolchain crate
+(core/std/alloc/proc_macro), and not on the allowlist emits a PB059
+violation at the macro call-site. Derive/attribute macros cannot be
+written with `macro_rules!`, so this is free of decl-macro false
+positives. Function-like (`name!{…}`) proc-macros are a tracked
+follow-up (distinguishing them from external `macro_rules!` needs a
+proc-macro-crate check).
 **Future.** Permanent; allowlist grows with audit history.
 ### PB060 — Build scripts
 **Detects.** Presence of `build.rs` in any reachable crate.
@@ -1424,7 +1434,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  220 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  226 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1437,7 +1447,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 220 passing, 0 warnings, clippy clean
+# Stable: 226 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

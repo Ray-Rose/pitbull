@@ -109,10 +109,12 @@ panic_strategy = "abort"
 # PSS-1 PB068: trust budget. Builds fail if trusted_lines / verified_lines
 # exceeds this fraction. Default 0.05 (5 percent).
 trust_budget_fraction = 0.05
-# PSS-1 PB059: proc macros allowed in verified code. NOT YET ENFORCED: this list
-# is parsed but the reachable-proc-macro rejection check is not yet implemented,
-# so the field is advisory for now. (Intended behavior: crates not on this list
-# that expand into reachable code cause subset rejection.)
+# PSS-1 PB059: proc macros allowed in verified code. ENFORCED (2026-05-29):
+# any DERIVE or ATTRIBUTE proc-macro that expands into reachable code and is
+# defined in a crate NOT on this list (and not the local crate or a trusted
+# toolchain crate — core/std/alloc/proc_macro) causes a PB059 subset rejection.
+# Crate names normalize hyphens/underscores (`serde-derive` == `serde_derive`).
+# (Function-like `name!{...}` proc-macros are a tracked follow-up.)
 allowed_proc_macros = [
     "pitbull-spec",      # our own attribute macros
     "thiserror",         # widely audited, no allocation in derived bodies
