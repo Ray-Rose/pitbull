@@ -364,15 +364,23 @@ return site (and, fail-closed, one at the body span when a body with
 an `ensures` diverges / has no return terminator). The special binding
 `result` denotes the return value.
 **v0.2 status (Q.4a — 2026-05-29).** PB076 now DISCHARGES via SMT for
-the straight-line shapes the visitor can capture *soundly*: a
-single-block body that returns a (return-typed) argument or an integer
-constant. `result` and the return-typed parameters are declared as
+the straight-line shapes the visitor can capture *soundly*: a linear
+chain of blocks (following `Goto` / overflow-`Assert` success to
+`Return`) whose result is a (return-typed) argument, an integer
+constant, or a wrapping `Add`/`Sub`/`Mul` (`bvadd`/`bvsub`/`bvmul`,
+bit-exact for Rust's wrapping) over captured operands. `result` and the
+return-typed parameters are declared as
 bit-vectors of the return width; the visitor asserts the captured body
 effect (`(= result <expr>)`), assumes every translatable precondition
 (with the F1 consistency guard), and negates the postcondition — so
 `unsat` ⇒ discharged and `sat` ⇒ a genuine counterexample (NOT
-discharged). Anything it cannot capture with certainty — an arithmetic
-body effect (`x + 1`, deferred to Q.4b), branches/loops, calls, casts, a
+discharged). The wrapping arithmetic is modelled over the FULL input
+range rather than excluding the overflow-panic region the `Assert`
+guards — a sound over-approximation (the modelled input set is a
+superset of the returning set, so `unsat` still means "holds for every
+returning input"; at worst it is conservative). Anything it cannot
+capture with certainty — a `Div`/`Rem`/shift/bitwise body effect (Q.4b
+covers wrapping `Add`/`Sub`/`Mul`), branches/loops, calls, casts, a
 non-primitive-integer return, or an untranslatable spec — stays
 *pending* (fail closed: never a false "verified"). A wrong body-effect
 encoding would falsely discharge a wrong postcondition, so the capture
@@ -1369,11 +1377,14 @@ the std form and now also matches. No shadow type changes.
   single-block bodies returning a return-typed argument or an integer
   constant — asserting the captured body effect, the translatable
   preconditions (F1-guarded), and the negated postcondition (`unsat` ⇒
-  holds; `sat` ⇒ counterexample). Arithmetic body effects (`x + 1`) are
-  deferred to Q.4b; anything uncapturable fails closed to "pending",
-  never a false "verified". Verified adversarially: a TRUE postcondition
-  discharges (unsat), a FALSE one does not (sat), arithmetic stays
-  pending — both unit (exact-SMT) and Z3-gated e2e tests.
+  holds; `sat` ⇒ counterexample). **Q.4b** adds wrapping `Add`/`Sub`/`Mul`
+  (`bvadd`/`bvsub`/`bvmul`) captured through the checked-add MIR
+  (`AddWithOverflow` tuple + overflow `Assert` + `_0 = (_t.0)`), so
+  `add_one` discharges; `Div`/`Rem`/shifts stay deferred. Anything
+  uncapturable fails closed to "pending", never a false "verified".
+  Verified adversarially: TRUE postconditions discharge (unsat), FALSE
+  ones do not (sat), uncapturable stays pending — unit (exact-SMT) +
+  Z3-gated e2e tests, plus an independent soundness review.
 - ✅ Full-codebase audit sweep cleanup (post-Q). Closed three
   "no silent skip" gaps the foundational-code audit found:
   (a) Div/Rem/Shl/Shr produced no obligation AND no audit note;

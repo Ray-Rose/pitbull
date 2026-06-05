@@ -23,7 +23,7 @@ repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 238 tests passing (135 subset-lib + 70 vc + 33 integration),
+- **State:** 242 tests passing (137 subset-lib + 70 vc + 35 integration),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -44,10 +44,10 @@ repo only (no remote).
   division-by-zero + signed `MIN/-1` and Shl/Shr over-shift (Task R,
   2026-05-28) PLUS unary negation `-(iN::MIN)` overflow (audit
   2026-05-29; a CRITICAL fix — `-x` was silently unobligated before).
-  PB076 (ensures postcondition) now DISCHARGES too (Q.4a) for
-  single-block bodies returning a return-typed arg or a constant;
-  arithmetic body effects (`x + 1`) are deferred to Q.4b and stay
-  pending. PB043 / PB041 still emit obligations that `compile` returns
+  PB076 (ensures postcondition) now DISCHARGES too — Q.4a (copy/constant
+  bodies) + Q.4b (wrapping `Add`/`Sub`/`Mul` captured through the
+  checked-add MIR, so `add_one` discharges); `Div`/`Rem`/shift body
+  effects stay deferred. PB043 / PB041 still emit obligations that `compile` returns
   `None` for (reported "pending"). The other ~71 rules are syntactic
   visitor rejects.
 - **Next task (recommended):** Task R closed the division/over-shift
@@ -69,13 +69,16 @@ repo only (no remote).
      no crypto dep today), plus certifying the consistency-refused /
      pending obligations (currently only main-check decisions get a
      cert).
-  2. ✅ **Q.4a ensures SMT discharge** — DONE (2026-05-29): PB076
-     discharges copy/constant straight-line bodies; verified
-     adversarially (TRUE→unsat, FALSE→sat, arithmetic→pending) via unit
-     (exact-SMT) + Z3-gated e2e tests. Remaining: **Q.4b** arithmetic
-     body effects (`x + 1` with wrapping-BV semantics) and **mixed-width
-     over-shift encoding** (Task R deferred `u32 << u8` to a zero-extend
-     follow-up; same-type shifts discharge today).
+  2. ✅ **Q.4a + Q.4b ensures SMT discharge** — DONE (2026-05-29 /
+     2026-05-31): PB076 discharges copy/constant bodies (Q.4a) AND
+     wrapping `Add`/`Sub`/`Mul` bodies captured through the checked-add
+     MIR (Q.4b — `add_one` + `requires(x<100)` + `ensures(result<101)`
+     discharges end-to-end); verified adversarially (TRUE→unsat,
+     FALSE→sat, uncapturable→pending) via unit (exact-SMT) + Z3-gated
+     e2e tests, plus an independent soundness review. Remaining:
+     `Div`/`Rem`/shift body effects, and **mixed-width over-shift
+     encoding** (Task R deferred `u32 << u8` to a zero-extend follow-up;
+     same-type shifts discharge today).
   See Section 5 for the full menu.
 - **First commands to run in a fresh session:** see
   [Section 4: Smoke test in a fresh session](#4-smoke-test-in-a-fresh-session).

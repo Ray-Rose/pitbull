@@ -2195,106 +2195,196 @@ impl<'cfg> SubsetVisitor<'cfg> {
         };
         primitive_int_name_from_ty(ty)
     }
-    /// Q.4a body-effect capture (SOUNDNESS-CRITICAL). Returns the SMT
-    /// expression that the return value `result` equals, in terms of
+    /// Q.4a/Q.4b body-effect capture (SOUNDNESS-CRITICAL). Returns the
+    /// SMT expression that the return value `result` equals, in terms of
     /// return-typed argument names — but ONLY for shapes we can capture
     /// with certainty. For ANY other shape it returns `None`, and the
     /// `#[ensures]` obligation then stays pending (never a guess).
     ///
-    /// Captured shapes (this increment): a SINGLE basic block ending in
-    /// `Return`, where the return local `_0` resolves (possibly via a
-    /// `_tmp = arg; _0 = _tmp` copy chain within that block) to a
-    /// Copy/Move of a return-typed argument, or a constant. Arithmetic
-    /// (`BinaryOp`) is intentionally NOT captured yet (the wrapping-BV
-    /// semantics is sound but deferred to the Q.4b follow-up). Multiple
-    /// blocks (branches/loops), projections, casts, calls → `None`.
+    /// Captured shape: a LINEAR chain of basic blocks ending in `Return`,
+    /// where every non-final block ends in `Goto` or an `Assert` (we
+    /// follow the `Assert`'s SUCCESS target — assert failure panics and
+    /// never returns, so the asserted condition is irrelevant to the
+    /// returning value). Any branch (`SwitchInt`), call, drop, tail call,
+    /// yield, or back-edge (loop) makes the body uncapturable. Within the
+    /// chain, the return local `_0` must resolve to: a Copy/Move of a
+    /// return-typed argument; an integer constant; the `.0` field of a
+    /// captured checked-arithmetic result; or an `Add`/`Sub`/`Mul` over
+    /// two captured return-typed operands.
+    ///
+    /// Q.4b note on arithmetic: `Add`/`Sub`/`Mul` are encoded as the
+    /// WRAPPING bit-vector ops `bvadd`/`bvsub`/`bvmul`, which are modular
+    /// over 2^width — exactly Rust's wrapping semantics and exactly the
+    /// value the overflow-check's success path produces. Modelling the
+    /// wrap over the FULL input range (instead of excluding the
+    /// overflow-panic region the `Assert` guards) is an
+    /// over-approximation: `unsat` still means "the postcondition holds
+    /// for every input that actually returns", so discharge stays sound;
+    /// at worst it is conservative (a postcondition that holds only
+    /// because overflow would have panicked stays pending/sat).
     ///
     /// Every captured value is return-typed, so the resulting expression
-    /// is a single uniform `BitVec<ret-width>` sort — matching the
-    /// `result` declaration in the SMT problem.
+    /// is a single uniform `BitVec<ret-width>` sort — matching `result`.
     fn capture_body_effect(&self, body: &crate::mir_api::Body) -> Option<String> {
         use crate::mir_api::{StatementKind, TerminatorKind};
-        if body.blocks.len() != 1 {
-            return None;
-        }
-        let block = &body.blocks[0];
-        if !matches!(block.terminator.kind, TerminatorKind::Return) {
-            return None;
-        }
         let ret_ty = primitive_int_name_from_ty(&body.return_ty)?;
-        // local index → SMT expr (all return-typed → uniform BV sort).
+        // local → SMT expr for a return-typed SCALAR value held there.
         let mut env: std::collections::HashMap<u32, String> =
             std::collections::HashMap::new();
-        // Seed parameters: MIR `Local(i+1)` is the i-th parameter. Only
-        // return-typed parameters can appear in a return-width expr.
-        for (i, ty) in body.arg_tys.iter().enumerate() {
-            if primitive_int_name_from_ty(ty).as_deref() == Some(ret_ty.as_str()) {
-                if let Some(name) = body.arg_names.get(i) {
-                    if !name.is_empty() {
-                        env.insert((i as u32) + 1, name.clone());
+        // local → SMT expr for the `.0` field of a checked-arithmetic
+        // tuple result held there (`_t = Add(a,b)` makes `_t.0` the
+        // wrapping sum). Kept separate from `env` because the whole tuple
+        // is NOT a return-typed scalar — only its `.0` projection is.
+        let mut checked: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
+        // Seed return-typed parameters by the SAME criterion
+        // `build_ensures_smt` uses to DECLARE them (the cached
+        // `current_body_arg_names` + `current_body_locals[i+1].ty`), so
+        // the names that can appear in the captured effect are EXACTLY
+        // the SMT variables that get declared — undeclared-symbol
+        // mismatch is impossible by construction, not merely fail-closed.
+        // MIR `Local(i+1)` is the i-th parameter.
+        for (i, name) in self.current_body_arg_names.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(ld) = self.current_body_locals.get(i + 1) {
+                if primitive_int_name_from_ty(&ld.ty).as_deref() == Some(ret_ty.as_str()) {
+                    env.insert((i as u32) + 1, name.clone());
+                }
+            }
+        }
+        // Walk the linear block chain from bb0, following Goto /
+        // Assert-success until Return. A revisited block is a back-edge
+        // (loop) → fail closed. The visited set also bounds the walk.
+        let mut current: u32 = 0;
+        let mut visited: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return None; // back-edge / loop — uncapturable
+            }
+            let block = body.blocks.get(current as usize)?;
+            for stmt in &block.statements {
+                let StatementKind::Assign(place, rvalue) = &stmt.kind else {
+                    continue;
+                };
+                if !place.projection.is_empty() {
+                    // Write through a projection — invalidate the base
+                    // local's scalar value AND any checked-arith result
+                    // (fail closed).
+                    env.remove(&place.local.0);
+                    checked.remove(&place.local.0);
+                    continue;
+                }
+                let l = place.local.0;
+                match self.capture_rvalue(rvalue, &env, &checked, &ret_ty) {
+                    Some(e) => {
+                        // Store under BOTH maps: a whole read (`move _l`)
+                        // resolves via `env` (gated by a return-type check
+                        // on `_l`), a `.0` read (`move (_l.0)`) resolves
+                        // via `checked`. The captured expr is return-typed
+                        // either way, so both reads are sound.
+                        env.insert(l, e.clone());
+                        checked.insert(l, e);
+                    }
+                    None => {
+                        env.remove(&l);
+                        checked.remove(&l);
                     }
                 }
             }
-        }
-        // Fold the block's assignments in order; track each local's
-        // captured value (or invalidate it on a non-capturable write).
-        for stmt in &block.statements {
-            let StatementKind::Assign(place, rvalue) = &stmt.kind else {
-                continue;
-            };
-            if !place.projection.is_empty() {
-                // Write through a projection — can't track the base
-                // local's scalar value; invalidate it (fail closed).
-                env.remove(&place.local.0);
-                continue;
-            }
-            match self.capture_rvalue(rvalue, &env, &ret_ty) {
-                Some(e) => {
-                    env.insert(place.local.0, e);
-                }
-                None => {
-                    env.remove(&place.local.0);
-                }
+            match &block.terminator.kind {
+                TerminatorKind::Return => return env.get(&0).cloned(),
+                TerminatorKind::Goto { target } => current = target.0,
+                // An `Assert` (overflow / bounds / div-by-zero) only gates
+                // control flow; its success target is the sole path that
+                // returns. Follow it; the asserted condition is not
+                // modelled (sound — it would only ADD an assumption).
+                TerminatorKind::Assert { target, .. } => current = target.0,
+                // Branches, calls, drops, tail calls, yields, unreachable,
+                // unwinds, inline asm — uncapturable. Fail closed.
+                _ => return None,
             }
         }
-        // `_0` is the return slot.
-        env.get(&0).cloned()
     }
     /// Capture an rvalue as a return-typed SMT expression, or `None`.
+    /// Handles a `Use` (copy/move/const/`.0`-of-checked) and wrapping
+    /// `Add`/`Sub`/`Mul`; every other rvalue is uncapturable (fail closed).
     fn capture_rvalue(
         &self,
         rvalue: &Rvalue,
         env: &std::collections::HashMap<u32, String>,
+        checked: &std::collections::HashMap<u32, String>,
         ret_ty: &str,
     ) -> Option<String> {
+        use crate::mir_api::BinOp;
         match rvalue {
-            Rvalue::Use(op) => self.capture_operand(op, env, ret_ty),
-            // BinaryOp (arithmetic) is deferred to Q.4b (wrapping-BV
-            // semantics); every other rvalue is uncapturable here. Fail
-            // closed — never invent a body effect.
+            Rvalue::Use(op) => self.capture_operand(op, env, checked, ret_ty),
+            // Wrapping arithmetic (Q.4b). `bvadd`/`bvsub`/`bvmul` are
+            // modular over 2^width — EXACTLY Rust's wrapping semantics and
+            // exactly the value the overflow check's success path yields.
+            // Both operands must capture as return-typed exprs (uniform
+            // width). Div/Rem (can panic) and Shl/Shr/bitwise (distinct
+            // semantics, mixed widths) are deferred — fail closed.
+            Rvalue::BinaryOp(op, a, b) => {
+                let smt_op = match op {
+                    BinOp::Add => "bvadd",
+                    BinOp::Sub => "bvsub",
+                    BinOp::Mul => "bvmul",
+                    _ => return None,
+                };
+                let ea = self.capture_operand(a, env, checked, ret_ty)?;
+                let eb = self.capture_operand(b, env, checked, ret_ty)?;
+                Some(format!("({smt_op} {ea} {eb})"))
+            }
+            // Casts, refs, len, aggregates, etc. — uncapturable. Fail
+            // closed; never invent a body effect.
             _ => None,
         }
     }
     /// Capture an operand as a return-typed SMT expression, or `None`.
-    /// Requires the operand's type to equal the return type, so the
-    /// expression is the same `BitVec` sort as `result`.
+    /// A whole-local read (`move _l`) and a constant require the operand
+    /// type to equal the return type (uniform `BitVec` sort). A `.0`
+    /// field read resolves a captured checked-arithmetic result, whose
+    /// `.0` is return-typed by construction.
     fn capture_operand(
         &self,
         op: &Operand,
         env: &std::collections::HashMap<u32, String>,
+        checked: &std::collections::HashMap<u32, String>,
         ret_ty: &str,
     ) -> Option<String> {
-        if self.operand_primitive_int_name(op).as_deref() != Some(ret_ty) {
-            return None;
-        }
+        use crate::mir_api::ProjectionElem;
         match op {
             Operand::Copy(p) | Operand::Move(p) => {
-                if !p.projection.is_empty() {
-                    return None;
+                if p.projection.is_empty() {
+                    // Whole-local read: require the local to be
+                    // return-typed, then resolve its scalar value.
+                    if self.operand_primitive_int_name(op).as_deref() != Some(ret_ty) {
+                        return None;
+                    }
+                    env.get(&p.local.0).cloned()
+                } else if p.projection.len() == 1
+                    && matches!(p.projection[0], ProjectionElem::Field(0))
+                {
+                    // `_t.0` of a captured checked-arithmetic tuple. Its
+                    // `.0` is the wrapping result — return-typed by
+                    // construction (we only record `checked[_t]` for an
+                    // Add/Sub/Mul over return-typed operands), so no extra
+                    // type check is required (and `operand_primitive_int_name`
+                    // can't see the projected field's type regardless).
+                    checked.get(&p.local.0).cloned()
+                } else {
+                    // Deref, nested fields, indexing, multi-element
+                    // projections — uncapturable.
+                    None
                 }
-                env.get(&p.local.0).cloned()
             }
             Operand::Constant(c) => {
+                if self.operand_primitive_int_name(op).as_deref() != Some(ret_ty) {
+                    return None;
+                }
                 let v = c.value?;
                 crate::predicate::format_int_literal_for_ty(v, ret_ty)
             }
@@ -4752,12 +4842,20 @@ mod tests {
             "must NOT be the structural contradiction of the TRUE case:\n{smt}",
         );
     }
+    /// `+ 1` constant operand, reused by the arithmetic capture tests.
+    fn q4b_const_u32(value: i128) -> Operand {
+        Operand::Constant(ConstOperand {
+            ty: Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) },
+            def_id: None,
+            path: None,
+            value: Some(value),
+        })
+    }
     #[test]
-    fn q4a_uncapturable_arithmetic_body_stays_pending() {
-        // fn add_one(x: u32) -> u32 { x + 1 } — a BinaryOp body effect,
-        // intentionally NOT captured this increment (wrapping-BV
-        // arithmetic lands in Q.4b). Fail closed: no discharge SMT, plus
-        // an audit note explaining the gap.
+    fn q4b_single_block_add_captures_wrapping_bvadd() {
+        // fn add_one(x: u32) -> u32 { x + 1 } in the SCALAR form
+        // (`_0 = Add(_1, const 1)`, single block). Q.4b captures the
+        // wrapping sum as `(bvadd x #x00000001)`.
         let cfg = SubsetConfig::default_for_test();
         let mut v = SubsetVisitor::new(&cfg);
         v.set_current_ensures(vec!["result < 101".to_string()]);
@@ -4767,25 +4865,116 @@ mod tests {
                 Rvalue::BinaryOp(
                     BinOp::Add,
                     Operand::Move(Place { local: Local(1), projection: vec![] }),
-                    Operand::Constant(ConstOperand {
-                        ty: Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) },
-                        def_id: None,
-                        path: None,
-                        value: Some(1),
-                    }),
+                    q4b_const_u32(1),
                 ),
             ),
             span: Span::default(),
         };
         v.visit_body(&q4a_u32_body(vec![add]), false);
-        let report = v.into_report();
-        let (discharge, _c) = q4a_ensures_smt(&report);
-        assert!(discharge.is_none(), "arithmetic body must NOT be captured (fail closed)");
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("Q.4b: a wrapping `x + 1` body effect must be captured");
         assert!(
-            report.audit_notes.iter().any(|n| n.message.contains("body effect")),
-            "pending arithmetic body must surface a body-effect audit note; got: {:?}",
-            report.audit_notes,
+            smt.contains("(assert (= result (bvadd x #x00000001)))"),
+            "wrapping-add body effect missing:\n{smt}",
         );
+    }
+    #[test]
+    fn q4b_two_block_checked_add_captures_via_field_zero() {
+        // The REALISTIC analysis-MIR shape of `x + 1`:
+        //   bb0: _2 = Add(_1, const 1);  assert(!_2.1) -> bb1
+        //   bb1: _0 = move (_2.0);  return
+        // Q.4b walks the linear chain through the overflow Assert and
+        // resolves `_2.0` to the captured wrapping sum.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 101".to_string()]);
+        let u32_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let local =
+            |ty: Ty| LocalDecl { ty, span: Span::default(), mutability: Mutability::Not };
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty()],
+            arg_names: vec!["x".to_string()],
+            return_ty: u32_ty(),
+            is_unsafe: false,
+            is_async: false,
+            // _0 return, _1 = x, _2 = checked-add result (.0 is the sum).
+            locals: vec![local(u32_ty()), local(u32_ty()), local(u32_ty())],
+            blocks: vec![
+                BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(2), projection: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Add,
+                                Operand::Move(Place { local: Local(1), projection: vec![] }),
+                                q4b_const_u32(1),
+                            ),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator {
+                        kind: TerminatorKind::Assert {
+                            cond: Operand::Move(Place {
+                                local: Local(2),
+                                projection: vec![ProjectionElem::Field(1)],
+                            }),
+                            expected: false,
+                            msg: AssertMessage::Overflow,
+                            target: BasicBlock(1),
+                        },
+                        span: Span::default(),
+                    },
+                },
+                BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::Use(Operand::Move(Place {
+                                local: Local(2),
+                                projection: vec![ProjectionElem::Field(0)],
+                            })),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator {
+                        kind: TerminatorKind::Return,
+                        span: Span::default(),
+                    },
+                },
+            ],
+            span: Span::default(),
+        };
+        v.visit_body(&body, false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("Q.4b: checked-add tuple via `.0` must be captured");
+        assert!(
+            smt.contains("(assert (= result (bvadd x #x00000001)))"),
+            "checked-add body effect (via _2.0) missing:\n{smt}",
+        );
+    }
+    #[test]
+    fn q4b_division_body_stays_pending() {
+        // Div is deferred (it can panic on a zero divisor and has
+        // distinct semantics from wrapping add/sub/mul). A `_0 = x / 2`
+        // body must stay pending — fail closed.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 101".to_string()]);
+        let div = Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::BinaryOp(
+                    BinOp::Div,
+                    Operand::Move(Place { local: Local(1), projection: vec![] }),
+                    q4b_const_u32(2),
+                ),
+            ),
+            span: Span::default(),
+        };
+        v.visit_body(&q4a_u32_body(vec![div]), false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        assert!(discharge.is_none(), "Div body effect must NOT be captured (fail closed)");
     }
     #[test]
     fn q4a_precondition_is_assumed_and_consistency_checked() {

@@ -772,14 +772,15 @@ fn pitbull_requires_attribute_attaches_precondition() {
          stderr; got:\n{stderr}",
     );
 }
-/// Task Q.4 MVP (2026-05-26): `#[pitbull::ensures("...")]`
-/// produces a PB076 EnsuresPostcondition obligation at every
-/// function exit (TerminatorKind::Return). The MVP encoder
-/// returns None — wrapper reports as "pending" — pending the
-/// Q.4a body-effect SMT encoder that proves `result < 101`
-/// from `x < 100` and `result = x + 1`. This test pins the
-/// emission contract: the obligation IS emitted and carries
-/// `ret_name: "result"` + `ret_ty_name: "u32"`.
+/// `#[pitbull::ensures("...")]` produces a PB076 EnsuresPostcondition
+/// obligation at every function exit, and (Q.4b) the wrapper now
+/// COMPILES it to SMT rather than reporting "pending" — `add_one`'s
+/// `x + 1` body effect is captured through the checked-add MIR
+/// (AddWithOverflow tuple + overflow Assert + `_0 = (_2.0)`). This
+/// non-gated test pins the pipeline up to dispatch (HIR attr → visitor
+/// → compile): the PB076 obligation is emitted AND is no longer
+/// compilation-pending. The live unsat/sat verdict is pinned by the
+/// Z3-gated discharge tests below.
 #[test]
 fn pitbull_ensures_attribute_emits_pb076_obligation() {
     let Some(env) = E2eEnv::probe() else {
@@ -819,14 +820,13 @@ fn pitbull_ensures_attribute_emits_pb076_obligation() {
         stderr.contains("pb076-ensures-"),
         "Q.4: verdict line should reference the pb076-ensures-{{seq}} id format. Got stderr:\n{stderr}",
     );
-    // `add_one`'s body effect is `x + 1` (a BinaryOp), which Q.4a
-    // intentionally does NOT capture — wrapping-BV arithmetic lands in
-    // the Q.4b follow-up — so the obligation stays "pending" (fail
-    // closed). The discharging copy/constant shapes are exercised by the
-    // two Z3-gated tests immediately below.
+    // Q.4b: `add_one`'s wrapping `x + 1` body effect is now CAPTURED and
+    // compiled to SMT, so the obligation must NOT be reported as
+    // compilation-pending. (The exact unsat/sat verdict is solver-
+    // dependent and pinned by the Z3-gated tests below.)
     assert!(
-        stderr.contains("pending"),
-        "ensures over an (uncaptured) arithmetic body should report as `pending`. Got stderr:\n{stderr}",
+        !stderr.contains("compilation not yet supported"),
+        "Q.4b: add_one's ensures must compile (not stay compilation-pending). Got stderr:\n{stderr}",
     );
 }
 /// Q.4a (2026-05-29) capstone — TRUE postcondition DISCHARGES (unsat).
@@ -958,6 +958,129 @@ fn wrapper_ensures_false_postcondition_not_discharged() {
         code,
         Some(0),
         "Q.4a: an undischarged ensures obligation must drive a non-zero exit. Got {code:?}",
+    );
+}
+/// Q.4b (2026-05-31) capstone — ensures over WRAPPING ARITHMETIC
+/// discharges. `add_one(x){ x + 1 }` with `requires(x < 100)` +
+/// `ensures(result < 101)`: the visitor walks the checked-add MIR
+/// (AddWithOverflow tuple + overflow Assert + `_0 = (_2.0)`), captures
+/// `result == (bvadd x #x00000001)`, assumes `x < 100`, and negates
+/// `result < 101` — unsat under Z3, so PB076 reports `discharged
+/// (unsat`. This is the canonical `add_one` ensures Q.4a left pending,
+/// now discharging end-to-end. (PB049 overflow also discharges under the
+/// same precondition, so the wrapper exits 0.) Z3-gated.
+#[test]
+fn wrapper_proves_ensures_add_one_discharges_under_precondition() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_ensures_add_one_discharges_under_precondition: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-q4b-true-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-q4b-true-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::requires(\"x < 100\")]\n\
+         #[pitbull::ensures(\"result < 101\")]\n\
+         pub fn add_one(x: u32) -> u32 {\n\
+             x + 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_proves_ensures_add_one_discharges_under_precondition: SKIPPED (no solver)");
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("discharged (unsat")
+            && !stderr.contains("NOT DISCHARGED"),
+        "Q.4b: `add_one(x){{ x + 1 }}` with `requires(x < 100)` + \
+         `ensures(result < 101)` must DISCHARGE (unsat). Got code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "Q.4b: add_one fully discharged (PB049 + PB076) should exit 0. Got {code:?}",
+    );
+}
+/// Q.4b adversarial twin — a FALSE arithmetic postcondition does NOT
+/// discharge, isolated from overflow. `add_one(x){ x + 1 }` with
+/// `requires(x < 100)` + `ensures(result < 50)`: PB049 overflow
+/// discharges (x < 100 ⇒ no overflow), but PB076 is `sat` (e.g. x = 60 ⇒
+/// result = 61 ≥ 50), so the wrapper reports `NOT DISCHARGED (sat` for
+/// the postcondition. Pairing this with the discharge test proves the
+/// wrapping-arithmetic encoder distinguishes a holding postcondition
+/// from a violated one. Z3-gated.
+#[test]
+fn wrapper_ensures_add_one_false_postcondition_not_discharged() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_ensures_add_one_false_postcondition_not_discharged: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-q4b-false-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-q4b-false-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::requires(\"x < 100\")]\n\
+         #[pitbull::ensures(\"result < 50\")]\n\
+         pub fn add_one(x: u32) -> u32 {\n\
+             x + 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_ensures_add_one_false_postcondition_not_discharged: SKIPPED (no solver)");
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("NOT DISCHARGED (sat"),
+        "Q.4b: `add_one` with `ensures(result < 50)` must NOT discharge — \
+         x = 60 ⇒ result = 61 ≥ 50 is a counterexample. Got code {code:?}, stderr:\n{stderr}",
     );
 }
 /// Q.4 trust × ensures interaction (Option C design open-question #4):
