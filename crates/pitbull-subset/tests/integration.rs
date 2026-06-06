@@ -1083,6 +1083,124 @@ fn wrapper_ensures_add_one_false_postcondition_not_discharged() {
          x = 60 ⇒ result = 61 ≥ 50 is a counterexample. Got code {code:?}, stderr:\n{stderr}",
     );
 }
+/// Q.4c (2026-05-31) capstone — ensures over DIVISION discharges.
+/// `safe_div(a,b){ a / b }` with `requires(b > 0)` + `ensures(result <= a)`:
+/// the visitor walks the div MIR (div-by-zero `Assert` then `_0 =
+/// Div(a,b)`), captures `result == (bvudiv a b)`, assumes `b > 0`, and
+/// negates `result <= a` — unsat under Z3. (The `requires(b > 0)` also
+/// discharges the PB054/Task-R division-by-zero obligation, so the
+/// wrapper exits 0.) Z3-gated.
+#[test]
+fn wrapper_proves_ensures_safe_div_discharges() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_ensures_safe_div_discharges: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-q4c-true-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-q4c-true-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::requires(\"b > 0\")]\n\
+         #[pitbull::ensures(\"result <= a\")]\n\
+         pub fn safe_div(a: u32, b: u32) -> u32 {\n\
+             a / b\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_proves_ensures_safe_div_discharges: SKIPPED (no solver)");
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("discharged (unsat")
+            && !stderr.contains("NOT DISCHARGED"),
+        "Q.4c: `safe_div(a,b){{ a / b }}` with `requires(b > 0)` + \
+         `ensures(result <= a)` must DISCHARGE (unsat). Got code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "Q.4c: safe_div fully discharged (div-by-zero + PB076) should exit 0. Got {code:?}",
+    );
+}
+/// Q.4c adversarial twin — a FALSE division postcondition does not
+/// discharge. `safe_div(a,b){ a / b }` with `requires(b > 0)` +
+/// `ensures(result < a)`: `b = 1` ⇒ `result = a`, so `result < a` is
+/// violated → PB076 is `sat` (NOT DISCHARGED), while the div-by-zero
+/// obligation still discharges under `b > 0`. Z3-gated.
+#[test]
+fn wrapper_ensures_safe_div_strict_false_not_discharged() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_ensures_safe_div_strict_false_not_discharged: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-q4c-false-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-q4c-false-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::requires(\"b > 0\")]\n\
+         #[pitbull::ensures(\"result < a\")]\n\
+         pub fn safe_div(a: u32, b: u32) -> u32 {\n\
+             a / b\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_ensures_safe_div_strict_false_not_discharged: SKIPPED (no solver)");
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("NOT DISCHARGED (sat"),
+        "Q.4c: `safe_div` with `ensures(result < a)` must NOT discharge — \
+         b = 1 ⇒ result = a is a counterexample. Got code {code:?}, stderr:\n{stderr}",
+    );
+}
 /// Q.4 trust × ensures interaction (Option C design open-question #4):
 /// a `#[pitbull::trusted]` body's ensures is NOT emitted as a proof
 /// obligation (trust means body-content assumed correct). The visitor

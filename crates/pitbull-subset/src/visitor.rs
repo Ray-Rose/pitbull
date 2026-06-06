@@ -2309,8 +2309,9 @@ impl<'cfg> SubsetVisitor<'cfg> {
         }
     }
     /// Capture an rvalue as a return-typed SMT expression, or `None`.
-    /// Handles a `Use` (copy/move/const/`.0`-of-checked) and wrapping
-    /// `Add`/`Sub`/`Mul`; every other rvalue is uncapturable (fail closed).
+    /// Handles a `Use` (copy/move/const/`.0`-of-checked) and the
+    /// same-type arithmetic ops `Add`/`Sub`/`Mul`/`Div`/`Rem`; every
+    /// other rvalue is uncapturable (fail closed).
     fn capture_rvalue(
         &self,
         rvalue: &Rvalue,
@@ -2321,17 +2322,34 @@ impl<'cfg> SubsetVisitor<'cfg> {
         use crate::mir_api::BinOp;
         match rvalue {
             Rvalue::Use(op) => self.capture_operand(op, env, checked, ret_ty),
-            // Wrapping arithmetic (Q.4b). `bvadd`/`bvsub`/`bvmul` are
-            // modular over 2^width — EXACTLY Rust's wrapping semantics and
-            // exactly the value the overflow check's success path yields.
+            // Same-type integer arithmetic (Q.4b add/sub/mul, Q.4c
+            // div/rem). All encodings are verified against Z3 to match
+            // Rust EXACTLY:
+            //   - `bvadd`/`bvsub`/`bvmul` are modular over 2^width =
+            //     Rust's wrapping (and the value the overflow check's
+            //     success path yields).
+            //   - `bvsdiv`/`bvudiv` = Rust `/` (truncate toward zero).
+            //   - `bvsrem`/`bvurem` = Rust `%` (remainder with the
+            //     DIVIDEND's sign). NOTE: signed `%` is `bvsrem`, NOT
+            //     `bvsmod` (which takes the divisor's sign) — they differ
+            //     (e.g. `7 % -2` is `1` vs `-1`).
+            // The panic guards (overflow, div-by-zero, signed MIN/-1) are
+            // NOT modelled: we capture the op over the FULL input range, a
+            // sound over-approximation (the returning inputs are a subset,
+            // so `unsat` still means "holds for every returning input").
             // Both operands must capture as return-typed exprs (uniform
-            // width). Div/Rem (can panic) and Shl/Shr/bitwise (distinct
-            // semantics, mixed widths) are deferred — fail closed.
+            // width); shifts (mixed-width amount) and bitwise stay
+            // deferred — fail closed.
             Rvalue::BinaryOp(op, a, b) => {
+                let signed = crate::predicate::int_type_info(ret_ty).map(|(s, _)| s)?;
                 let smt_op = match op {
                     BinOp::Add => "bvadd",
                     BinOp::Sub => "bvsub",
                     BinOp::Mul => "bvmul",
+                    BinOp::Div if signed => "bvsdiv",
+                    BinOp::Div => "bvudiv",
+                    BinOp::Rem if signed => "bvsrem",
+                    BinOp::Rem => "bvurem",
                     _ => return None,
                 };
                 let ea = self.capture_operand(a, env, checked, ret_ty)?;
@@ -4954,10 +4972,8 @@ mod tests {
         );
     }
     #[test]
-    fn q4b_division_body_stays_pending() {
-        // Div is deferred (it can panic on a zero divisor and has
-        // distinct semantics from wrapping add/sub/mul). A `_0 = x / 2`
-        // body must stay pending — fail closed.
+    fn q4c_unsigned_div_captures_bvudiv() {
+        // fn half(x: u32) -> u32 { x / 2 } → unsigned division `bvudiv`.
         let cfg = SubsetConfig::default_for_test();
         let mut v = SubsetVisitor::new(&cfg);
         v.set_current_ensures(vec!["result < 101".to_string()]);
@@ -4974,7 +4990,147 @@ mod tests {
         };
         v.visit_body(&q4a_u32_body(vec![div]), false);
         let (discharge, _c) = q4a_ensures_smt(&v.into_report());
-        assert!(discharge.is_none(), "Div body effect must NOT be captured (fail closed)");
+        let smt = discharge.expect("Q.4c: unsigned `x / 2` must be captured");
+        assert!(
+            smt.contains("(assert (= result (bvudiv x #x00000002)))"),
+            "unsigned-div body effect missing:\n{smt}",
+        );
+    }
+    #[test]
+    fn q4c_unsigned_rem_captures_bvurem() {
+        // fn m(x: u32) -> u32 { x % 10 } → unsigned remainder `bvurem`.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 10".to_string()]);
+        let rem = Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::BinaryOp(
+                    BinOp::Rem,
+                    Operand::Move(Place { local: Local(1), projection: vec![] }),
+                    q4b_const_u32(10),
+                ),
+            ),
+            span: Span::default(),
+        };
+        v.visit_body(&q4a_u32_body(vec![rem]), false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("Q.4c: unsigned `x % 10` must be captured");
+        assert!(
+            // `format_bv_literal` emits UPPERCASE hex (10 → `#x0000000A`).
+            smt.contains("(assert (= result (bvurem x #x0000000A)))"),
+            "unsigned-rem body effect missing:\n{smt}",
+        );
+    }
+    /// Build a single-block `fn f(x: i32) -> i32 { <stmts>; return }`.
+    fn q4c_i32_body(statements: Vec<Statement>) -> Body {
+        let i32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Int(IntTy::I32)) };
+        let local =
+            |ty: Ty| LocalDecl { ty, span: Span::default(), mutability: Mutability::Not };
+        Body {
+            def_id: DefId(0),
+            arg_tys: vec![i32_ty.clone()],
+            arg_names: vec!["x".to_string()],
+            return_ty: i32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![local(i32_ty.clone()), local(i32_ty)],
+            blocks: vec![BasicBlockData {
+                statements,
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        }
+    }
+    /// `i32` constant operand.
+    fn q4c_const_i32(value: i128) -> Operand {
+        Operand::Constant(ConstOperand {
+            ty: Ty { kind: TyKind::RigidTy(RigidTy::Int(IntTy::I32)) },
+            def_id: None,
+            path: None,
+            value: Some(value),
+        })
+    }
+    #[test]
+    fn q4c_signed_div_captures_bvsdiv() {
+        // fn d(x: i32) -> i32 { x / 2 } → SIGNED division `bvsdiv`
+        // (truncate toward zero), selected by the i32 return type.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result <= x".to_string()]);
+        let div = Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::BinaryOp(
+                    BinOp::Div,
+                    Operand::Move(Place { local: Local(1), projection: vec![] }),
+                    q4c_const_i32(2),
+                ),
+            ),
+            span: Span::default(),
+        };
+        v.visit_body(&q4c_i32_body(vec![div]), false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("Q.4c: signed `x / 2` must be captured");
+        assert!(
+            smt.contains("(assert (= result (bvsdiv x #x00000002)))"),
+            "signed-div body effect missing:\n{smt}",
+        );
+        assert!(!smt.contains("bvudiv"), "signed div must use bvsdiv, not bvudiv:\n{smt}");
+    }
+    #[test]
+    fn q4c_signed_rem_uses_bvsrem_not_bvsmod() {
+        // fn r(x: i32) -> i32 { x % 3 } → SIGNED remainder `bvsrem`
+        // (sign of the DIVIDEND, matching Rust). MUST NOT be `bvsmod`
+        // (sign of the divisor) — they differ (e.g. `7 % -2` is 1 vs -1).
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 3".to_string()]);
+        let rem = Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::BinaryOp(
+                    BinOp::Rem,
+                    Operand::Move(Place { local: Local(1), projection: vec![] }),
+                    q4c_const_i32(3),
+                ),
+            ),
+            span: Span::default(),
+        };
+        v.visit_body(&q4c_i32_body(vec![rem]), false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("Q.4c: signed `x % 3` must be captured");
+        assert!(
+            smt.contains("(assert (= result (bvsrem x #x00000003)))"),
+            "signed-rem body effect must use bvsrem:\n{smt}",
+        );
+        assert!(!smt.contains("bvsmod"), "signed rem must be bvsrem, NOT bvsmod:\n{smt}");
+    }
+    #[test]
+    fn q4c_shift_body_stays_pending() {
+        // Shifts are deferred (the shift amount can be a different width
+        // than the value — needs zero-extend). `_0 = x << 1` must stay
+        // pending — fail closed.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 101".to_string()]);
+        let shl = Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::BinaryOp(
+                    BinOp::Shl,
+                    Operand::Move(Place { local: Local(1), projection: vec![] }),
+                    q4b_const_u32(1),
+                ),
+            ),
+            span: Span::default(),
+        };
+        v.visit_body(&q4a_u32_body(vec![shl]), false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        assert!(discharge.is_none(), "Shl body effect must NOT be captured yet (fail closed)");
     }
     #[test]
     fn q4a_precondition_is_assumed_and_consistency_checked() {

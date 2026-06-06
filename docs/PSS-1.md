@@ -367,8 +367,10 @@ an `ensures` diverges / has no return terminator). The special binding
 the straight-line shapes the visitor can capture *soundly*: a linear
 chain of blocks (following `Goto` / overflow-`Assert` success to
 `Return`) whose result is a (return-typed) argument, an integer
-constant, or a wrapping `Add`/`Sub`/`Mul` (`bvadd`/`bvsub`/`bvmul`,
-bit-exact for Rust's wrapping) over captured operands. `result` and the
+constant, a wrapping `Add`/`Sub`/`Mul` (`bvadd`/`bvsub`/`bvmul`,
+bit-exact for Rust's wrapping), or a `Div`/`Rem` (`bvsdiv`/`bvudiv`/
+`bvsrem`/`bvurem` — Rust's truncating `/` and dividend-signed `%`,
+verified vs Z3) over captured operands. `result` and the
 return-typed parameters are declared as
 bit-vectors of the return width; the visitor asserts the captured body
 effect (`(= result <expr>)`), assumes every translatable precondition
@@ -379,8 +381,8 @@ range rather than excluding the overflow-panic region the `Assert`
 guards — a sound over-approximation (the modelled input set is a
 superset of the returning set, so `unsat` still means "holds for every
 returning input"; at worst it is conservative). Anything it cannot
-capture with certainty — a `Div`/`Rem`/shift/bitwise body effect (Q.4b
-covers wrapping `Add`/`Sub`/`Mul`), branches/loops, calls, casts, a
+capture with certainty — a shift/bitwise body effect (Q.4b/Q.4c cover
+`Add`/`Sub`/`Mul`/`Div`/`Rem`), branches/loops, calls, casts, a
 non-primitive-integer return, or an untranslatable spec — stays
 *pending* (fail closed: never a false "verified"). A wrong body-effect
 encoding would falsely discharge a wrong postcondition, so the capture
@@ -1377,10 +1379,10 @@ the std form and now also matches. No shadow type changes.
   single-block bodies returning a return-typed argument or an integer
   constant — asserting the captured body effect, the translatable
   preconditions (F1-guarded), and the negated postcondition (`unsat` ⇒
-  holds; `sat` ⇒ counterexample). **Q.4b** adds wrapping `Add`/`Sub`/`Mul`
-  (`bvadd`/`bvsub`/`bvmul`) captured through the checked-add MIR
-  (`AddWithOverflow` tuple + overflow `Assert` + `_0 = (_t.0)`), so
-  `add_one` discharges; `Div`/`Rem`/shifts stay deferred. Anything
+  holds; `sat` ⇒ counterexample). **Q.4b/Q.4c** add `Add`/`Sub`/`Mul`
+  (wrapping `bvadd`/`bvsub`/`bvmul`, captured through the checked-add MIR)
+  and `Div`/`Rem` (`bvsdiv`/`bvudiv`/`bvsrem`/`bvurem`), so `add_one` and
+  `safe_div` discharge; shifts stay deferred. Anything
   uncapturable fails closed to "pending", never a false "verified".
   Verified adversarially: TRUE postconditions discharge (unsat), FALSE
   ones do not (sat), uncapturable stays pending — unit (exact-SMT) +
