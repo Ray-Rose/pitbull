@@ -23,7 +23,7 @@ repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 248 tests passing (141 subset-lib + 70 vc + 37 integration),
+- **State:** 253 tests passing (144 subset-lib + 70 vc + 39 integration),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -46,8 +46,9 @@ repo only (no remote).
   2026-05-29; a CRITICAL fix — `-x` was silently unobligated before).
   PB076 (ensures postcondition) now DISCHARGES too — Q.4a (copy/constant
   bodies) + Q.4b (wrapping `Add`/`Sub`/`Mul`) + Q.4c (`Div`/`Rem` via
-  bvsdiv/bvudiv/bvsrem/bvurem), so `add_one` and `safe_div` discharge;
-  shift body effects stay deferred. PB043 / PB041 still emit obligations that `compile` returns
+  bvsdiv/bvudiv/bvsrem/bvurem) + Q.4d (shifts `bvshl`/`bvlshr`/`bvashr`),
+  so `add_one`, `safe_div`, `halve` discharge; bitwise ops + variable
+  narrower-width shift amounts remain. PB043 / PB041 still emit obligations that `compile` returns
   `None` for (reported "pending"). The other ~71 rules are syntactic
   visitor rejects.
 - **Next task (recommended):** Task R closed the division/over-shift
@@ -69,16 +70,17 @@ repo only (no remote).
      no crypto dep today), plus certifying the consistency-refused /
      pending obligations (currently only main-check decisions get a
      cert).
-  2. ✅ **Q.4a–Q.4c ensures SMT discharge** — DONE (2026-05-29 →
+  2. ✅ **Q.4a–Q.4d ensures SMT discharge** — DONE (2026-05-29 →
      2026-05-31): PB076 discharges copy/constant bodies (Q.4a), wrapping
      `Add`/`Sub`/`Mul` through the checked-add MIR (Q.4b), and `Div`/`Rem`
      (Q.4c — `bvsdiv`/`bvudiv`/`bvsrem`/`bvurem`; signed `%` is `bvsrem`
      NOT `bvsmod`, verified vs Z3); `add_one` and `safe_div` discharge
      end-to-end. Verified adversarially (TRUE→unsat, FALSE→sat,
      uncapturable→pending) via unit (exact-SMT) + Z3-gated e2e tests, plus
-     an independent soundness review. Remaining: **Q.4d** shift body
-     effects (`Shl`/`Shr` — the shift amount may be a narrower type,
-     needing zero-extend) and the **mixed-width over-shift PB049
+     an independent soundness review (Q.4d shifts added 2026-05-31:
+     `bvshl`/`bvlshr`/`bvashr`, constant + same-type amounts). Remaining:
+     variable narrower-width shift amounts (zero-extend + their own
+     declaration), bitwise ops, and the **mixed-width over-shift PB049
      encoding** (Task R deferred `u32 << u8`; same-type shifts today).
   See Section 5 for the full menu.
 - **First commands to run in a fresh session:** see

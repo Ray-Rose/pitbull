@@ -2337,9 +2337,15 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // NOT modelled: we capture the op over the FULL input range, a
             // sound over-approximation (the returning inputs are a subset,
             // so `unsat` still means "holds for every returning input").
-            // Both operands must capture as return-typed exprs (uniform
-            // width); shifts (mixed-width amount) and bitwise stay
-            // deferred — fail closed.
+            // Arithmetic operands are same-type (uniform width). Shifts
+            // (Q.4d): `<<` = `bvshl`; `>>` = `bvashr` (arithmetic,
+            // sign-filling) for a SIGNED value, `bvlshr` (logical) for an
+            // UNSIGNED one — selected by the VALUE's signedness, verified
+            // vs Z3. The shift AMOUNT may be a different integer type, so
+            // it goes through `capture_shift_amount` (rendered at the
+            // value width); over-shift amounts are not excluded — the SMT
+            // op yields the same sound over-approximation as the other
+            // panic guards. Bitwise ops stay deferred — fail closed.
             Rvalue::BinaryOp(op, a, b) => {
                 let signed = crate::predicate::int_type_info(ret_ty).map(|(s, _)| s)?;
                 let smt_op = match op {
@@ -2350,10 +2356,18 @@ impl<'cfg> SubsetVisitor<'cfg> {
                     BinOp::Div => "bvudiv",
                     BinOp::Rem if signed => "bvsrem",
                     BinOp::Rem => "bvurem",
+                    BinOp::Shl => "bvshl",
+                    BinOp::Shr if signed => "bvashr",
+                    BinOp::Shr => "bvlshr",
                     _ => return None,
                 };
                 let ea = self.capture_operand(a, env, checked, ret_ty)?;
-                let eb = self.capture_operand(b, env, checked, ret_ty)?;
+                let eb = match op {
+                    BinOp::Shl | BinOp::Shr => {
+                        self.capture_shift_amount(b, env, checked, ret_ty)?
+                    }
+                    _ => self.capture_operand(b, env, checked, ret_ty)?,
+                };
                 Some(format!("({smt_op} {ea} {eb})"))
             }
             // Casts, refs, len, aggregates, etc. — uncapturable. Fail
@@ -2405,6 +2419,34 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 }
                 let v = c.value?;
                 crate::predicate::format_int_literal_for_ty(v, ret_ty)
+            }
+        }
+    }
+    /// Capture a SHIFT AMOUNT operand as a value-width SMT expression, or
+    /// `None`. The amount's own integer type may differ from the value's,
+    /// but SMT shifts need both operands at the value width:
+    ///   - a CONSTANT amount is rendered at the value's width directly —
+    ///     only its (small, non-negative) value matters, and an over-shift
+    ///     amount renders fine because the SMT op then yields the sound
+    ///     over-approximation of the over-shift panic;
+    ///   - a VARIABLE amount is accepted ONLY when it is already the
+    ///     return type (same width, already declared as an SMT var). A
+    ///     narrower/wider variable amount would need zero-extend/truncate
+    ///     plus its own declaration — deferred (fail closed).
+    fn capture_shift_amount(
+        &self,
+        op: &Operand,
+        env: &std::collections::HashMap<u32, String>,
+        checked: &std::collections::HashMap<u32, String>,
+        ret_ty: &str,
+    ) -> Option<String> {
+        match op {
+            Operand::Constant(c) => {
+                let v = c.value?;
+                crate::predicate::format_int_literal_for_ty(v, ret_ty)
+            }
+            Operand::Copy(_) | Operand::Move(_) => {
+                self.capture_operand(op, env, checked, ret_ty)
             }
         }
     }
@@ -5110,10 +5152,9 @@ mod tests {
         assert!(!smt.contains("bvsmod"), "signed rem must be bvsrem, NOT bvsmod:\n{smt}");
     }
     #[test]
-    fn q4c_shift_body_stays_pending() {
-        // Shifts are deferred (the shift amount can be a different width
-        // than the value — needs zero-extend). `_0 = x << 1` must stay
-        // pending — fail closed.
+    fn q4d_shl_constant_captures_bvshl() {
+        // fn f(x: u32) -> u32 { x << 1 } → `bvshl` with the amount
+        // rendered at the value's width.
         let cfg = SubsetConfig::default_for_test();
         let mut v = SubsetVisitor::new(&cfg);
         v.set_current_ensures(vec!["result < 101".to_string()]);
@@ -5130,7 +5171,86 @@ mod tests {
         };
         v.visit_body(&q4a_u32_body(vec![shl]), false);
         let (discharge, _c) = q4a_ensures_smt(&v.into_report());
-        assert!(discharge.is_none(), "Shl body effect must NOT be captured yet (fail closed)");
+        let smt = discharge.expect("Q.4d: `x << 1` must be captured");
+        assert!(
+            smt.contains("(assert (= result (bvshl x #x00000001)))"),
+            "shl body effect missing:\n{smt}",
+        );
+    }
+    #[test]
+    fn q4d_unsigned_shr_captures_bvlshr() {
+        // fn f(x: u32) -> u32 { x >> 4 } → LOGICAL right shift `bvlshr`.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result <= x".to_string()]);
+        let shr = Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::BinaryOp(
+                    BinOp::Shr,
+                    Operand::Move(Place { local: Local(1), projection: vec![] }),
+                    q4b_const_u32(4),
+                ),
+            ),
+            span: Span::default(),
+        };
+        v.visit_body(&q4a_u32_body(vec![shr]), false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("Q.4d: unsigned `x >> 4` must be captured");
+        assert!(
+            smt.contains("(assert (= result (bvlshr x #x00000004)))"),
+            "unsigned-shr body effect must use bvlshr:\n{smt}",
+        );
+        assert!(!smt.contains("bvashr"), "unsigned >> must be bvlshr, not bvashr:\n{smt}");
+    }
+    #[test]
+    fn q4d_signed_shr_captures_bvashr() {
+        // fn f(x: i32) -> i32 { x >> 1 } → ARITHMETIC right shift `bvashr`
+        // (sign-filling), selected by the i32 return type.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result <= x".to_string()]);
+        let shr = Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::BinaryOp(
+                    BinOp::Shr,
+                    Operand::Move(Place { local: Local(1), projection: vec![] }),
+                    q4c_const_i32(1),
+                ),
+            ),
+            span: Span::default(),
+        };
+        v.visit_body(&q4c_i32_body(vec![shr]), false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        let smt = discharge.expect("Q.4d: signed `x >> 1` must be captured");
+        assert!(
+            smt.contains("(assert (= result (bvashr x #x00000001)))"),
+            "signed-shr body effect must use bvashr:\n{smt}",
+        );
+        assert!(!smt.contains("bvlshr"), "signed >> must be bvashr, not bvlshr:\n{smt}");
+    }
+    #[test]
+    fn q4d_bitwise_body_stays_pending() {
+        // Bitwise ops (BitAnd/BitOr/BitXor) are deferred — `_0 = x ^ 1`
+        // must stay pending (fail closed).
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result < 101".to_string()]);
+        let xor = Statement {
+            kind: StatementKind::Assign(
+                Place { local: Local(0), projection: vec![] },
+                Rvalue::BinaryOp(
+                    BinOp::BitXor,
+                    Operand::Move(Place { local: Local(1), projection: vec![] }),
+                    q4b_const_u32(1),
+                ),
+            ),
+            span: Span::default(),
+        };
+        v.visit_body(&q4a_u32_body(vec![xor]), false);
+        let (discharge, _c) = q4a_ensures_smt(&v.into_report());
+        assert!(discharge.is_none(), "BitXor body effect must NOT be captured (fail closed)");
     }
     #[test]
     fn q4a_precondition_is_assumed_and_consistency_checked() {

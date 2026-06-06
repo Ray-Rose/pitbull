@@ -1201,6 +1201,115 @@ fn wrapper_ensures_safe_div_strict_false_not_discharged() {
          b = 1 ⇒ result = a is a counterexample. Got code {code:?}, stderr:\n{stderr}",
     );
 }
+/// Q.4d (2026-05-31) capstone — ensures over a SHIFT discharges.
+/// `halve(x){ x >> 1 }` with `ensures(result <= x)`: the visitor walks
+/// the shift MIR (over-shift `Assert` then `_0 = Shr(x, 1)`), captures
+/// `result == (bvlshr x #x00000001)` (logical right shift, unsigned),
+/// and negates `result <= x` — unsat under Z3 (`x >> 1 <= x` for all x).
+/// Asserts the PB076 verdict specifically (the separate over-shift
+/// obligation is not this test's concern). Z3-gated.
+#[test]
+fn wrapper_proves_ensures_shr_halve_discharges() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_ensures_shr_halve_discharges: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-q4d-true-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-q4d-true-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::ensures(\"result <= x\")]\n\
+         pub fn halve(x: u32) -> u32 {\n\
+             x >> 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_proves_ensures_shr_halve_discharges: SKIPPED (no solver)");
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("discharged (unsat")
+            && !stderr.contains("NOT DISCHARGED"),
+        "Q.4d: `halve(x){{ x >> 1 }}` with `ensures(result <= x)` must \
+         DISCHARGE (unsat). Got code {code:?}, stderr:\n{stderr}",
+    );
+}
+/// Q.4d adversarial twin — a FALSE shift postcondition does not
+/// discharge. `halve(x){ x >> 1 }` with `ensures(result < x)`: `x = 0` ⇒
+/// `0 >> 1 = 0`, not `< 0`, so PB076 is `sat` (NOT DISCHARGED). Z3-gated.
+#[test]
+fn wrapper_ensures_shr_strict_false_not_discharged() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_ensures_shr_strict_false_not_discharged: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-q4d-false-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-q4d-false-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::ensures(\"result < x\")]\n\
+         pub fn halve(x: u32) -> u32 {\n\
+             x >> 1\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_ensures_shr_strict_false_not_discharged: SKIPPED (no solver)");
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("NOT DISCHARGED (sat"),
+        "Q.4d: `halve` with `ensures(result < x)` must NOT discharge — \
+         x = 0 ⇒ 0 >> 1 = 0 is a counterexample. Got code {code:?}, stderr:\n{stderr}",
+    );
+}
 /// Q.4 trust × ensures interaction (Option C design open-question #4):
 /// a `#[pitbull::trusted]` body's ensures is NOT emitted as a proof
 /// obligation (trust means body-content assumed correct). The visitor
