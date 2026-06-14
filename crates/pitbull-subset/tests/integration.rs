@@ -551,6 +551,56 @@ fn malformed_pitbull_toml_hard_errors() {
          mode clear; got:\n{stderr}",
     );
 }
+/// Regression for the config-validation fail-open (audit 2026-05-31): a
+/// pitbull.toml that PARSES but violates a PSS-1 config policy (here PB048,
+/// `panic_strategy != "abort"`) must REFUSE to verify (exit 2) — not print
+/// the error and exit 0. A non-conforming config (e.g. an unsupported
+/// toolchain, PB071) invalidates the run's soundness basis, so proceeding
+/// would be a fail-open. Before the fix, a clean body under this config
+/// exited 0 ("verified").
+#[test]
+fn invalid_config_policy_refuses_verification() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("invalid_config_policy_refuses_verification: SKIPPED — prerequisites missing.");
+        return;
+    };
+    let mut config_path = std::env::temp_dir();
+    config_path.push(format!("pitbull-cfgpolicy-{}.toml", std::process::id()));
+    // Parses fine; `panic_strategy = "unwind"` violates PB048.
+    fs::write(
+        &config_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[subset]\npanic_strategy = \"unwind\"\n",
+    )
+    .expect("write temp pitbull.toml");
+    // A clean body — without the fix this would exit 0 despite the policy
+    // violation.
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-cfgpolicy-{}.rs", std::process::id()));
+    fs::write(&probe_rs, "pub fn ok(x: u32) -> u32 { x }\n").expect("write probe.rs");
+    let result = run_one_corpus_file_full(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", config_path.as_os_str())],
+    );
+    let _ = fs::remove_file(&config_path);
+    let _ = fs::remove_file(&probe_rs);
+    let (stderr, code) = result.expect("wrapper should spawn");
+    assert_eq!(
+        code,
+        Some(2),
+        "config policy violation (PB048) must refuse with exit 2, not pass; \
+         got {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("PB048") || stderr.contains("validation error"),
+        "stderr should name the config validation failure; got:\n{stderr}",
+    );
+}
 /// Regression test for audit finding H1 (companion): when
 /// `PITBULL_TOML` is set to a path that does not exist, the wrapper
 /// must hard-error rather than silently fall back.

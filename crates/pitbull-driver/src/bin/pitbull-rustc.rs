@@ -1219,6 +1219,17 @@ fn load_config() -> pitbull_subset::SubsetConfig {
                 for err in &outcome.errors {
                     eprintln!("pitbull-rustc:   {err}");
                 }
+                // Fail closed (audit 2026-05-31). A config POLICY violation —
+                // unsupported toolchain (PB071), panic_strategy != "abort"
+                // (PB048), non-{16,32,64} pointer width (PB052), out-of-range
+                // trust budget (PB068), or a malformed trusted-build-script
+                // hash (PB060) — invalidates the soundness basis for the
+                // entire run (the per-toolchain / per-config trust argument no
+                // longer holds). These were previously printed and then
+                // IGNORED (exit 0 if the bodies happened to be clean) — a
+                // fail-open. Refuse to verify, mirroring the structural
+                // load-error path below.
+                std::process::exit(2);
             }
             outcome.config
         }
