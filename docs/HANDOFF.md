@@ -8,7 +8,7 @@ during work.
 
 Last known-good commit at hand-off: the latest on `main` — run
 `git log -1`. The most recent milestone is **Task S** (multi-solver
-2-of-N agreement gate); the prior one is **`11aed4c`** (Task R,
+2-of-N agreement gate); the prior one is **`dbdc3dd`** (Task R,
 division/over-shift obligation encoding). The v0.2 state ships the
 deductive backend, full PB054 end-to-end discharge (P / P.1 / P.2),
 the Option-C attribute suite (Phase B grammar, Q.1 trusted, Q.2
@@ -107,52 +107,51 @@ repo only (no remote).
 ### Recent commit log (newest first)
 
 ```
-b080d1a Audit-cleanup: close silent-skip soundness gaps (div/rem/shift notes, divergent-ensures fail-closed, exclude-count)
-49fbf09 Audit-cleanup post-Q: close M-1/M-2/L-1/L-2 (divergent-ensures note, ret_ty_name Option, ascii assert)
-dfef08b Milestone 2 Task Q.4 MVP: #[pitbull::ensures(...)] postcondition obligations (PB076)
-1ba425e Audit-cleanup pass after Q.1-Q.3 (M-RT-Q.A–D)
-4ba79ba Milestone 2 Task Q.3: expression-form #[pitbull::requires(x < 100)] without quotes
-39ab294 Milestone 2 Task Q.2: #[pitbull::requires]/#[trusted] on impl methods
-99c7b28 Milestone 2 Task Q.1: #[pitbull::trusted] + adapter is_unsafe/is_async fix
-73a5568 Phase B: predicate grammar <ident> <cmp> <ident> form
-c43f051 chore: remove orphan deps (sha2/trybuild/insta/syn/quote/proc-macro2)
-0767285 N3 + H-RT1/H-RT2/H-RT3/M-RT3 (post-interruption red-team cleanup)
-e6f9154 Audit-cleanup pass after P/P.1/P.2 (N1/N2/F3/F4/F5–F13 closed)
-c05bd13 Milestone 2 Task P.2: PB054 operand binding — IndexBound discharges end-to-end
-f0b7dc7 Milestone 2 Task P.1: PB054 SMT discharge — IndexBound compiles to QF_BV
-9e15116 Milestone 2 Task P: PB054 MVP — detect index sites and emit IndexBound obligations
-de0054e docs: HANDOFF.md refresh for post-O.3 state
-a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
-808f5dd Audit O.2.5-followup: sign-extend narrow signed values + capstone test + doc fixes
-f18a3fa Milestone 2 Task O.2.5: constant-operand value extraction (headline demo unlocker)
-c535fe4 docs: HANDOFF.md — fresh-session instructions for the next contributor
-7f6bdc2 Audit O.2-cleanup #6: final residuals (doc drift, dead method, F1/F10 regression tests, integration-test race fix)
-99f975c Audit O.2-cleanup #5: F7 + F8 + F10 (defense-in-depth + UX correctness)
-9f6ce90 Audit O.2-cleanup #4: F3 + H-1/H-2/H-3 + specific audit messages for translation failures
-01c001b Audit O.2-cleanup #3: F1 (consistency-check guard against contradictory preconditions)
-db34fb7 Audit O.2-cleanup #2: F2 + F9 (assumption lex-validation + verdict-parser hardening)
-dc5ed6d Milestone 2 Task O.2-cleanup: audit findings after O.2
-102aeca Milestone 2 Task O.2: spec-context narrowing — predicate grammar + parameter binding
-bc2bd46 Milestone 2 Task O.1: spec-context narrowing — foundation (raw SMT-LIB preconditions)
-3c477e2 Milestone 2 Task N: visitor → pitbull-vc → Z3 end-to-end (v0.2 spine working)
-6a4c3ec Milestone 2 Task M: pitbull-vc scaffold (VC types + SMT-LIB + Z3 dispatch)
-79a87c7 Milestone 2 Task L: add CI workflow (stable + nightly-e2e gates)
-7b6d5a6 Milestone 2 Task K: fix audit finding H3 (env-path injection guards)
-8950d55 Milestone 2 Task J: fix audit finding H1 (silent default-config fallback)
-d362094 Milestone 2 Task I: fix audit finding C2 (silent path=None fallthrough)
-931a90a Milestone 2 Task H: fix audit finding C1 (verify_roots skipped statics)
-7b7de36 Milestone 2 Task G: HIR pre-pass for PB001 unsafe-block detection
-b383707 Milestone 2 Task F: filename side-channel for SARIF artifactLocation URIs
-3d4f2d7 Milestone 2 Task E: wrapper enumerates static/const items (PB018 e2e)
-50ec60d Milestone 2 Task C: activate corpus_runs_full_pipeline e2e test
-40a0511 Milestone 2 Task D: cleaner def_id via DefId::name()
-d581354 Milestone 2 Task B: real Span line/col from rustc_public
-13b2b8b Milestone 2 Task A: verify_roots filtering via pitbull.toml
-781b906 Milestone 2: full adapter — Box example emits PB011 end-to-end
-7a54f52 Milestone 2: PitbullCallbacks fires end-to-end through cargo check
-c601831 Milestone 2: pitbull-rustc wrapper binary + cargo check integration
-ab4cde1 Milestone 2 scaffold: rustc_public adapter wiring
-f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
+a62a770 Deep-audit self-review: fix cross-crate false-positive + catch method-form overflow
+ca48798 M1: fold coverage-gap audit notes into the exit code (no silent skips)
+4f4dc65 Cross-crate reachability aggregation (whole-workspace gate)
+d39ed4c Audit: catch unwrap/expect false-discharge + adapter accept-on-unknown
+7256d3e #27 drop-glue: fail closed on Drop reached via drop-glue under narrowing
+39eb5cf Discharge variable mixed-width shifts (safe subset) under preconditions
+06a2e6b #25: discharge mixed-width over-shift + close its fail-open
+29c46ce Enforce FFI surface (PB056/057/058); reclassify PB016 as covered
+34f6403 Close coverage-gap audit: enforce PB003 (unsafe impl/trait)
+9b3549e Harden #27: fail closed on in-crate callees skipped by verify_roots
+9632404 Fix CRITICAL fail-open: rustc_public bridge failure could exit 0
+0f2ccc9 Fix PB051-on-shift: exempt value-preserving constant int casts
+bc0ea99 Fix CI nightly-e2e: run the REAL wrapper + don't panic without cvc5
+ecb043d Harden corpus accept-check; fix mislabeled accept files (audit 2026-05-31)
+5710742 Fix HIGH fail-open: config policy violations ignored by the exit code
+82acf9d Fix CRITICAL false-discharge: precondition referencing `result` (PB076)
+d17a9f1 Milestone 2 Task Q.4d: discharge #[pitbull::ensures] over shifts
+827d61f Milestone 2 Task Q.4c: discharge #[pitbull::ensures] over Div/Rem
+944d4bd Milestone 2 Task Q.4b: discharge #[pitbull::ensures] over wrapping arithmetic
+c43bc45 Milestone 2 Task Q.4a: discharge #[pitbull::ensures] (PB076) via SMT
+a15bc60 Unit-test + DRY the solver-version-pin and unmatched-precondition checks
+14ec194 PB059: enforce the proc-macro allowlist (reject non-allowlisted reachable derives/attrs)
+38f3939 Red-team T.3/hardening fixes: from_hex panic (HIGH), probe_version timeout, +Lows
+8d50b23 docs: refresh test count to 219 + record T.3 signing / red-team / hardening
+50531c3 Hardening: enforce solver_versions pins + warn on unmatched precondition keys
+dcc70d8 Task T.3: HMAC-SHA256 certificate signing (closes swapped-SMT + threshold tamper)
+e931e75 Red-team Task T fixes: empty-bundle exit-0, internal consistency, timeout, size cap
+940fbd6 Task T.2: emit proof certificates from the wrapper + `cargo pitbull replay`
+083f609 Task T.1: proof-certificate data model + replay logic (pitbull-vc)
+d030604 Audit fix (CRITICAL): unary negation overflow was silently unobligated
+c39848f Task S audit: fix consistency-check fail-open + duplicate-solver vote inflation
+e614f00 Task S: multi-solver N-of-M agreement gate (closes single-solver TCB hole)
+dbdc3dd Task R: division-by-zero / over-shift obligation encoding (closes AoRTE gap)
+85b5751 docs: refresh drift flagged by full-codebase audit (counts, Q-series, PB076)
+5fdf3c1 Audit-cleanup: close silent-skip soundness gaps in foundational code
+8692d7f Audit-cleanup post-Q: close M-1, M-2, L-1, L-2 from 4-agent deep audit
+7dc2633 Task Q.4 MVP: #[pitbull::ensures("...")] postcondition obligations
+0597752 Audit-cleanup pass after Q.1-Q.3: close M-RT-Q.A through M-RT-Q.D + doc refresh
+ecef732 Task Q.3: expression-form #[pitbull::requires(x < 100)] without quotes
+36f0132 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl methods
+d4abf03 Task Q.1: #[pitbull::trusted] attribute + adapter fix for is_unsafe/is_async
+0b79d3e Phase B: predicate grammar <ident> <cmp> <ident> form (vision-audit #2)
+fbe96c8 chore: remove orphan deps (architectural-review #1)
+f71d238 N3 + H-RT1/H-RT2/H-RT3/M-RT3: Z3 timeout + post-interruption red-team cleanup
+efce72b Audit-cleanup pass after P/P.1/P.2: close N1/N2/F3/F4/F5–F13 from deep audit
 ```
 
 ### Test invariant
@@ -333,7 +332,8 @@ pwd
 # Expected: .../PLAYGROUND_pitbull/pitbull_official
 
 git log --oneline -1
-# Expected: a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
+# Expected: the latest commit on `main` (the tip moves every session; do
+# not pin a specific hash here). See the recent-commit-log block in §1.
 ```
 
 ### Step 4.2 — Stable test suite (the 305-test baseline)
@@ -683,8 +683,8 @@ git commit -m "..."
 |---|---|---|---|
 | solver PATH trust | A solver binary on PATH could be a hostile substitute always returning `unsat`. | `pitbull-vc/src/solver.rs::{run_solvers,vote}` | **Mitigated (Task S + 2026-05-29 audit):** discharge requires `threshold` *distinct* solvers (default `[z3, cvc5]`, threshold 2) to agree `unsat` with zero `sat`; one corrupt solver yields at most `Inconclusive`, and a `sat`/`unsat` split is a loud `DISAGREEMENT`. `vote` counts distinct solver names and the driver dedups the pool, so a duplicate config entry (`["z3","z3"]`) cannot inflate the vote. The precondition consistency check fails closed unless `threshold` solvers confirm satisfiability, so a timed-out/errored consistency check cannot yield a vacuous discharge. `[verification.solver_versions]` pins are now enforced — a solver whose `--version` doesn't match its pin is dropped from the pool (fail-closed). Residual: a coordinated swap of ALL distinct solvers to the pinned versions. |
 | u32 file-hash collisions | `Span::file` is a u32 hash. At ~65K files, 50% collision probability. | `pitbull-subset/src/mir_api/adapter.rs` (and `mir_api.rs::Span`) | Bumping to u64 ripples through the shadow IR. Tracked. |
-| Constant operand extraction (O.2.5) | ✅ DONE in `f18a3fa`. Adapter now extracts integer values via `try_extract_integer_value`; visitor synthesizes `(assert (= rhs #x...))` pinning assertions. Sign-extension fix in `808f5dd`. | — | Closed. |
-| `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `a66a1a4`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |
+| Constant operand extraction (O.2.5) | ✅ DONE in `89cc583`. Adapter now extracts integer values via `try_extract_integer_value`; visitor synthesizes `(assert (= rhs #x...))` pinning assertions. Sign-extension fix in `7a8f04b`. | — | Closed. |
+| `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `afb5892`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |
 | Path-sensitive symbolic exec | PB043 PanicReachability obligations are emitted but `pitbull-vc::compile` returns None for the kind. | `pitbull-vc/src/vc.rs::compile` | The SMT encoding for "panic site is unreachable" requires path-sensitive analysis — multi-week task. |
 | Termination measures (PB041) | Recursion-decreasing obligations not yet emitted. | visitor + vc | Needs call-graph SCC analysis, currently a documented gap. |
 | Bounds checks (PB054) | ✅ DONE in Tasks P / P.1 / P.2 + audit-cleanup. Visitor emits `IndexBound { idx_source_name: Option<String> }`; compile emits QF_BV with `__pb_idx`/`__pb_len` canonical names + `idx`/`len` aliases + optional source-name alias in quoted-symbol syntax for raw-ident safety. End-to-end discharge under Z3 verified by `wrapper_proves_bounded_index_safe_under_precondition`. | — | Closed. |
@@ -729,7 +729,7 @@ cargo +stable test -p pitbull-subset --all-features  # crate-only mode
 
 ### Cargo test parallel races on shared temp files
 
-Fixed in `7f6bdc2`. If you write new integration tests in `crates/pitbull-subset/tests/integration.rs`, the helper `run_one_corpus_file_full` now uses `TEMP_FILE_COUNTER` to uniquify temp filenames. Don't reintroduce pid-only filenames.
+Fixed in `506563a`. If you write new integration tests in `crates/pitbull-subset/tests/integration.rs`, the helper `run_one_corpus_file_full` now uses `TEMP_FILE_COUNTER` to uniquify temp filenames. Don't reintroduce pid-only filenames.
 
 ### Nightly wrapper not rebuilt after code changes
 
@@ -750,7 +750,7 @@ If the wrapper outputs only `"pitbull-rustc: crate analyzed: ... 0 violation(s)"
 
 ### `.claude/settings.local.json` accidentally committed
 
-This happens when you use `git add -A`. The `.claude/` directory is now in `.gitignore` (since commit `d362094`), so it won't happen automatically. If it does, `git rm --cached .claude/settings.local.json` and commit.
+This happens when you use `git add -A`. The `.claude/` directory is now in `.gitignore` (since commit `5862f34`), so it won't happen automatically. If it does, `git rm --cached .claude/settings.local.json` and commit.
 
 ---
 

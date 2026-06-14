@@ -497,7 +497,7 @@ declared complete:
 - ✅ `adapter::aggregate_kind`, `cast_kind`, `bin_op`, `un_op`,
   `assert_message`, `non_diverging_intrinsic`, `retag_kind` — full
   supporting-type translations
-- ✅ `adapter::span` real line/col extraction (Task B, commit d581354)
+- ✅ `adapter::span` real line/col extraction (Task B, commit 722dc20)
   and filename URI side-channel (Task F, see Driver integration below).
   rustc_public does not expose byte offsets, so SARIF region encoding
   uses line/col only — adequate for IDE/CI consumers.
@@ -1092,7 +1092,7 @@ the std form and now also matches. No shadow type changes.
       no-overflow"); this ordering is cosmetic for the
       solver but reads naturally for an auditor.
 
-  Layered tests (5 new in commit f18a3fa, plus 1 e2e test
+  Layered tests (5 new in commit 89cc583, plus 1 e2e test
   in the audit follow-up at integration.rs::wrapper_proves_add_one_safe_under_precondition):
     * `predicate::tests::operand_pin_assertion_basic` —
       pins the bv-literal encoding for u32/i64/i32 with
@@ -1241,7 +1241,7 @@ the std form and now also matches. No shadow type changes.
         - Atomic (PB023): also matches `std::sync::atomic::*`.
 
       Same fix shape as the Box ADT path-normalization that landed
-      in 781b906. Now PB043 default obligations fire on real
+      in f8d4ed5. Now PB043 default obligations fire on real
       panicking code: `panic!("boom")` produces
       `pitbull-rustc: vc pb043-panic-0: pending (compilation not
       yet supported for PanicReachability)` rather than silently
@@ -1746,7 +1746,7 @@ the std form and now also matches. No shadow type changes.
 - ✅ Deep-audit self-review fixes (2026-06-14) — a 3-agent adversarial review
   of this session's own commits, each finding verified against the source
   before acting. Two issues fixed:
-  (1) **Cross-crate gate false-positive (a regression in 85900e7)** — the
+  (1) **Cross-crate gate false-positive (a regression in 4f4dc65)** — the
   aggregation keyed on rendered path STRINGS, but `item.name()` renders a
   trait-impl method as `<crate::S as crate::T>::m` (walked) while the CALL
   references the trait path `crate::T::m` (referenced) — verified empirically
