@@ -1477,37 +1477,42 @@ impl<'cfg> SubsetVisitor<'cfg> {
             );
             return;
         };
-        if lhs_name != rhs_name {
-            // Operand types differ. For Add/Sub/Mul/Div/Rem this is
-            // unreachable in well-formed MIR post-coercion (both
-            // operands share the type). For Shl/Shr it is EXPECTED
-            // and common — the shift amount may be a different
-            // integer type than the value (`u32 << u8`). Either way
-            // we cannot emit a well-sorted same-width SMT problem,
-            // so we surface the gap (audit-safe, no silent skip)
-            // rather than emit a malformed `(bvuge rhs width)` on
-            // mismatched bit-vector sorts. Mixed-width over-shift
-            // encoding (zero-extend the amount to the value width)
-            // is a tracked follow-up.
-            let note = if matches!(arith_op, crate::vc::ArithOp::Shl | crate::vc::ArithOp::Shr) {
-                format!(
-                    "PB049: shift {arith_op:?} skipped — value type {lhs_name} \
-                     differs from shift-amount type {rhs_name} (mixed-width \
-                     shift). The v0.2 encoder emits the over-shift obligation \
-                     only when both operands share a type; mixed-width \
-                     over-shift encoding is a tracked follow-up. Treat the \
-                     over-shift safety of this operation as unverified.",
-                )
-            } else {
+        // #25 (2026-06-14): a mixed-width SHIFT no longer silently passes.
+        // Pre-fix, `x: u32 << y: u8` (amount type ≠ value type) emitted only
+        // an audit note and NO obligation — so the over-shift went unchecked
+        // and the wrapper exited 0 ("verified") even though `y >= 32` panics:
+        // a fail-OPEN. Now a mixed-width shift FALLS THROUGH and emits the
+        // over-shift obligation at the VALUE width (`lhs_name`). Rust's
+        // over-shift check is `(amount as V) >= bits_of(V)` (unsigned, at the
+        // value width — verified against real MIR), so the amount (`rhs`) is
+        // constrained ONLY when modelling it at V is provably exact:
+        //   - a CONSTANT amount whose value FITS V is pinned to `(amount as
+        //     V)` by the const-pin below → `(bvuge rhs bits_V)` is the exact
+        //     check → safe constants discharge (`x << 4`), over-shifting
+        //     constants stay `sat`;
+        //   - otherwise (variable amount, or a constant that does NOT fit V
+        //     and would truncate under the pin, hiding a real over-shift) the
+        //     amount is left FREE → `(bvuge rhs bits_V)` is `sat` → the
+        //     obligation does NOT discharge → fail CLOSED (exit 1).
+        // Fully discharging a VARIABLE mixed-width amount (modelling it at its
+        // own width with zero/sign-extend) is the tracked follow-up.
+        let is_shift =
+            matches!(arith_op, crate::vc::ArithOp::Shl | crate::vc::ArithOp::Shr);
+        let mixed_width_shift = lhs_name != rhs_name && is_shift;
+        if lhs_name != rhs_name && !is_shift {
+            // Add/Sub/Mul/Div/Rem with differing operand types is
+            // unreachable in well-formed MIR post-coercion; surface the
+            // anomaly rather than emit a malformed same-sort problem.
+            self.audit_note(
+                span,
                 format!(
                     "PB049: BinaryOp {arith_op:?} skipped — operand types \
                      differ ({lhs_name} vs {rhs_name}). Should be unreachable \
-                     in well-formed MIR post-coercion; if you see this \
-                     note, the visitor encountered an unusual lowering and \
-                     the gap is worth investigating.",
-                )
-            };
-            self.audit_note(span, note);
+                     in well-formed MIR post-coercion; if you see this note, \
+                     the visitor encountered an unusual lowering and the gap \
+                     is worth investigating.",
+                ),
+            );
             return;
         }
         // O.2.5: pin constant-operand values into the SMT problem.
@@ -1529,6 +1534,19 @@ impl<'cfg> SubsetVisitor<'cfg> {
         for (label, op) in [("lhs", lhs), ("rhs", rhs)] {
             if let Operand::Constant(c) = op {
                 if let Some(value) = c.value {
+                    // #25: for a mixed-width shift, pin the AMOUNT (rhs) ONLY
+                    // when its value fits the value type V — then the pin
+                    // renders `(amount as V)` exactly. A non-fitting value
+                    // would truncate under the pin (e.g. `u8 << 256` → 0) and
+                    // hide a real over-shift, so leave it free (→ sat → fail
+                    // closed) instead. (Same-width shifts and Add/Sub/… are
+                    // unaffected: `mixed_width_shift` is false for them.)
+                    if mixed_width_shift
+                        && label == "rhs"
+                        && !crate::predicate::value_fits_in_int_ty(value, &lhs_name)
+                    {
+                        continue;
+                    }
                     if let Some(assertion) =
                         crate::predicate::operand_pin_assertion(label, value, &lhs_name)
                     {
@@ -1557,7 +1575,18 @@ impl<'cfg> SubsetVisitor<'cfg> {
         //      the raw string verbatim. That preserves O.1's
         //      raw-SMT-LIB escape hatch.
         let lhs_arg = self.operand_arg_name(lhs);
-        let rhs_arg = self.operand_arg_name(rhs);
+        // #25: for a mixed-width shift, do NOT bind preconditions to the
+        // amount (rhs) — its real width differs from the value width V we
+        // model it at, so a precondition bound at V width could be mis-sized.
+        // Leaving rhs unbound keeps a variable mixed-width amount FREE, so the
+        // over-shift obligation cannot vacuously discharge (fail closed). A
+        // sound variable-amount encoding (at the amount's own width) is the
+        // tracked follow-up.
+        let rhs_arg = if mixed_width_shift {
+            None
+        } else {
+            self.operand_arg_name(rhs)
+        };
         // Process each precondition through three potential paths,
         // recording a specific audit note for each rejection so
         // the auditor sees WHY a given assumption was dropped:
@@ -4904,12 +4933,16 @@ mod tests {
             "`!a` (Not) must emit no obligation; got {:?}", report2.vc_obligations,
         );
     }
-    /// Task R: a mixed-width shift (`u32 << u8`) cannot be encoded
-    /// as a same-sort BV problem, so it emits NO obligation but
-    /// surfaces an explicit "mixed-width shift" audit note (no
-    /// silent skip). Pins the audit-safe fallback.
+    /// #25 (2026-06-14): a VARIABLE mixed-width shift (`u32 << u8`) is no
+    /// longer a silent pass. Pre-fix it emitted NO obligation + an audit
+    /// note, so the over-shift went unchecked and the wrapper exited 0
+    /// (fail-OPEN). Now it emits the over-shift obligation at the VALUE
+    /// width (`u32`) with the amount LEFT FREE (no rhs-constraining
+    /// assumption), so `(bvuge rhs bits_V)` is `sat` → the obligation does
+    /// NOT discharge → fail CLOSED. (A constant amount fitting V discharges;
+    /// see `mixed_width_const_shift_pins_only_when_value_fits`.)
     #[test]
-    fn mixed_width_shift_audit_notes_no_obligation() {
+    fn mixed_width_variable_shift_emits_freed_obligation_fail_closed() {
         use crate::mir_api::{BinOp, UintTy};
         let cfg = SubsetConfig::default_for_test();
         let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
@@ -4945,16 +4978,109 @@ mod tests {
         };
         v.visit_body(&body, false);
         let report = v.into_report();
-        assert!(
-            report.vc_obligations.is_empty(),
-            "mixed-width shift must emit no obligation; got {:?}",
+        assert_eq!(
+            report.vc_obligations.len(),
+            1,
+            "variable mixed-width shift must now emit one over-shift obligation \
+             (fail-closed), not skip it; got {:?}",
             report.vc_obligations,
         );
+        let crate::vc::VcObligationKind::ArithmeticOverflow { op, ty_name } =
+            &report.vc_obligations[0].kind
+        else {
+            panic!("expected ArithmeticOverflow; got {:?}", report.vc_obligations[0].kind);
+        };
+        assert_eq!(*op, crate::vc::ArithOp::Shl);
+        assert_eq!(ty_name, "u32", "obligation must be at the VALUE width");
+        // The amount (rhs) is LEFT FREE — no rhs-constraining assumption —
+        // so the obligation cannot vacuously discharge (fail closed).
         assert!(
-            report.audit_notes.iter().any(|n| n.message.contains("mixed-width shift")),
-            "mixed-width shift must surface an explicit audit note; got: {:?}",
+            !report.vc_obligations[0]
+                .assumptions
+                .iter()
+                .any(|a| a.contains("rhs")),
+            "variable mixed-width amount must be left free (no rhs assumption); \
+             got: {:?}",
+            report.vc_obligations[0].assumptions,
+        );
+        // The old exit-0 "mixed-width shift skipped" audit note is gone.
+        assert!(
+            !report.audit_notes.iter().any(|n| n.message.contains("mixed-width shift")),
+            "the old mixed-width-skip audit note must be gone; got: {:?}",
             report.audit_notes,
         );
+    }
+    /// #25: a mixed-width shift with a CONSTANT amount that FITS the value
+    /// type pins the amount to `(amount as V)` at the VALUE width, so the
+    /// over-shift obligation is Rust's exact check (`x: u32 << 4` → rhs
+    /// pinned to 4 at u32 → discharges). A constant that does NOT fit V is
+    /// left FREE (→ fail closed), never pinned to a truncated value.
+    #[test]
+    fn mixed_width_const_shift_pins_only_when_value_fits() {
+        use crate::mir_api::{BinOp, IntTy, UintTy};
+        let cfg = SubsetConfig::default_for_test();
+        let u32_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let u8_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U8)) };
+        let i32_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Int(IntTy::I32)) };
+        let const_op = |val: i128, ty: Ty| {
+            Operand::Constant(ConstOperand { ty, def_id: None, path: None, value: Some(val) })
+        };
+        // (value_ty, amount, amount_ty, expected rhs pin literal or None)
+        let cases: Vec<(Ty, i128, Ty, Option<&str>, &str)> = vec![
+            (u32_ty(), 4, i32_ty(), Some("#x00000004"), "u32 << 4_i32 fits → pin (4 as u32)"),
+            (u8_ty(), 4, i32_ty(), Some("#x04"), "u8 << 4_i32 fits → pin (4 as u8)"),
+            (u8_ty(), 256, i32_ty(), None, "u8 << 256_i32 does NOT fit u8 → free (fail closed)"),
+        ];
+        for (value_ty, amount, amount_ty, expect_pin, label) in cases {
+            let mut v = SubsetVisitor::new(&cfg);
+            let body = Body {
+                def_id: DefId(0),
+                arg_tys: vec![value_ty.clone()],
+                arg_names: vec!["x".into()],
+                return_ty: value_ty.clone(),
+                is_unsafe: false,
+                is_async: false,
+                locals: vec![
+                    LocalDecl { ty: value_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                    LocalDecl { ty: value_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                ],
+                blocks: vec![BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Shl,
+                                Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                                const_op(amount, amount_ty.clone()),
+                            ),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator { kind: TerminatorKind::Return, span: Span::default() },
+                }],
+                span: Span::default(),
+            };
+            v.visit_body(&body, false);
+            let report = v.into_report();
+            assert_eq!(
+                report.vc_obligations.len(), 1,
+                "{label}: must emit one obligation; got {:?}",
+                report.vc_obligations,
+            );
+            let assumptions = &report.vc_obligations[0].assumptions;
+            let rhs_pin = assumptions.iter().find(|a| a.contains("rhs"));
+            match expect_pin {
+                Some(lit) => assert!(
+                    rhs_pin.is_some_and(|a| a.contains(lit)),
+                    "{label}: expected rhs pinned to {lit} (= amount as V); got {assumptions:?}",
+                ),
+                None => assert!(
+                    rhs_pin.is_none(),
+                    "{label}: amount must be FREE (no rhs pin) — pinning a \
+                     truncated value would hide a real over-shift; got {assumptions:?}",
+                ),
+            }
+        }
     }
     /// M-1 positive control: a body WITH a Return terminator and an
     /// ensures emits the PB076 obligation and does NOT surface the

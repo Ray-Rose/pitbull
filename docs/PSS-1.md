@@ -1596,6 +1596,32 @@ the std form and now also matches. No shadow type changes.
   `verify_roots` narrowing — the #27 drop-glue follow-up (`callee_paths`
   tracks `Call`, not `Drop`, terminators); with the default empty
   `verify_roots` (full-crate walk) every drop body is walked.
+- ✅ #25 mixed-width over-shift discharge + fail-open fix (2026-06-14). A
+  shift whose amount type differs from the value type (`x: u32 << 4` — the
+  literal `4` is i32; or `x: u32 << y: u8`) previously emitted ONLY an audit
+  note and NO obligation, so the over-shift went unchecked and the wrapper
+  exited 0 ("verified") even for an over-shifting amount — a latent
+  FAIL-OPEN (verified empirically). Now a mixed-width shift emits the
+  over-shift obligation at the VALUE width. Rust's over-shift check is
+  `(amount as V) >= bits_of(V)` (unsigned, value width — confirmed against
+  real MIR), so the amount is constrained ONLY when modelling it at V is
+  exact: a CONSTANT amount whose value FITS V is pinned to `(amount as V)`
+  (so `x << 4` DISCHARGES with a solver; an over-shifting constant stays
+  `sat`); otherwise (variable amount, or a constant that does NOT fit V and
+  would truncate under the pin — e.g. `u8 << 256` → 0 — hiding a real
+  over-shift) the amount is left FREE → `(bvuge rhs bits_V)` is `sat` → the
+  obligation does NOT discharge → FAIL CLOSED (exit 1). This both closes the
+  fail-open and adds discharge for the headline `x << N`. The soundness
+  pivot — never pin a truncated value — reuses `predicate::value_fits_in_int_ty`
+  (the PB051 gate). Pinned by
+  `visitor::mixed_width_const_shift_pins_only_when_value_fits`,
+  `visitor::mixed_width_variable_shift_emits_freed_obligation_fail_closed`,
+  and e2e `mixed_width_const_shift_emits_obligation_not_silent_pass`.
+  REMAINING (tracked): fully DISCHARGING a VARIABLE mixed-width amount under
+  a precondition needs modelling the amount at its own width
+  (zero/sign-extend) — today such a shift fails closed (undischarged)
+  rather than discharging. Supersedes the Task R "mixed-width shift audit
+  note" follow-up.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

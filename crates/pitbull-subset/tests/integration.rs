@@ -2734,3 +2734,51 @@ fn ffi_constructs_fire_pb056_pb057_pb058() {
         "FFI constructs must FAIL CLOSED (exit 1); stderr:\n{stderr}",
     );
 }
+/// #25 (2026-06-14): a mixed-width shift `x: u32 << 4` (the literal `4` is
+/// i32, so value type ≠ amount type) previously emitted only an audit note
+/// and exited 0 — a fail-OPEN, since the over-shift went unchecked. It now
+/// emits a real PB049 over-shift obligation (the amount pinned to
+/// `(4 as u32)` at the value width), so without a solver it is undischarged
+/// → exit 1 (fail closed), and WITH a solver it discharges (`(bvuge 4 32)`
+/// is unsat). This pins the solver-independent property: a real obligation
+/// exists and an undischarged one fails closed (no more silent exit-0).
+#[test]
+fn mixed_width_const_shift_emits_obligation_not_silent_pass() {
+    let Some(env) = E2eEnv::probe() else {
+        let require = std::env::var_os("PITBULL_REQUIRE_E2E").is_some();
+        if require {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("mixed_width_const_shift_emits_obligation_not_silent_pass: SKIPPED — prerequisites missing.");
+        return;
+    };
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut src = std::env::temp_dir();
+    src.push(format!("pitbull-25-{}-{}.rs", std::process::id(), counter));
+    fs::write(&src, "pub fn f(x: u32) -> u32 { x << 4 }\n").expect("write #25 probe");
+    let result = run_one_corpus_file_full(&env, &src, &[]);
+    let _ = fs::remove_file(&src);
+    let (stderr, code) = result.expect("wrapper should run");
+    // A real over-shift obligation now exists (was a silent audit-note skip).
+    assert!(
+        stderr.contains("pb049-shl"),
+        "x << 4 must emit a PB049 over-shift obligation (was a silent \
+         audit-note skip); stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.to_lowercase().contains("mixed-width shift"),
+        "the old mixed-width-skip audit note must be gone; stderr:\n{stderr}",
+    );
+    // Fail-closed without a solver: an undischarged obligation must drive a
+    // nonzero exit — the OLD behavior was a silent exit 0 with only a note.
+    // (With z3+cvc5 installed it discharges and exits 0; both are correct —
+    // the regression being pinned is "no longer a silent exit-0 pass".)
+    if stderr.contains("undischarged") {
+        assert_eq!(
+            code,
+            Some(1),
+            "x << 4 with no solver must FAIL CLOSED (exit 1), not silently \
+             exit 0; stderr:\n{stderr}",
+        );
+    }
+}
