@@ -1641,6 +1641,23 @@ the std form and now also matches. No shadow type changes.
   and e2e `mixed_width_unsigned_amount_binds_precondition`. REMAINING: the
   signed / wider-amount cases need modelling the amount at its OWN width
   (zero/sign-extend + its own declaration); today they fail closed.
+- ✅ #27 drop-glue residual closed (2026-06-14). The #27 reachability check
+  tracked `Call` terminators only, so a `Drop::drop` reached via IMPLICIT
+  drop-glue (a `Drop` terminator) under `verify_roots` narrowing could go
+  unwalked AND unflagged — a (possibly panicking) drop slipping through to
+  exit 0. Now every LOCAL `Drop` impl method (identified via its parent
+  impl's trait ref == the `Drop` lang item — `trait_of_assoc` does NOT
+  resolve impl methods, so the impl's `impl_opt_trait_ref` is used, guarded
+  by a `DefKind::Impl { of_trait: true }` check) is added to the
+  reachable-callee set, so narrowing that leaves it unwalked is flagged
+  fail-closed (exit 1). Conservative (a local Drop impl is treated as
+  reachable even if no walked root provably drops that type) but sound, and
+  Drop impls are rare; the default empty-`verify_roots` (full-crate) walk
+  verifies every drop body unchanged. Verified e2e: a root dropping a
+  custom-`Drop` value under `verify_roots=[root]` flags
+  `<D as Drop>::drop` and exits 1 (was exit 0). Pinned by
+  `drop_glue_under_narrowing_fails_closed`. This was the last
+  fail-closed-under-narrowing residual from #27.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

@@ -426,6 +426,41 @@ impl PitbullCallbacks {
                     // correctly absent from the universe.)
                     if item.has_body() {
                         local_fn_universe.insert(item_path.clone());
+                        // #27 drop-glue (2026-06-14): a `Drop::drop` impl is
+                        // invoked via IMPLICIT drop-glue (a `Drop` terminator,
+                        // not a `Call`), so the Call-based callee tracking below
+                        // never references it — under verify_roots narrowing an
+                        // unwalked, panicking drop would slip through. Drop glue
+                        // can run wherever a value of the type leaves scope, so
+                        // treat every local Drop impl as a reachable callee: add
+                        // it to `referenced_callees` so the post-loop #27 check
+                        // flags it (fail closed) if narrowing left it unwalked.
+                        // Conservative (flags a local Drop impl even if no
+                        // walked root provably drops that type) but sound, and
+                        // Drop impls are rare. `internal()` is the id conversion
+                        // (safe on any def_id); `trait_of_assoc` is safe too.
+                        let drop_id = rustc_public::rustc_internal::internal(
+                            tcx,
+                            item.def_id(),
+                        );
+                        // A Drop-impl method's PARENT is its `impl` block; if
+                        // that impl is a TRAIT impl of `Drop`, this fn is a
+                        // `Drop::drop`. (`trait_of_assoc` only resolves trait
+                        // DECLARATION items, not impl methods — it returns None
+                        // here — so use the impl's trait ref.) The `def_kind`
+                        // guard keeps `impl_opt_trait_ref` from panicking on a
+                        // non-impl parent (free fns, inherent-impl methods).
+                        let parent = tcx.parent(drop_id);
+                        let is_drop_impl = matches!(
+                            tcx.def_kind(parent),
+                            rustc_hir::def::DefKind::Impl { of_trait: true }
+                        ) && tcx
+                            .impl_opt_trait_ref(parent)
+                            .map(|tr| tr.skip_binder().def_id)
+                            == tcx.lang_items().drop_trait();
+                        if is_drop_impl {
+                            referenced_callees.insert(item_path.clone());
+                        }
                     }
                     let matches_root = verify_roots.is_empty()
                         || verify_roots

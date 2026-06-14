@@ -2839,3 +2839,58 @@ fn mixed_width_unsigned_amount_binds_precondition() {
          `[N assumption]` obligation); stderr:\n{stderr}",
     );
 }
+/// #27 drop-glue (2026-06-14): a `Drop::drop` impl is invoked via IMPLICIT
+/// drop-glue (a `Drop` terminator, not a `Call`), so the Call-based #27
+/// reachability check missed it — under `verify_roots` narrowing a root
+/// that drops a custom-`Drop` value could leave that (possibly panicking)
+/// drop unverified yet exit 0. Now every local Drop impl is treated as a
+/// reachable callee, so narrowing that leaves it unwalked is flagged and
+/// fails closed.
+#[test]
+fn drop_glue_under_narrowing_fails_closed() {
+    let Some(env) = E2eEnv::probe() else {
+        let require = std::env::var_os("PITBULL_REQUIRE_E2E").is_some();
+        if require {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("drop_glue_under_narrowing_fails_closed: SKIPPED — prerequisites missing.");
+        return;
+    };
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut src = std::env::temp_dir();
+    src.push(format!("pitbull-27drop-{}-{}.rs", std::process::id(), counter));
+    fs::write(
+        &src,
+        "pub struct D;\n\
+         impl Drop for D { fn drop(&mut self) {} }\n\
+         pub fn root() -> u32 { let _d = D; 0 }\n",
+    )
+    .expect("write drop-glue probe");
+    let mut cfg = std::env::temp_dir();
+    cfg.push(format!("pitbull-27drop-{}-{}.toml", std::process::id(), counter));
+    // verify_roots matches `root` (which drops D) but NOT D's drop impl.
+    fs::write(
+        &cfg,
+        "[project]\n\
+         name = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         [reachability]\n\
+         verify_roots = [\"corpus_test::root\"]\n",
+    )
+    .expect("write drop-glue pitbull.toml");
+    let result = run_one_corpus_file_full(&env, &src, &[("PITBULL_TOML", cfg.as_os_str())]);
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&cfg);
+    let (stderr, code) = result.expect("wrapper should run");
+    assert!(
+        stderr.contains("PB-reachability") && stderr.contains("drop"),
+        "the Drop impl reached via drop-glue must be flagged under narrowing; \
+         stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "an unverified drop reached via drop-glue must FAIL CLOSED (exit 1); \
+         stderr:\n{stderr}",
+    );
+}
