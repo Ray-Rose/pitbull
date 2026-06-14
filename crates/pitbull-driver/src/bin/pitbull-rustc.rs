@@ -96,6 +96,62 @@ extern crate rustc_middle;
 extern crate rustc_public;
 #[cfg(rustc_public_real)]
 extern crate rustc_span;
+/// Decide the wrapper's process exit code from rustc's own exit code and
+/// Pitbull's findings. Pure + lane-agnostic so it is unit-testable on
+/// stable (the rest of the wrapper is nightly-only behind
+/// `rustc_public_real`).
+///
+/// Fail-closed policy (red-team F10 + bridge-failure audit 2026-06-14):
+///   - rustc's own failure always propagates — compiler errors win.
+///   - a bridge/analysis failure (the subset check could not run at all)
+///     yields exit 2: we must NEVER report "verified" when no analysis
+///     happened, even off a clean rustc compile with zero findings.
+///   - subset violations OR undischarged obligations yield exit 1.
+///   - otherwise exit 0 (clean verification).
+#[cfg(any(rustc_public_real, test))]
+fn decide_pitbull_exit_code(
+    rustc_exit_code: i32,
+    violations: usize,
+    undischarged_obligations: usize,
+    bridge_failed: bool,
+) -> i32 {
+    let pitbull_exit_code = if bridge_failed {
+        2
+    } else if violations > 0 || undischarged_obligations > 0 {
+        1
+    } else {
+        0
+    };
+    rustc_exit_code.max(pitbull_exit_code)
+}
+#[cfg(test)]
+mod exit_code_tests {
+    use super::decide_pitbull_exit_code;
+    #[test]
+    fn clean_verification_is_zero() {
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, false), 0);
+    }
+    #[test]
+    fn violations_or_undischarged_is_one() {
+        assert_eq!(decide_pitbull_exit_code(0, 1, 0, false), 1);
+        assert_eq!(decide_pitbull_exit_code(0, 0, 1, false), 1);
+        assert_eq!(decide_pitbull_exit_code(0, 7, 3, false), 1);
+    }
+    /// CRITICAL fail-open regression (audit 2026-06-14): if the
+    /// rustc_public bridge fails, the subset check never runs and the
+    /// finding counters stay 0 — but the wrapper must STILL fail closed,
+    /// never exit 0 ("verified") off a clean rustc compile.
+    #[test]
+    fn bridge_failure_never_reports_verified() {
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, true), 2);
+        assert_ne!(decide_pitbull_exit_code(0, 0, 0, true), 0);
+    }
+    #[test]
+    fn rustc_failure_takes_precedence() {
+        assert_eq!(decide_pitbull_exit_code(101, 0, 0, false), 101);
+        assert_eq!(decide_pitbull_exit_code(101, 5, 5, true), 101);
+    }
+}
 #[cfg(rustc_public_real)]
 fn main() {
     // Cargo invokes a `RUSTC_WORKSPACE_WRAPPER` binary as
@@ -161,14 +217,15 @@ fn main() {
     // "subset-violation vs. undischarged-obligation" lives in
     // the cargo subcommand's report rendering, not the wrapper's
     // exit status.
-    let pitbull_exit_code = if callbacks.violations > 0
-        || callbacks.undischarged_obligations > 0
-    {
-        1
-    } else {
-        0
-    };
-    std::process::exit(rustc_exit_code.max(pitbull_exit_code));
+    // Fail-closed exit code (F10 + bridge-failure audit 2026-06-14):
+    // a bridge failure (analysis could not run) must never be reportable
+    // as "verified". See `decide_pitbull_exit_code`.
+    std::process::exit(decide_pitbull_exit_code(
+        rustc_exit_code,
+        callbacks.violations,
+        callbacks.undischarged_obligations,
+        callbacks.bridge_failed,
+    ));
 }
 /// Pitbull's rustc_driver callback. State lives across compile units
 /// when invoked per-crate; for the v0.2 scaffold we accumulate counts
@@ -195,6 +252,12 @@ struct PitbullCallbacks {
     /// `violations` to determine the wrapper's exit code per the
     /// F10 audit fix.
     undischarged_obligations: usize,
+    /// Set when the rustc_public bridge (`rustc_internal::run`) returns
+    /// `Err` — i.e. the subset check could not run at all. Forces a
+    /// fail-closed nonzero exit so a clean rustc compile is NEVER
+    /// reported as "verified" when no analysis actually happened
+    /// (audit 2026-06-14, CRITICAL fail-open: bridge failure → exit 0).
+    bridge_failed: bool,
 }
 #[cfg(rustc_public_real)]
 impl rustc_driver::Callbacks for PitbullCallbacks {
@@ -216,7 +279,13 @@ impl rustc_driver::Callbacks for PitbullCallbacks {
             self.run_pitbull_subset_check(tcx);
         });
         if let Err(e) = result {
+            // Fail closed: the bridge into rustc_public never ran the
+            // subset check, so the finding counters are meaningless
+            // (still 0). Mark the failure so the exit code can never
+            // report "verified" off a clean rustc compile (audit
+            // 2026-06-14, CRITICAL fail-open).
             eprintln!("pitbull-rustc: rustc_public bridge failed: {e:?}");
+            self.bridge_failed = true;
         }
         // Report a per-crate summary on stderr so the user sees what
         // happened. The driver-side cargo-pitbull command wraps this in

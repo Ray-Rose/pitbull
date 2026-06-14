@@ -318,7 +318,9 @@ impl SubsetConfig {
     ///
     /// Project-level rules surfaced here:
     /// - PB048 panic strategy
-    /// - PB049 overflow-checks (checked by the driver against profile flags)
+    /// - PB049 overflow-checks: NOT yet enforced (the driver does not yet
+    ///   inspect the build profile's `overflow-checks` flag) — see note
+    ///   at the end of `validate`
     /// - PB068 trust budget shape (range, not actual ratio)
     /// - PB071–PB075 project hygiene
     #[must_use]
@@ -401,7 +403,14 @@ impl SubsetConfig {
         // PB073: hermetic environment is checked by the driver.
         // PB074: pitbull-spec version match is checked by the driver.
         // PB075: cache signing key existence is checked at use time.
-        let _ = (PB049, PB072, PB073, PB074, PB075); // referenced for grep; checked elsewhere
+        // PB049 (overflow-checks): NOT yet enforced anywhere — neither here
+        // nor in the driver, which does not yet inspect the build profile's
+        // `overflow-checks`/`-C overflow-checks` flag. Tracked follow-up.
+        // This is a hygiene-policy gap, not a soundness hole: Pitbull
+        // proves absence of overflow via its own PB049 VC obligations
+        // regardless of the runtime flag, and any undischarged obligation
+        // already forces a nonzero exit.
+        let _ = (PB049, PB072, PB073, PB074, PB075); // referenced for grep
         errors
     }
     /// Test-only convenience constructor.

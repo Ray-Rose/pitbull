@@ -1099,9 +1099,14 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 // obligation enforced by the VC generator, not a subset
                 // rejection.
             }
-            // PB053: `char` is accepted as a value but cannot appear in
-            // arithmetic position. We accept here; the BinaryOp visitor
-            // catches char-arithmetic if it occurs.
+            // PB053: `char` is accepted as a value type. Char arithmetic
+            // is not expressible in safe Rust (`char` implements no
+            // `Add`/`Sub`/… ), and char comparisons lower to total `BinOp`
+            // ops that cannot panic or overflow — so there is no MIR
+            // operation here to reject. PB053 is reserved; no per-construct
+            // check is wired because none is reachable through safe Rust.
+            // (Earlier comment claimed the BinaryOp visitor catches
+            // char-arithmetic; it does not — corrected 2026-06-14 audit.)
             RigidTy::Char => {}
             // PB050: any float type.
             RigidTy::Float(width) => {

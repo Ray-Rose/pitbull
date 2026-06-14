@@ -1506,6 +1506,27 @@ the std form and now also matches. No shadow type changes.
   "mixed-width shift" audit note (tracked separately under Task R);
   same-type shifts (`i32 >> 4`, `u32 << y`) emit their PB049 over-shift
   obligation as before.
+- ✅ CRITICAL fail-open fixed — a bridge failure could exit 0 "verified"
+  (full-codebase audit 2026-06-14). In `pitbull-rustc`'s `after_analysis`,
+  if `rustc_public::rustc_internal::run` returned `Err`, the error was
+  only printed: the subset check never ran, the finding counters stayed
+  at their `Default` 0, and a clean rustc compile then yielded
+  `rustc_exit.max(0) == 0` — the process reported "verified" having
+  performed NO analysis. Fix: a `bridge_failed` flag set in the `Err`
+  arm forces a fail-closed exit 2 (analysis-could-not-run ranks above
+  "verification failed"). The exit-code decision was extracted into a
+  pure, lane-agnostic `decide_pitbull_exit_code` and pinned by four
+  stable unit tests, incl. `bridge_failure_never_reports_verified`. The
+  same 4-agent audit confirmed (and I re-verified) that the adapter
+  type-mapping is compile-error-on-unknown (the `_ =>` arms forward to
+  exhaustive sub-matches, never a silent benign map), the wrapper's
+  `is_unsafe`/`is_async` override makes PB002/PB026 fire on real MIR,
+  and the pitbull-vc discharge / agreement-gate / certificate paths are
+  fail-closed — no other fail-open found. Doc-honesty cleanups: PB049
+  overflow-checks config policy is now documented as NOT yet enforced
+  (was mislabeled "checked by the driver"); the PB053 `char` comment no
+  longer claims a char-arithmetic check that does not exist (and is not
+  expressible in safe Rust).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
