@@ -64,6 +64,7 @@ use crate::config::SubsetConfig;
 use crate::diagnostic::SubsetReport;
 use crate::mir_api::{Body, DefId, Span, Ty};
 use crate::visitor::SubsetVisitor;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 /// What kind of item appears in the reachability graph.
 ///
@@ -289,6 +290,154 @@ pub fn unverified_reachable_callees(
         .collect();
     out.sort();
     out
+}
+/// Per-crate reachability manifest, emitted by the `pitbull-rustc`
+/// wrapper (one JSON file per compiled crate, into `PITBULL_REACH_DIR`)
+/// and aggregated by `cargo pitbull check` to close the CROSS-crate
+/// reachability hole.
+///
+/// The per-crate `#27` gate ([`unverified_reachable_callees`]) only sees
+/// the crate it is compiling — its `local_universe` is that crate's items
+/// alone. So a verified root in crate A that calls into workspace crate B
+/// is invisible to A's gate (B's path isn't in A's universe), and if B's
+/// OWN run narrowed `verify_roots` so as to skip that entry, B's gate
+/// doesn't flag it either (nothing B walked referenced it). Neither crate
+/// catches it — a cross-crate false-"verified". Aggregating these
+/// manifests across the whole `cargo check` lets the subcommand verify the
+/// WHOLE-workspace closure (see [`cross_crate_unverified`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReachManifest {
+    /// The crate this manifest is for, as it appears in fully-qualified
+    /// item paths (the crate name with `-` normalized to `_`, e.g.
+    /// `pitbull_subset`).
+    pub crate_name: String,
+    /// Fully-qualified paths of fns actually walked (verified) this run.
+    pub walked: Vec<String>,
+    /// Direct callees referenced by walked, non-trusted bodies (union of
+    /// [`callee_paths`]) plus the local `Drop::drop` impls.
+    pub referenced: Vec<String>,
+    /// Paths the user marked `#[pitbull::trusted]` (the user takes
+    /// responsibility for these and their callees).
+    pub trusted: Vec<String>,
+}
+/// The crate segment of a fully-qualified item path — the text before the
+/// first `::`. `"crate_b::module::foo"` → `"crate_b"`; a bare `"foo"` →
+/// `"foo"`. Used to decide whether a referenced callee belongs to a
+/// workspace member (and so MUST be covered by some crate's run) versus an
+/// external crate (std/registry dep — trusted, see SAFETY-MANUAL §3.6).
+#[must_use]
+pub fn crate_of_path(path: &str) -> &str {
+    match path.split_once("::") {
+        Some((krate, _)) => krate,
+        None => path,
+    }
+}
+/// Cross-crate reachability gate — [`unverified_reachable_callees`] lifted
+/// to the whole workspace.
+///
+/// Returns the WORKSPACE-MEMBER callees that NO crate's run verified: a
+/// path referenced by some manifest whose crate is a workspace member
+/// (`workspace_crates`) but which appears in NO manifest's `walked` or
+/// `trusted` set. Non-workspace callees (std/core/alloc, registry deps)
+/// are the trusted surface and are intentionally excluded — modelling them
+/// is the prelude's job (SAFETY-MANUAL §3.4 / §3.6).
+///
+/// A clean (empty) result means every workspace-member function reachable
+/// from a verified root ANYWHERE in the build was itself verified — so a
+/// whole-workspace "verified" verdict cannot rest on an unverified member
+/// function, even across crate boundaries. With every crate at the default
+/// empty `verify_roots` (full walk) this is trivially empty; it only fires
+/// when `verify_roots` narrowing in some crate left a cross-crate-reachable
+/// member uncovered. Sorted + deduped for deterministic diagnostics.
+///
+/// ## Warm-cache safety
+///
+/// A referenced member callee is hard-flagged ONLY when its OWNING crate
+/// was actually analyzed this run (it emitted a manifest). On a warm cargo
+/// cache, cargo may skip recompiling some crate, so the wrapper never runs
+/// for it and it emits no manifest; we must not flag that crate's callees
+/// as uncovered just because we have no record of them (a false positive on
+/// every incremental build). Those are INDETERMINATE — see
+/// [`cross_crate_indeterminate`] — and surfaced as a "run a clean build for
+/// complete cross-crate coverage" note rather than a hard failure. On a
+/// clean build (CI) every member is analyzed, so the gate is fully
+/// fail-closed; this mirrors the tool's existing whole-analysis posture
+/// (a warm cache already degrades the per-crate pass — SAFETY-MANUAL §3.6).
+#[must_use]
+pub fn cross_crate_unverified(
+    manifests: &[ReachManifest],
+    workspace_crates: &HashSet<String>,
+) -> Vec<String> {
+    let (covered, analyzed) = covered_and_analyzed(manifests);
+    let mut bad: Vec<String> = Vec::new();
+    for m in manifests {
+        for r in &m.referenced {
+            let owner = crate_of_path(r);
+            // External crates (std/registry deps) are the trusted boundary.
+            if !workspace_crates.contains(owner) {
+                continue;
+            }
+            // Verified (walked/trusted) by some crate's run → fine.
+            if covered.contains(r.as_str()) {
+                continue;
+            }
+            // Owner not analyzed this run (warm cache) → indeterminate, not
+            // a hard fail (avoids false positives on incremental builds).
+            if !analyzed.contains(owner) {
+                continue;
+            }
+            bad.push(r.clone());
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    bad
+}
+/// Companion to [`cross_crate_unverified`]: the workspace-member callees
+/// whose coverage is INDETERMINATE because their owning crate was not
+/// analyzed this run (cargo served it from a warm cache, so no manifest).
+/// These are not failures, but they mean the cross-crate verdict is
+/// incomplete — surface them as a "run a clean build" note. Sorted+deduped.
+#[must_use]
+pub fn cross_crate_indeterminate(
+    manifests: &[ReachManifest],
+    workspace_crates: &HashSet<String>,
+) -> Vec<String> {
+    let (covered, analyzed) = covered_and_analyzed(manifests);
+    let mut out: Vec<String> = Vec::new();
+    for m in manifests {
+        for r in &m.referenced {
+            let owner = crate_of_path(r);
+            if workspace_crates.contains(owner)
+                && !covered.contains(r.as_str())
+                && !analyzed.contains(owner)
+            {
+                out.push(r.clone());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+/// Shared pass over the manifests: `covered` = every path walked or trusted
+/// by any crate's run; `analyzed` = every crate that produced a manifest
+/// this run (by its declared name AND the crate segment of every path it
+/// walked, so a crate is "analyzed" even if it walked zero of its own fns).
+fn covered_and_analyzed(manifests: &[ReachManifest]) -> (HashSet<&str>, HashSet<&str>) {
+    let mut covered: HashSet<&str> = HashSet::new();
+    let mut analyzed: HashSet<&str> = HashSet::new();
+    for m in manifests {
+        analyzed.insert(m.crate_name.as_str());
+        for w in &m.walked {
+            covered.insert(w.as_str());
+            analyzed.insert(crate_of_path(w));
+        }
+        for t in &m.trusted {
+            covered.insert(t.as_str());
+        }
+    }
+    (covered, analyzed)
 }
 #[cfg(test)]
 mod tests {
@@ -589,5 +738,101 @@ mod tests {
             .is_empty(),
             "a walked callee must not be flagged"
         );
+    }
+    // ----- cross-crate aggregation (whole-workspace gate) --------------
+    fn manifest(name: &str, walked: &[&str], referenced: &[&str], trusted: &[&str]) -> ReachManifest {
+        let v = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        ReachManifest {
+            crate_name: name.into(),
+            walked: v(walked),
+            referenced: v(referenced),
+            trusted: v(trusted),
+        }
+    }
+    fn ws(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+    /// Flags a workspace-member callee that NO crate's run verified — the
+    /// cross-crate hole. crate_a's walked root calls crate_b::foo + std;
+    /// crate_b narrowed and walked nothing, so neither crate's local gate
+    /// catches foo.
+    #[test]
+    fn cross_crate_unverified_flags_member_callee_no_one_walked() {
+        let manifests = vec![
+            manifest("crate_a", &["crate_a::root"], &["crate_b::foo", "std::vec::Vec::new"], &[]),
+            manifest("crate_b", &[], &[], &[]),
+        ];
+        assert_eq!(
+            cross_crate_unverified(&manifests, &ws(&["crate_a", "crate_b"])),
+            vec!["crate_b::foo".to_string()],
+            "a workspace-member callee no crate walked/trusted must be flagged; \
+             the external std callee must NOT (trusted boundary)",
+        );
+    }
+    /// Clean when the member callee WAS walked by its owning crate's run.
+    #[test]
+    fn cross_crate_unverified_clean_when_member_walked_elsewhere() {
+        let manifests = vec![
+            manifest("crate_a", &["crate_a::root"], &["crate_b::foo"], &[]),
+            manifest("crate_b", &["crate_b::foo"], &[], &[]),
+        ];
+        assert!(
+            cross_crate_unverified(&manifests, &ws(&["crate_a", "crate_b"])).is_empty(),
+            "a member callee walked by its owning crate must clear the gate",
+        );
+    }
+    /// Trusting the member callee (in any crate's run) is an explicit opt-out.
+    #[test]
+    fn cross_crate_unverified_respects_trusted() {
+        let manifests = vec![
+            manifest("crate_a", &["crate_a::root"], &["crate_b::foo"], &[]),
+            manifest("crate_b", &[], &[], &["crate_b::foo"]),
+        ];
+        assert!(
+            cross_crate_unverified(&manifests, &ws(&["crate_a", "crate_b"])).is_empty(),
+            "a trusted member callee must not be flagged",
+        );
+    }
+    /// External (non-workspace) callees are the trusted boundary — never
+    /// flagged, even though no manifest walks them.
+    #[test]
+    fn cross_crate_unverified_ignores_external_callees() {
+        let manifests = vec![manifest(
+            "crate_a",
+            &["crate_a::root"],
+            &["core::option::Option::<u32>::unwrap", "some_dep::helper", "std::mem::swap"],
+            &[],
+        )];
+        assert!(
+            cross_crate_unverified(&manifests, &ws(&["crate_a"])).is_empty(),
+            "callees from non-workspace crates (std/deps) are trusted, never flagged",
+        );
+    }
+    /// Warm-cache safety: when the OWNING crate emitted no manifest (cargo
+    /// served it from cache), its uncovered callee is INDETERMINATE, not
+    /// hard-flagged — no false positive on incremental builds. Only
+    /// crate_a's manifest is present; crate_b (owner of foo) was not
+    /// analyzed this run.
+    #[test]
+    fn cross_crate_unverified_indeterminate_when_owner_not_analyzed() {
+        let manifests = vec![manifest("crate_a", &["crate_a::root"], &["crate_b::foo"], &[])];
+        let workspace = ws(&["crate_a", "crate_b"]);
+        assert!(
+            cross_crate_unverified(&manifests, &workspace).is_empty(),
+            "an uncovered callee whose owner wasn't analyzed must NOT hard-fail",
+        );
+        assert_eq!(
+            cross_crate_indeterminate(&manifests, &workspace),
+            vec!["crate_b::foo".to_string()],
+            "it must instead be reported as indeterminate (clean build needed)",
+        );
+    }
+    /// `crate_of_path` extracts the leading crate segment.
+    #[test]
+    fn crate_of_path_extracts_leading_segment() {
+        assert_eq!(crate_of_path("crate_b::module::foo"), "crate_b");
+        assert_eq!(crate_of_path("crate_b::<impl X>::foo"), "crate_b");
+        assert_eq!(crate_of_path("bare"), "bare");
+        assert_eq!(crate_of_path(""), "");
     }
 }

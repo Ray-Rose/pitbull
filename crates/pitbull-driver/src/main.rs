@@ -37,7 +37,8 @@
 #![forbid(unsafe_code)]
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[derive(Parser, Debug)]
 #[command(
@@ -134,6 +135,16 @@ fn run_check(cli: &Cli) -> Result<ExitCode> {
     // config on the user's own crate compile.
     let pitbull_toml_abs = std::fs::canonicalize(&cfg_path)
         .with_context(|| format!("canonicalizing {}", cfg_path.display()))?;
+    // Cross-crate reachability aggregation. Each per-crate wrapper run only
+    // sees its own crate (the #27 gate's universe is local), so a verified
+    // root that calls into another WORKSPACE crate whose own verify_roots
+    // narrowing skipped that entry slips past both crates' local gates. We
+    // have every wrapper run emit a reachability manifest into a fresh dir,
+    // then verify the WHOLE-workspace closure here (SAFETY-MANUAL §3.6).
+    let manifest_dir = std::env::temp_dir().join(format!("pitbull-reach-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&manifest_dir); // clear any stale run
+    std::fs::create_dir_all(&manifest_dir)
+        .with_context(|| format!("creating reachability manifest dir {}", manifest_dir.display()))?;
     eprintln!("pitbull check: invoking cargo check with RUSTC_WORKSPACE_WRAPPER={}", wrapper.display());
     eprintln!("pitbull check: PITBULL_TOML={}", pitbull_toml_abs.display());
     let status = std::process::Command::new("cargo")
@@ -141,18 +152,141 @@ fn run_check(cli: &Cli) -> Result<ExitCode> {
         .arg("--all-targets")
         .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
         .env("PITBULL_TOML", &pitbull_toml_abs)
+        .env("PITBULL_REACH_DIR", &manifest_dir)
         .status()
         .context("spawning `cargo check` with pitbull-rustc as the rustc wrapper")?;
-    if status.success() {
+    // Aggregate the per-crate manifests into the whole-workspace gate. This
+    // is best-effort: if cargo metadata or the manifests can't be read we
+    // warn and fall back to the per-crate verdict (cargo's exit status),
+    // never silently claiming a stronger guarantee than we verified.
+    let cross_crate_failed = run_cross_crate_gate(&manifest_dir);
+    let _ = std::fs::remove_dir_all(&manifest_dir);
+    if status.success() && !cross_crate_failed {
         eprintln!("pitbull check: configuration OK; analysis pass exited cleanly");
         Ok(ExitCode::from(0))
     } else {
-        // Exit code 1 = subset violations / analysis failures.
-        // Exit code 2+ = wrapper not yet active (stub mode), or compile
-        // failure unrelated to Pitbull. We don't currently distinguish
-        // these — that's part of the next driver-wiring chunk.
+        // Exit code 1 = subset violations / analysis failures / a
+        // cross-crate reachability gap. Exit code 2+ = wrapper not yet
+        // active (stub mode), or compile failure unrelated to Pitbull. We
+        // don't currently distinguish these at the subcommand boundary.
         Ok(ExitCode::from(1))
     }
+}
+/// Read every per-crate reachability manifest, resolve the workspace member
+/// crate names, and run the whole-workspace cross-crate gate. Returns
+/// `true` iff a workspace-member callee reachable from a verified root was
+/// left unverified by EVERY crate's run (a fail-closed cross-crate gap).
+///
+/// Best-effort and fail-SAFE in the reporting direction: any failure to
+/// gather inputs (cargo metadata error, unreadable manifests) is a warning
+/// and returns `false` — the per-crate gates already ran inside the wrapper
+/// and contribute to cargo's exit status; this layer only ADDS the
+/// cross-crate check on top.
+fn run_cross_crate_gate(manifest_dir: &Path) -> bool {
+    let workspace = match workspace_crate_names() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!(
+                "pitbull check: WARNING: `cargo metadata` failed ({e:#}); skipping the \
+                 cross-crate reachability gate (per-crate gates still applied).",
+            );
+            return false;
+        }
+    };
+    let manifests = read_manifests(manifest_dir);
+    if manifests.is_empty() {
+        // No manifests: the nightly wrapper isn't active (stable stub), or
+        // cargo served everything from cache. Nothing to aggregate.
+        return false;
+    }
+    let unverified = pitbull_subset::reachability::cross_crate_unverified(&manifests, &workspace);
+    let indeterminate =
+        pitbull_subset::reachability::cross_crate_indeterminate(&manifests, &workspace);
+    for callee in &unverified {
+        eprintln!(
+            "pitbull check: CROSS-CRATE: workspace function `{callee}` is reachable from a \
+             verified root but was NOT verified by any crate's run (skipped by some crate's \
+             `verify_roots` narrowing). Add it to that crate's [reachability] verify_roots, \
+             leave verify_roots empty for full-crate coverage, or mark it \
+             #[pitbull::trusted]. Treating as unverified (fail-closed).",
+        );
+    }
+    if !indeterminate.is_empty() {
+        eprintln!(
+            "pitbull check: note: {} cross-crate callee(s) had INDETERMINATE coverage — their \
+             crate was served from a warm cargo cache and not re-analyzed this run, so the \
+             cross-crate verdict is incomplete. Run a clean build (e.g. `cargo clean`) for a \
+             complete whole-workspace cross-crate check.",
+            indeterminate.len(),
+        );
+    }
+    !unverified.is_empty()
+}
+/// Resolve the set of workspace-member crate names (as they appear in
+/// fully-qualified item paths: the package/target name with `-` normalized
+/// to `_`). Used by the cross-crate gate to tell a workspace-member callee
+/// (which MUST be verified by some crate's run) from an external one
+/// (std/registry dep — the trusted boundary).
+fn workspace_crate_names() -> Result<HashSet<String>> {
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()
+        .context("spawning `cargo metadata`")?;
+    if !out.status.success() {
+        anyhow::bail!("`cargo metadata` exited with status {}", out.status);
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("parsing `cargo metadata` JSON")?;
+    let mut names = HashSet::new();
+    if let Some(packages) = json["packages"].as_array() {
+        for pkg in packages {
+            if let Some(n) = pkg["name"].as_str() {
+                names.insert(n.replace('-', "_"));
+            }
+            // Target names are the actual crate names (a package may set a
+            // `[lib] name` different from the package name); collect those too.
+            if let Some(targets) = pkg["targets"].as_array() {
+                for t in targets {
+                    if let Some(tn) = t["name"].as_str() {
+                        names.insert(tn.replace('-', "_"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(names)
+}
+/// Read every `*.json` reachability manifest in `dir`. Unreadable or
+/// malformed files are skipped with a warning (a partial set only weakens
+/// the gate toward more INDETERMINATE entries, never a false discharge).
+fn read_manifests(dir: &Path) -> Vec<pitbull_subset::reachability::ReachManifest> {
+    let mut manifests = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return manifests,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                match serde_json::from_str::<pitbull_subset::reachability::ReachManifest>(&text) {
+                    Ok(m) => manifests.push(m),
+                    Err(e) => eprintln!(
+                        "pitbull check: WARNING: skipping malformed reachability manifest {}: {e}",
+                        path.display(),
+                    ),
+                }
+            }
+            Err(e) => eprintln!(
+                "pitbull check: WARNING: could not read reachability manifest {}: {e}",
+                path.display(),
+            ),
+        }
+    }
+    manifests
 }
 /// Find the pitbull-rustc wrapper binary path.
 ///

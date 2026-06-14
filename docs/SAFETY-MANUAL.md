@@ -126,15 +126,24 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
     audit, 2026-06-14). This list is the known-dangerous subset; other
     panicking library functions remain on the trusted side until the
     prelude models them.
-- **User obligation (multi-crate).** Because each crate is gated
-  independently, in a workspace you must ensure **every** member's
-  `verify_roots` jointly covers the reachable closure (or leave
-  `verify_roots` empty for full-crate coverage). A verified root in crate
-  A that calls into workspace crate B relies on B's *own* Pitbull run to
-  have verified that entry — the per-crate gate cannot see across the
-  crate boundary. Whole-workspace closure aggregation is tracked future
-  work; until then, **narrowing is a per-crate promise the operator must
-  make consistent across the build.**
+- **Cross-crate aggregation (whole-workspace gate).** Each crate's
+  per-crate `#27` gate only sees its own items, so on its own it cannot
+  tell whether a callee in *another* workspace crate was verified. To close
+  that, `cargo pitbull check` now has every wrapper run emit a reachability
+  manifest (its walked / referenced / trusted paths) into a shared dir and,
+  after the build, runs the **whole-workspace** gate
+  (`reachability::cross_crate_unverified`): a workspace-member function
+  referenced from a verified root anywhere in the build that NO crate's run
+  walked or trusted fails the check (exit 1). A verified root in crate A
+  calling workspace crate B's `foo` therefore requires *some* crate's run to
+  have verified `foo`, or the build fails closed — the per-crate boundary no
+  longer hides it. **Warm-cache caveat:** if cargo serves a crate from cache
+  (no recompile), that crate emits no manifest this run and its callees are
+  reported as INDETERMINATE rather than failed (so incremental builds don't
+  false-positive); run a clean build (`cargo clean`) for a complete
+  cross-crate verdict. Registry/non-workspace deps stay on the trusted side
+  (they are not workspace members, so the gate never demands their
+  coverage).
 ## 4. User obligations
 For the guarantee to hold:
 1. **Pin the toolchain** to one of `SUPPORTED_TOOLCHAINS`.

@@ -704,6 +704,65 @@ impl PitbullCallbacks {
                  (check for a typo, or that the function is reached and not excluded).",
             );
         }
+        // Cross-crate reachability manifest. When `PITBULL_REACH_DIR` is
+        // set (the `cargo pitbull check` subcommand sets it), write this
+        // crate's walked / referenced / trusted sets so the subcommand can
+        // verify the WHOLE-workspace reachability closure. The per-crate
+        // #27 gate above only sees the local crate (its `local_universe` is
+        // this crate's items alone), so a workspace-member callee reached
+        // ACROSS a crate boundary and skipped by the callee crate's own
+        // `verify_roots` narrowing would otherwise slip past both crates'
+        // local gates (SAFETY-MANUAL §3.6). Best-effort + non-fatal: a
+        // manifest write failure warns but never changes the verdict.
+        if let Some(dir) = std::env::var_os("PITBULL_REACH_DIR") {
+            // crate_name is informational (the aggregation keys off the
+            // referenced PATHS, not this field), so deriving it from a
+            // walked/universe path's leading segment is sufficient — every
+            // local item shares the crate prefix.
+            let crate_name = local_fn_universe
+                .iter()
+                .chain(walked_fn_paths.iter())
+                .map(|p| pitbull_subset::reachability::crate_of_path(p).to_string())
+                .next()
+                .unwrap_or_else(|| "unknown".to_string());
+            let sorted = |s: &std::collections::HashSet<String>| {
+                let mut v: Vec<String> = s.iter().cloned().collect();
+                v.sort();
+                v
+            };
+            let manifest = pitbull_subset::reachability::ReachManifest {
+                crate_name: crate_name.clone(),
+                walked: sorted(&walked_fn_paths),
+                referenced: sorted(&referenced_callees),
+                trusted: sorted(&hir_trusted),
+            };
+            match serde_json::to_string(&manifest) {
+                Ok(json) => {
+                    // One file per compile unit. A content hash keeps the
+                    // name unique across crates AND across the multiple
+                    // targets `cargo check --all-targets` compiles for one
+                    // crate (lib/test/bin), while staying deterministic
+                    // (idempotent re-runs overwrite the same file). The
+                    // subcommand unions every manifest in the dir, so
+                    // capturing all targets only ADDS coverage.
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    json.hash(&mut h);
+                    let fname = format!("{crate_name}-{:016x}.json", h.finish());
+                    let path = std::path::Path::new(&dir).join(fname);
+                    if let Err(e) = std::fs::write(&path, json) {
+                        eprintln!(
+                            "pitbull-rustc: WARNING: could not write reachability manifest \
+                             to {}: {e}",
+                            path.display(),
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "pitbull-rustc: WARNING: could not serialize reachability manifest: {e}",
+                ),
+            }
+        }
         let mut report = visitor.into_report();
         // Append HIR-derived violations (PB001 unsafe blocks + PB003
         // unsafe impl/trait) to the MIR-derived violations. The two walks

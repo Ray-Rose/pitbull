@@ -1703,8 +1703,26 @@ the std form and now also matches. No shadow type changes.
   corrected to state the real analyzed-vs-trusted boundary (now in
   `SAFETY-MANUAL.md` §3.6) instead of the stale "reachability driver walks the
   callee" claim. RESIDUAL (documented, not closed): other panicking stdlib
-  functions and cross-crate closure coverage remain on the trusted side
-  pending the prelude / whole-workspace aggregation.
+  functions remain on the trusted side pending the prelude; cross-crate
+  closure coverage is now aggregated (next entry).
+- ✅ Cross-crate reachability aggregation (2026-06-14). The per-crate `#27`
+  gate's universe is the LOCAL crate only, so a verified root in crate A
+  calling into workspace crate B — whose own `verify_roots` narrowing
+  skipped that entry — slipped past both crates' local gates (a cross-crate
+  false-"verified"). Closed by a whole-workspace gate: each `pitbull-rustc`
+  run emits a reachability manifest (its walked / referenced / trusted
+  paths) into `PITBULL_REACH_DIR`, and `cargo pitbull check` aggregates them
+  after the build — `reachability::cross_crate_unverified` flags any
+  workspace-member callee referenced from a verified root that NO crate's
+  run walked or trusted (exit 1). The pure aggregation is stable-unit-tested
+  (6 tests incl. the trusted opt-out, the external-callee trusted boundary,
+  and a warm-cache INDETERMINATE case that avoids false positives when cargo
+  serves a crate from cache); manifest emission is smoke-verified on real
+  MIR (walked/referenced path formats match — the gate's key invariant).
+  Workspace membership comes from `cargo metadata`; registry/non-workspace
+  deps stay trusted. RESIDUAL: a full multi-crate-narrowing e2e fixture, and
+  forcing complete re-analysis on warm caches (today: INDETERMINATE note +
+  "run a clean build").
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1712,7 +1730,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  288 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  294 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1725,7 +1743,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 288 passing, 0 warnings, clippy clean
+# Stable: 294 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

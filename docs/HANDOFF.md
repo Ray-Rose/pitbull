@@ -23,7 +23,7 @@ repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 288 tests passing (165 subset-lib + 70 vc + 47 integration + 6 driver-bin),
+- **State:** 294 tests passing (171 subset-lib + 70 vc + 47 integration + 6 driver-bin),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -159,14 +159,14 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **288 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **294 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The **288** breaks down: 1 (cargo-pitbull bin) + 5 (pitbull-rustc bin) + 165
-(subset lib) + 47 (integration) + 70 (vc) = 288. This supersedes the long
+The **294** breaks down: 1 (cargo-pitbull bin) + 5 (pitbull-rustc bin) + 171
+(subset lib) + 47 (integration) + 70 (vc) = 294. This supersedes the long
 Task-S-era narration that previously lived here (which still said "226" while
 the table said 277 — a drift caught and corrected in the 2026-06-14 deep
 audit). The lineage to today's number: the multi-solver agreement gate (Task
@@ -325,11 +325,11 @@ git log --oneline -1
 # Expected: a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
 ```
 
-### Step 4.2 — Stable test suite (the 288-test baseline)
+### Step 4.2 — Stable test suite (the 294-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
-# Expected: "test result: ok" lines totaling 288 passing, 0 failed, 0 ignored
+# Expected: "test result: ok" lines totaling 294 passing, 0 failed, 0 ignored
 ```
 
 If you see `Application Control policy has blocked this file` on Windows: that's Smart App Control quarantining a fresh test binary. Run again — usually clears on the second try. If persistent, run `cargo +stable test --workspace --all-features` (without the -p flag) to use the workspace-mode binary path which SAC tends to accept.
@@ -404,7 +404,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 288 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 294 passing.
 # Note: the 2-of-N agreement capstone additionally requires BOTH z3 and
 # cvc5 on PATH; with PITBULL_REQUIRE_E2E set it panics if either is missing.
 ```
@@ -451,7 +451,7 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 288 passing (same as without Z3 — the new tests
+# Expected: 294 passing (same as without Z3 — the new tests
 # also pass via graceful-skip if no solver is present, but with
 # z3 they exercise the real `unsat` verdict path).
 ```
