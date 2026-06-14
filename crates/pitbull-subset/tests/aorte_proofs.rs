@@ -418,6 +418,13 @@ fn control_panicking_int_methods_do_panic_safe_ones_do_not() {
     assert!(p(|| { let _ = 'a'.to_digit(std::hint::black_box(37)); }), "to_digit(_,37) must panic");
     assert!(p(|| { let _ = 'a'.is_digit(std::hint::black_box(37)); }), "is_digit(_,37) must panic");
     assert!(p(|| { let _ = std::char::from_digit(5, std::hint::black_box(37)); }), "from_digit(_,37) must panic");
+    // Completeness-net additions: encode into an undersized buffer, and a
+    // zero const chunk size (`black_box`ed so it is a runtime panic, not a
+    // const-eval one).
+    assert!(p(|| { let mut b = [0u8; 1]; let _ = '\u{20AC}'.encode_utf8(&mut b); }), "encode_utf8 small-buf must panic");
+    assert!(p(|| { let mut b = [0u16; 0]; let _ = 'x'.encode_utf16(&mut b); }), "encode_utf16 small-buf must panic");
+    assert!(p(|| { let s: &[u8] = &[1, 2, 3, 4]; let _ = s.as_chunks::<0>(); }), "as_chunks::<0> must panic");
+    assert!(p(|| { let s: &[u8] = &[1, 2, 3, 4]; let _ = s.as_rchunks::<0>(); }), "as_rchunks::<0> must panic");
     // Must NOT panic — total siblings the matcher must let through (no false
     // reject). A regression that flags these would degrade Pitbull to
     // rejecting provably-safe code.
@@ -426,4 +433,9 @@ fn control_panicking_int_methods_do_panic_safe_ones_do_not() {
     assert!(!p(|| { let _ = 4u32.abs_diff(6); }), "abs_diff is total");
     assert!(!p(|| { let _ = 'a'.is_alphabetic(); }), "char::is_alphabetic is total");
     assert!(!p(|| { let _ = 'a'.len_utf8(); }), "char::len_utf8 is total");
+    // The same calls with a sufficient buffer / nonzero chunk size do NOT
+    // panic — Pitbull's conservative fail-closed on the family is a false
+    // REJECT here (acceptable), never a runtime panic.
+    assert!(!p(|| { let mut b = [0u8; 4]; let _ = '\u{20AC}'.encode_utf8(&mut b); }), "encode_utf8 big-buf is total");
+    assert!(!p(|| { let s: &[u8] = &[1, 2, 3, 4]; let _ = s.as_chunks::<2>(); }), "as_chunks::<2> is total");
 }

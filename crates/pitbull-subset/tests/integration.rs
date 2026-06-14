@@ -3205,3 +3205,104 @@ fn differential_precondition_discharge_is_sound() {
         );
     }
 }
+
+// =====================================================================
+// Panicking-stdlib COMPLETENESS NET (2026-06-14 #2).
+//
+// The trusted-library boundary is fail-OPEN: a call into un-walked `core`
+// whose panic the matcher does not enumerate is silently "verified" — a false
+// discharge (the cardinal sin). Three separate deep-audit sweeps each found a
+// fresh family (unwrap/pow; the slice methods; then the int-method +
+// char-radix + as_chunks classes). This net turns "what did we forget?" from
+// an unknown-unknown into a tested list: every known-panicking stdlib call a
+// PSS-1 function can reach is exercised end-to-end and MUST be rejected (exit
+// != 0); a curated set of adjacent TOTAL calls MUST stay verified (exit 0),
+// so the net also guards against over-reach (false rejects). Adding a method
+// the matcher misses fails this test loudly. Gated on the nightly wrapper.
+// =====================================================================
+
+/// Each `(label, src)` MUST be rejected: the call panics inside un-walked
+/// `core`, so a `verified` verdict would be a false discharge. One entry per
+/// caught family + the specific methods three audits had to add.
+const NET_PANICKING: &[(&str, &str)] = &[
+    // Option / Result.
+    ("opt_unwrap", "pub fn f(o: Option<u32>) -> u32 { o.unwrap() }"),
+    ("res_expect", "pub fn f(r: Result<u32, u32>) -> u32 { r.expect(\"x\") }"),
+    // Integer inherent methods (operator forms are PB049; these are the
+    // method forms whose panic is in un-walked core).
+    ("int_pow", "pub fn f(x: u32, y: u32) -> u32 { x.pow(y) }"),
+    ("int_div_euclid", "pub fn f(x: i32, y: i32) -> i32 { x.div_euclid(y) }"),
+    ("int_ilog2", "pub fn f(x: u32) -> u32 { x.ilog2() }"),
+    ("int_isqrt_signed", "pub fn f(x: i32) -> i32 { x.isqrt() }"),
+    ("int_next_multiple_of", "pub fn f(x: u32, m: u32) -> u32 { x.next_multiple_of(m) }"),
+    ("int_div_ceil", "pub fn f(x: u32, y: u32) -> u32 { x.div_ceil(y) }"),
+    ("int_strict_add", "pub fn f(x: u32, y: u32) -> u32 { x.strict_add(y) }"),
+    (
+        "int_from_str_radix",
+        "pub fn f(s: &str, r: u32) -> Result<i32, core::num::ParseIntError> { i32::from_str_radix(s, r) }",
+    ),
+    // Iterator adapters/folds.
+    ("iter_sum", "pub fn f(s: &[u32]) -> u32 { s.iter().copied().sum() }"),
+    ("iter_step_by", "pub fn f(n: u32, k: usize) -> usize { (0u32..n).step_by(k).count() }"),
+    // str / slice range indexing + split / chunk / swap / copy / as_chunks.
+    ("range_index", "pub fn f(s: &[u8], a: usize, b: usize) -> usize { s[a..b].len() }"),
+    ("slice_swap", "pub fn f(s: &mut [u8], a: usize, b: usize) { s.swap(a, b) }"),
+    ("slice_copy_from", "pub fn f(d: &mut [u8], s: &[u8]) { d.copy_from_slice(s) }"),
+    ("slice_chunks", "pub fn f(s: &[u8], n: usize) -> usize { s.chunks(n).count() }"),
+    ("slice_as_chunks", "pub fn f(s: &[u8]) -> usize { let (a, _) = s.as_chunks::<4>(); a.len() }"),
+    ("str_split_at", "pub fn f(s: &str, m: usize) -> usize { s.split_at(m).0.len() }"),
+    // char radix + encode-into-buffer.
+    ("char_to_digit", "pub fn f(c: char, r: u32) -> u32 { c.to_digit(r).unwrap_or(0) }"),
+    ("char_from_digit", "pub fn f(n: u32, r: u32) -> Option<char> { core::char::from_digit(n, r) }"),
+    ("char_encode_utf8", "pub fn f(c: char, b: &mut [u8]) { c.encode_utf8(b); }"),
+];
+
+/// Each `(label, src)` MUST stay verified (exit 0): a TOTAL call adjacent to
+/// a panicking one, so the matcher must NOT over-reach onto it. Each is
+/// zero-obligation (a trusted total library call, no operator arithmetic), so
+/// the verdict is solver-independent.
+const NET_TOTAL: &[(&str, &str)] = &[
+    ("wrapping_add", "pub fn f(x: u32, y: u32) -> u32 { x.wrapping_add(y) }"),
+    ("saturating_mul", "pub fn f(x: u32, y: u32) -> u32 { x.saturating_mul(y) }"),
+    ("checked_div", "pub fn f(x: u32, y: u32) -> Option<u32> { x.checked_div(y) }"),
+    ("u32_isqrt_total", "pub fn f(x: u32) -> u32 { x.isqrt() }"),
+    ("min_max", "pub fn f(a: u32, b: u32) -> u32 { a.min(b).max(a) }"),
+    ("char_is_alpha", "pub fn f(c: char) -> bool { c.is_alphabetic() }"),
+    ("char_len_utf8", "pub fn f(c: char) -> usize { c.len_utf8() }"),
+    ("slice_len", "pub fn f(s: &[u8]) -> usize { s.len() }"),
+    ("slice_first", "pub fn f(s: &[u8]) -> Option<&u8> { s.first() }"),
+    ("slice_first_chunk", "pub fn f(s: &[u8]) -> bool { s.first_chunk::<4>().is_some() }"),
+];
+
+#[test]
+fn completeness_net_panicking_stdlib_rejected_total_verified() {
+    let Some(env) = E2eEnv::probe() else {
+        skip_or_require("completeness_net");
+        return;
+    };
+    let mut failures: Vec<String> = Vec::new();
+    for (label, src) in NET_PANICKING {
+        let (stderr, code) = run_wrapper_on_source(&env, src, &[]).expect("wrapper run");
+        if wrapper_verified(code) {
+            failures.push(format!(
+                "FALSE DISCHARGE: `{label}` was VERIFIED (exit 0) but panics inside core.\n  \
+                 src: {src}\n  stderr:\n{stderr}"
+            ));
+        }
+    }
+    for (label, src) in NET_TOTAL {
+        let (stderr, code) = run_wrapper_on_source(&env, src, &[]).expect("wrapper run");
+        if !wrapper_verified(code) {
+            failures.push(format!(
+                "FALSE REJECT: total `{label}` was NOT verified (exit {code:?}); the matcher \
+                 over-reached onto a panic-free call.\n  src: {src}\n  stderr:\n{stderr}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "panicking-stdlib completeness net found {} problem(s):\n\n{}",
+        failures.len(),
+        failures.join("\n\n"),
+    );
+}

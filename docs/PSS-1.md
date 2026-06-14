@@ -1893,6 +1893,27 @@ the std form and now also matches. No shadow type changes.
   why the soundness posture must treat that boundary as fail-OPEN until a
   prelude allow-list inverts it (§3.4) — each newly-reached panicking method
   is a latent false discharge until enumerated.
+- ✅ Panicking-stdlib COMPLETENESS NET (2026-06-14 #2). Acting on the
+  process note above, instead of waiting for a fourth ad-hoc sweep, a
+  curated end-to-end net (`integration.rs::completeness_net_panicking_stdlib_
+  rejected_total_verified`) now drives the wrapper over every known-panicking
+  stdlib call a PSS-1 function can reach (Option/Result, the int methods, the
+  iterator adapters, `str`/slice range-index + split/chunk/swap/copy/
+  `as_chunks`, and the `char` radix/encode methods) and asserts each is
+  REJECTED (exit ≠ 0), alongside a curated set of adjacent TOTAL calls that
+  must stay VERIFIED (exit 0) — so the net guards BOTH against false
+  discharge (a missed panicking method) AND false reject (over-reach onto a
+  total method). Running it immediately surfaced two more holes it then
+  closed: `char::encode_utf8`/`encode_utf16` (panic on an undersized
+  destination buffer — added to `is_panicking_char_method`) and
+  `<[T]>::as_chunks`/`as_rchunks`(`_mut`) (panic on a zero const chunk size;
+  the const `N` is absent from the post-mono path so the family is failed
+  closed — a conservative false REJECT of the safe `N > 0` use, never a false
+  discharge — added to `is_panicking_index_or_slice_call`). The net is the
+  standing regression guard the per-family sweeps lacked: adding a stdlib
+  method the matcher misses fails it loudly. (It does NOT close the fail-OPEN
+  posture itself — that remains the prelude allow-list's job, §3.4 — but it
+  converts "what did we forget?" from an unknown-unknown into a tested list.)
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1900,7 +1921,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  323 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  324 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1913,7 +1934,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 323 passing, 0 warnings, clippy clean
+# Stable: 324 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

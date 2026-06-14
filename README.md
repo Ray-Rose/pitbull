@@ -48,12 +48,14 @@ caught at the call site only for the enumerated families — currently
 `Option`/`Result::unwrap`/`expect`, the panicking int methods
 `pow`/`abs`/`div_euclid`/`div_ceil`/`next_multiple_of`/`from_str_radix`/signed
 `isqrt`/the always-panicking `strict_*` family/… plus
-`Iterator::sum`/`product`/`step_by` and the `char` radix methods
-(`to_digit`/`from_digit`/`is_digit`, which panic on `radix ∉ 2..=36`),
+`Iterator::sum`/`product`/`step_by` and the `char` methods
+(`to_digit`/`from_digit`/`is_digit`, which panic on `radix ∉ 2..=36`, plus
+`encode_utf8`/`encode_utf16` into an undersized buffer),
 `str`/slice range
 indexing (`&s[a..b]` via the `Index` trait), and the panicking `[T]`/`str`
 methods (`split_at`, `swap`, `copy_from_slice`, `rotate_left`/`right`,
-`chunks`/`windows`, `select_nth_unstable`, …). Operator-form arithmetic
+`chunks`/`windows`, `as_chunks` (panics on a zero chunk size),
+`select_nth_unstable`, …). Operator-form arithmetic
 (`x * y`) and element-projection indexing (`a[i]`) are fully covered
 regardless. Less-common panicking library methods not yet on the list
 remain trusted pending the prelude — see `docs/SAFETY-MANUAL.md` §3.6.

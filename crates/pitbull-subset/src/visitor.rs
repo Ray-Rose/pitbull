@@ -3010,19 +3010,24 @@ pub fn is_panicking_int_method(p: &str) -> bool {
         || p.contains("::strict_")
 }
 /// Whether `p` names a `char` inherent method (or the `char::from_digit` free
-/// fn) that PANICS when its `radix` argument is out of `2..=36`.
+/// fn) that PANICS — on a `radix` outside `2..=36`, or an undersized output
+/// buffer.
 ///
-/// ## Why (deep-audit 2026-06-14 #2)
+/// ## Why (deep-audit 2026-06-14 #2 + completeness net)
 ///
 /// `char::to_digit`, `char::is_digit`, and `char::from_digit` assert
 /// `radix <= 36` (`to_digit`/`is_digit` also reject `radix < 2` via the same
 /// path) BEFORE returning — `to_digit`/`from_digit` return an `Option`, but
 /// the radix check is a separate `panic!`, so a runtime `radix` the caller
-/// hasn't bounded panics inside un-walked `core`. The same class as the
-/// panicking int methods, found in the same boundary sweep, and routed
-/// through the same fail-closed PB043 handling. (`from_digit` is a free fn
-/// `std::char::from_digit`; the inherent methods render
-/// `…::char::methods::<impl char>::{to_digit, is_digit}`.)
+/// hasn't bounded panics inside un-walked `core`. `encode_utf8(dst)` /
+/// `encode_utf16(dst)` panic when `dst` is shorter than the char's encoded
+/// length (`dst.len() < self.len_utf8()` / `len_utf16()`) — a runtime buffer
+/// the caller hasn't bounded, the same shape as the panicking slice methods.
+/// All are the same un-walked-`core` class, found in the boundary sweep / the
+/// completeness net, and routed through the same fail-closed PB043 handling.
+/// (`from_digit` is a free fn `std::char::from_digit`; the inherent methods
+/// render `…::char::methods::<impl char>::{to_digit, is_digit, encode_utf8,
+/// encode_utf16}`.)
 #[must_use]
 pub fn is_panicking_char_method(p: &str) -> bool {
     if p.ends_with("char::from_digit") {
@@ -3031,7 +3036,10 @@ pub fn is_panicking_char_method(p: &str) -> bool {
     if !p.contains("char::methods::<impl char>") {
         return false;
     }
-    p.ends_with("::to_digit") || p.ends_with("::is_digit")
+    p.ends_with("::to_digit")
+        || p.ends_with("::is_digit")
+        || p.ends_with("::encode_utf8")
+        || p.ends_with("::encode_utf16")
 }
 /// Whether `p` names a `str`/slice RANGE-index or split/chunk library call
 /// that PANICS on out-of-bounds / a bad split point / a zero size.
@@ -3060,8 +3068,10 @@ pub fn is_panicking_char_method(p: &str) -> bool {
 /// each distinguished precisely. The list is the KNOWN panicking subset of
 /// the (stable) `[T]`/`str` inherent API — a deep audit (2026-06-14) proved
 /// `swap`/`rotate_*`/`copy_from_slice`/`clone_from_slice` were silently
-/// accepted (a CRITICAL false discharge), so the enumeration is now
-/// comprehensive over the stable panicking methods.
+/// accepted (a CRITICAL false discharge), and the completeness net
+/// (2026-06-14 #2) added the `as_chunks`/`as_rchunks` family (panic on a zero
+/// const chunk size), so the enumeration is now comprehensive over the stable
+/// panicking methods.
 #[must_use]
 pub fn is_panicking_index_or_slice_call(p: &str) -> bool {
     // Range / `[]` indexing via the Index/IndexMut trait (str non-char-
@@ -3101,6 +3111,20 @@ pub fn is_panicking_index_or_slice_call(p: &str) -> bool {
         || p.ends_with("::select_nth_unstable")
         || p.ends_with("::select_nth_unstable_by")
         || p.ends_with("::select_nth_unstable_by_key")
+        // `as_chunks::<N>` / `as_rchunks::<N>` panic when `N == 0` (completeness
+        // net 2026-06-14 #2). `N` is a const generic NOT carried in the post-
+        // mono path (`as_chunks::<0>` and `as_chunks::<4>` both render
+        // `…::slice::<impl [T]>::as_chunks`), so we cannot match only `N == 0`
+        // — we fail closed on the family. This conservatively rejects the safe
+        // `N > 0` use (a false REJECT, the acceptable side of the trade), but
+        // the `N == 0` panic can never slip through as a false DISCHARGE. The
+        // `_mut` variants and the Option-returning `as_chunks_checked` are
+        // distinguished by suffix. (`split_first_chunk`/`first_chunk` return
+        // `Option` — total — and are correctly excluded.)
+        || p.ends_with("::as_chunks")
+        || p.ends_with("::as_chunks_mut")
+        || p.ends_with("::as_rchunks")
+        || p.ends_with("::as_rchunks_mut")
 }
 /// Extract the canonical Rust type name (`"u32"`, `"i64"`, ...) from
 /// a shadow `Ty` when it represents a primitive integer; otherwise
@@ -4816,6 +4840,9 @@ mod tests {
             "core::char::from_digit",
             "std::char::methods::<impl char>::to_digit",
             "std::char::methods::<impl char>::is_digit",
+            // Completeness net 2026-06-14 #2: encode into an undersized buffer.
+            "std::char::methods::<impl char>::encode_utf8",
+            "std::char::methods::<impl char>::encode_utf16",
         ];
         for p in positive {
             assert!(is_panicking_char_method(p), "should be a panicking char method: {p}");
@@ -4825,6 +4852,7 @@ mod tests {
             "std::char::methods::<impl char>::is_numeric", // total
             "std::char::methods::<impl char>::to_ascii_uppercase", // total
             "std::char::methods::<impl char>::len_utf8", // total
+            "std::char::methods::<impl char>::len_utf16", // total
             "core::char::from_u32", // returns Option, no radix, total
             "my_crate::Glyph::to_digit", // user method, not the char inherent impl
         ];
@@ -4914,6 +4942,11 @@ mod tests {
             "core::slice::<impl [T]>::copy_within",
             "core::slice::<impl [T]>::select_nth_unstable",
             "core::slice::<impl [T]>::select_nth_unstable_by_key",
+            // Completeness net 2026-06-14 #2: as_chunks/as_rchunks panic on N==0.
+            "core::slice::<impl [T]>::as_chunks",
+            "core::slice::<impl [T]>::as_chunks_mut",
+            "core::slice::<impl [T]>::as_rchunks",
+            "core::slice::<impl [T]>::as_rchunks_mut",
             // str panicking methods (anchored on `::str::<impl`).
             "core::str::<impl str>::split_at",
             "core::str::<impl str>::split_at_mut",
@@ -4927,6 +4960,8 @@ mod tests {
             "core::slice::<impl [T]>::first",       // returns Option, not a panic itself
             "core::slice::<impl [T]>::split_first",  // returns Option
             "core::slice::<impl [T]>::split_at_checked", // returns Option (no panic)
+            "core::slice::<impl [T]>::first_chunk",  // returns Option (total)
+            "core::slice::<impl [T]>::split_first_chunk", // returns Option (total)
             "core::slice::<impl [T]>::fill",         // does not panic
             "core::slice::<impl [T]>::sort_unstable", // does not panic
             "my_crate::MyIndex::index",             // user trait named index, not ops::Index

@@ -146,15 +146,21 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
       `chunks`/`chunks_exact`/`rchunks`/`rchunks_exact`/`windows` (zero size),
       `swap`/`swap_with_slice`, `rotate_left`/`rotate_right`,
       `copy_from_slice`/`clone_from_slice`/`copy_within` (length mismatch /
-      OOB), and `select_nth_unstable`(`_by`/`_by_key`). A 2026-06-14 deep
-      audit PROVED `swap`/`copy_from_slice`/`rotate_*` were previously a
-      silent exit-0 "verified" (a CRITICAL false discharge); the enumeration
-      is now comprehensive over the stable panicking `[T]`/`str` API; and
-    - the `char` radix methods `to_digit` / `is_digit` and the
-      `char::from_digit` free fn, which panic when `radix` is outside
-      `2..=36` (the radix check is a `panic!` that runs BEFORE the `Option`
-      is returned). Caught in the same 2026-06-14 **#2** boundary sweep as
-      the extended int-method family; radix-free `char` methods
+      OOB), `select_nth_unstable`(`_by`/`_by_key`), and
+      `as_chunks`/`as_rchunks`(`_mut`) (panic on a zero const chunk size —
+      since the const `N` is not in the post-mono path, we fail closed on the
+      whole family, so the safe `N > 0` use is a conservative false REJECT,
+      never a false discharge). A 2026-06-14 deep audit PROVED
+      `swap`/`copy_from_slice`/`rotate_*` were previously a silent exit-0
+      "verified" (a CRITICAL false discharge); the enumeration is now
+      comprehensive over the stable panicking `[T]`/`str` API; and
+    - the `char` methods `to_digit` / `is_digit` and the `char::from_digit`
+      free fn, which panic when `radix` is outside `2..=36` (the radix check
+      is a `panic!` that runs BEFORE the `Option` is returned), plus
+      `encode_utf8` / `encode_utf16`, which panic when the destination buffer
+      is shorter than the char's encoded length. Caught in the same
+      2026-06-14 **#2** boundary sweep / completeness net as the extended
+      int-method family; radix-free, buffer-free `char` methods
       (`is_alphabetic`, `len_utf8`, `from_u32`, …) are total and not flagged.
   - **Documented residual — less-common library panics remain trusted (a
     known gap, NOT a silent pass).** The catch-list above is the common-and-
