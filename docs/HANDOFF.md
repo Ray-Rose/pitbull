@@ -8,7 +8,7 @@ during work.
 
 Last known-good commit at hand-off: the latest on `main` — run
 `git log -1`. The most recent milestone is **Task S** (multi-solver
-2-of-N agreement gate); the prior one is **`dbdc3dd`** (Task R,
+2-of-N agreement gate); the prior one is **`51c99e5`** (Task R,
 division/over-shift obligation encoding). The v0.2 state ships the
 deductive backend, full PB054 end-to-end discharge (P / P.1 / P.2),
 the Option-C attribute suite (Phase B grammar, Q.1 trusted, Q.2
@@ -107,51 +107,51 @@ repo only (no remote).
 ### Recent commit log (newest first)
 
 ```
-a62a770 Deep-audit self-review: fix cross-crate false-positive + catch method-form overflow
-ca48798 M1: fold coverage-gap audit notes into the exit code (no silent skips)
-4f4dc65 Cross-crate reachability aggregation (whole-workspace gate)
-d39ed4c Audit: catch unwrap/expect false-discharge + adapter accept-on-unknown
-7256d3e #27 drop-glue: fail closed on Drop reached via drop-glue under narrowing
-39eb5cf Discharge variable mixed-width shifts (safe subset) under preconditions
-06a2e6b #25: discharge mixed-width over-shift + close its fail-open
-29c46ce Enforce FFI surface (PB056/057/058); reclassify PB016 as covered
-34f6403 Close coverage-gap audit: enforce PB003 (unsafe impl/trait)
-9b3549e Harden #27: fail closed on in-crate callees skipped by verify_roots
-9632404 Fix CRITICAL fail-open: rustc_public bridge failure could exit 0
-0f2ccc9 Fix PB051-on-shift: exempt value-preserving constant int casts
-bc0ea99 Fix CI nightly-e2e: run the REAL wrapper + don't panic without cvc5
-ecb043d Harden corpus accept-check; fix mislabeled accept files (audit 2026-05-31)
-5710742 Fix HIGH fail-open: config policy violations ignored by the exit code
-82acf9d Fix CRITICAL false-discharge: precondition referencing `result` (PB076)
-d17a9f1 Milestone 2 Task Q.4d: discharge #[pitbull::ensures] over shifts
-827d61f Milestone 2 Task Q.4c: discharge #[pitbull::ensures] over Div/Rem
-944d4bd Milestone 2 Task Q.4b: discharge #[pitbull::ensures] over wrapping arithmetic
-c43bc45 Milestone 2 Task Q.4a: discharge #[pitbull::ensures] (PB076) via SMT
-a15bc60 Unit-test + DRY the solver-version-pin and unmatched-precondition checks
-14ec194 PB059: enforce the proc-macro allowlist (reject non-allowlisted reachable derives/attrs)
-38f3939 Red-team T.3/hardening fixes: from_hex panic (HIGH), probe_version timeout, +Lows
-8d50b23 docs: refresh test count to 219 + record T.3 signing / red-team / hardening
-50531c3 Hardening: enforce solver_versions pins + warn on unmatched precondition keys
-dcc70d8 Task T.3: HMAC-SHA256 certificate signing (closes swapped-SMT + threshold tamper)
-e931e75 Red-team Task T fixes: empty-bundle exit-0, internal consistency, timeout, size cap
-940fbd6 Task T.2: emit proof certificates from the wrapper + `cargo pitbull replay`
-083f609 Task T.1: proof-certificate data model + replay logic (pitbull-vc)
-d030604 Audit fix (CRITICAL): unary negation overflow was silently unobligated
-c39848f Task S audit: fix consistency-check fail-open + duplicate-solver vote inflation
-e614f00 Task S: multi-solver N-of-M agreement gate (closes single-solver TCB hole)
-dbdc3dd Task R: division-by-zero / over-shift obligation encoding (closes AoRTE gap)
-85b5751 docs: refresh drift flagged by full-codebase audit (counts, Q-series, PB076)
-5fdf3c1 Audit-cleanup: close silent-skip soundness gaps in foundational code
-8692d7f Audit-cleanup post-Q: close M-1, M-2, L-1, L-2 from 4-agent deep audit
-7dc2633 Task Q.4 MVP: #[pitbull::ensures("...")] postcondition obligations
-0597752 Audit-cleanup pass after Q.1-Q.3: close M-RT-Q.A through M-RT-Q.D + doc refresh
-ecef732 Task Q.3: expression-form #[pitbull::requires(x < 100)] without quotes
-36f0132 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl methods
-d4abf03 Task Q.1: #[pitbull::trusted] attribute + adapter fix for is_unsafe/is_async
-0b79d3e Phase B: predicate grammar <ident> <cmp> <ident> form (vision-audit #2)
-fbe96c8 chore: remove orphan deps (architectural-review #1)
-f71d238 N3 + H-RT1/H-RT2/H-RT3/M-RT3: Z3 timeout + post-interruption red-team cleanup
-efce72b Audit-cleanup pass after P/P.1/P.2: close N1/N2/F3/F4/F5–F13 from deep audit
+d439bbe Wire end-to-end AoRTE differential (wrapper verdict gates the fuzz)
+d801178 Fix CRITICAL false discharge: panicking slice/str methods silently accepted
+09aecbc Empirical AoRTE soundness net: property-test harness (first increment)
+b4297f4 Close library-panic residual: range-index + split_at/chunks
+3d26d72 docs: refresh commit-hash references after history identity rewrite
+d791197 Deep-audit self-review: fix cross-crate false-positive + catch method-form overflow
+7f20f26 M1: fold coverage-gap audit notes into the exit code (no silent skips)
+4861ebf Cross-crate reachability aggregation (whole-workspace gate)
+19ad8b9 Audit: catch unwrap/expect false-discharge + adapter accept-on-unknown
+06e86a9 #27 drop-glue: fail closed on Drop reached via drop-glue under narrowing
+bef6478 Discharge variable mixed-width shifts (safe subset) under preconditions
+73c24b5 #25: discharge mixed-width over-shift + close its fail-open
+927e628 Enforce FFI surface (PB056/057/058); reclassify PB016 as covered
+69644ab Close coverage-gap audit: enforce PB003 (unsafe impl/trait)
+7bfda25 Harden #27: fail closed on in-crate callees skipped by verify_roots
+b9739e9 Fix CRITICAL fail-open: rustc_public bridge failure could exit 0
+f646492 Fix PB051-on-shift: exempt value-preserving constant int casts
+4a424d0 Fix CI nightly-e2e: run the REAL wrapper + don't panic without cvc5
+bf51a7b Harden corpus accept-check; fix mislabeled accept files (audit 2026-05-31)
+e4fa2cb Fix HIGH fail-open: config policy violations ignored by the exit code
+772ce36 Fix CRITICAL false-discharge: precondition referencing `result` (PB076)
+0bdd6de Milestone 2 Task Q.4d: discharge #[pitbull::ensures] over shifts
+8969ac6 Milestone 2 Task Q.4c: discharge #[pitbull::ensures] over Div/Rem
+01ad538 Milestone 2 Task Q.4b: discharge #[pitbull::ensures] over wrapping arithmetic
+ac787c0 Milestone 2 Task Q.4a: discharge #[pitbull::ensures] (PB076) via SMT
+ae8a29b Unit-test + DRY the solver-version-pin and unmatched-precondition checks
+6d81891 PB059: enforce the proc-macro allowlist (reject non-allowlisted reachable derives/attrs)
+ca2eccf Red-team T.3/hardening fixes: from_hex panic (HIGH), probe_version timeout, +Lows
+9b9afc4 docs: refresh test count to 219 + record T.3 signing / red-team / hardening
+01e41ed Hardening: enforce solver_versions pins + warn on unmatched precondition keys
+d0d3062 Task T.3: HMAC-SHA256 certificate signing (closes swapped-SMT + threshold tamper)
+6b3a7f4 Red-team Task T fixes: empty-bundle exit-0, internal consistency, timeout, size cap
+cac9cf6 Task T.2: emit proof certificates from the wrapper + `cargo pitbull replay`
+29f7bd7 Task T.1: proof-certificate data model + replay logic (pitbull-vc)
+a8e700a Audit fix (CRITICAL): unary negation overflow was silently unobligated
+19c7aa8 Task S audit: fix consistency-check fail-open + duplicate-solver vote inflation
+bc38c42 Task S: multi-solver N-of-M agreement gate (closes single-solver TCB hole)
+51c99e5 Task R: division-by-zero / over-shift obligation encoding (closes AoRTE gap)
+12e8c82 docs: refresh drift flagged by full-codebase audit (counts, Q-series, PB076)
+55a80fe Audit-cleanup: close silent-skip soundness gaps in foundational code
+c80ae81 Audit-cleanup post-Q: close M-1, M-2, L-1, L-2 from 4-agent deep audit
+b31f3c8 Task Q.4 MVP: #[pitbull::ensures("...")] postcondition obligations
+11496fc Audit-cleanup pass after Q.1-Q.3: close M-RT-Q.A through M-RT-Q.D + doc refresh
+f3556d9 Task Q.3: expression-form #[pitbull::requires(x < 100)] without quotes
+d3682f6 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl methods
 ```
 
 ### Test invariant
@@ -683,8 +683,8 @@ git commit -m "..."
 |---|---|---|---|
 | solver PATH trust | A solver binary on PATH could be a hostile substitute always returning `unsat`. | `pitbull-vc/src/solver.rs::{run_solvers,vote}` | **Mitigated (Task S + 2026-05-29 audit):** discharge requires `threshold` *distinct* solvers (default `[z3, cvc5]`, threshold 2) to agree `unsat` with zero `sat`; one corrupt solver yields at most `Inconclusive`, and a `sat`/`unsat` split is a loud `DISAGREEMENT`. `vote` counts distinct solver names and the driver dedups the pool, so a duplicate config entry (`["z3","z3"]`) cannot inflate the vote. The precondition consistency check fails closed unless `threshold` solvers confirm satisfiability, so a timed-out/errored consistency check cannot yield a vacuous discharge. `[verification.solver_versions]` pins are now enforced — a solver whose `--version` doesn't match its pin is dropped from the pool (fail-closed). Residual: a coordinated swap of ALL distinct solvers to the pinned versions. |
 | u32 file-hash collisions | `Span::file` is a u32 hash. At ~65K files, 50% collision probability. | `pitbull-subset/src/mir_api/adapter.rs` (and `mir_api.rs::Span`) | Bumping to u64 ripples through the shadow IR. Tracked. |
-| Constant operand extraction (O.2.5) | ✅ DONE in `89cc583`. Adapter now extracts integer values via `try_extract_integer_value`; visitor synthesizes `(assert (= rhs #x...))` pinning assertions. Sign-extension fix in `7a8f04b`. | — | Closed. |
-| `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `afb5892`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |
+| Constant operand extraction (O.2.5) | ✅ DONE in `0d52ae1`. Adapter now extracts integer values via `try_extract_integer_value`; visitor synthesizes `(assert (= rhs #x...))` pinning assertions. Sign-extension fix in `a930691`. | — | Closed. |
+| `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `719dba8`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |
 | Path-sensitive symbolic exec | PB043 PanicReachability obligations are emitted but `pitbull-vc::compile` returns None for the kind. | `pitbull-vc/src/vc.rs::compile` | The SMT encoding for "panic site is unreachable" requires path-sensitive analysis — multi-week task. |
 | Termination measures (PB041) | Recursion-decreasing obligations not yet emitted. | visitor + vc | Needs call-graph SCC analysis, currently a documented gap. |
 | Bounds checks (PB054) | ✅ DONE in Tasks P / P.1 / P.2 + audit-cleanup. Visitor emits `IndexBound { idx_source_name: Option<String> }`; compile emits QF_BV with `__pb_idx`/`__pb_len` canonical names + `idx`/`len` aliases + optional source-name alias in quoted-symbol syntax for raw-ident safety. End-to-end discharge under Z3 verified by `wrapper_proves_bounded_index_safe_under_precondition`. | — | Closed. |

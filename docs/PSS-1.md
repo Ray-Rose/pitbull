@@ -1092,7 +1092,7 @@ the std form and now also matches. No shadow type changes.
       no-overflow"); this ordering is cosmetic for the
       solver but reads naturally for an auditor.
 
-  Layered tests (5 new in commit 89cc583, plus 1 e2e test
+  Layered tests (5 new in commit 0d52ae1, plus 1 e2e test
   in the audit follow-up at integration.rs::wrapper_proves_add_one_safe_under_precondition):
     * `predicate::tests::operand_pin_assertion_basic` —
       pins the bv-literal encoding for u32/i64/i32 with
@@ -1746,7 +1746,7 @@ the std form and now also matches. No shadow type changes.
 - ✅ Deep-audit self-review fixes (2026-06-14) — a 3-agent adversarial review
   of this session's own commits, each finding verified against the source
   before acting. Two issues fixed:
-  (1) **Cross-crate gate false-positive (a regression in 4f4dc65)** — the
+  (1) **Cross-crate gate false-positive (a regression in 4861ebf)** — the
   aggregation keyed on rendered path STRINGS, but `item.name()` renders a
   trait-impl method as `<crate::S as crate::T>::m` (walked) while the CALL
   references the trait path `crate::T::m` (referenced) — verified empirically
