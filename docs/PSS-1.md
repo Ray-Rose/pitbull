@@ -1774,6 +1774,24 @@ the std form and now also matches. No shadow type changes.
   updated to scope the AoRTE claim honestly and list the remaining trusted
   library-panic residual (`str` range/byte index, `<[T]>::split_at`) as a
   documented gap, not a silent pass.
+- ✅ Library-panic residual closed: range-index + split_at/chunks
+  (tracked-residual closure, 2026-06-14). The deep audit's documented
+  residual — `str`/slice RANGE indexing and the panicking slice split/chunk
+  methods — is now caught at the call site (no longer trusted). Verified
+  empirically: `&s[a..b]` / `&v[a..b]` does NOT lower to a
+  `ProjectionElem::Index` (only element `v[i]` does, which is PB054); it
+  lowers to a `Call` to `core::ops::Index::index`, whose out-of-bounds panic
+  lives in un-walked `core`. `is_panicking_index_or_slice_call` now matches
+  `ops::Index::index` / `ops::IndexMut::index_mut` plus the panicking
+  `core::slice::<impl [T]>` methods (`split_at`/`split_at_mut`/`chunks`/
+  `chunks_exact`/`rchunks`/`windows`), routing them through the same
+  fail-closed PB043 handling. Element-projection indexing (`a[i]`, PB054)
+  and the non-panicking slice methods (`len`/`iter`/`first`/…) are correctly
+  NOT matched (verified e2e + 2 unit tests; the `bytes[i]` accept-corpus
+  file is unaffected since it is a projection). README + SAFETY-MANUAL §3.6
+  updated to move these from "trusted residual" to "caught". Remaining
+  residual is now just less-common panicking library methods not yet
+  enumerated.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1781,7 +1799,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  305 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  307 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1794,7 +1812,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 305 passing, 0 warnings, clippy clean
+# Stable: 307 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

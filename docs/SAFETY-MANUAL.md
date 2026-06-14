@@ -123,23 +123,26 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
     PB043 obligation (or a hard reject under `strict_panic_acceptance`), so
     they are reported as an unproven panic, never silently "verified"
     (reachability-integrity audit, 2026-06-14). Caught today:
-    `Option`/`Result::{unwrap, expect, unwrap_err, expect_err}`, and the
-    panicking primitive-int inherent methods `pow` / `abs` / `div_euclid` /
-    `rem_euclid` / `next_power_of_two` / `ilog`/`ilog2`/`ilog10` (the METHOD
-    form of overflow — the OPERATOR form `x * y` is already PB049).
-  - **Documented residual — some library panics remain trusted (a known
-    gap, NOT a silent pass).** The catch-list above is the common-and-
-    dangerous subset, not exhaustive. Library functions whose panic is in
-    un-walked `core` and that are NOT yet on the list — notably `str` range/
-    byte indexing (`&s[a..b]` via the `Index` trait, which is a library
-    `Call`, not a `ProjectionElem::Index`, so PB054 does not see it),
-    `<[T]>::split_at`, `slice::chunks(0)`/`windows(0)` — are still on the
-    trusted side until the prelude models them. **Operator-form arithmetic
-    (`+ - * / % << >>`) and projection-form indexing (`a[i]`) ARE fully
-    covered** (PB049 / PB054); the gap is specifically the library-method
-    panic forms not yet enumerated. Until the prelude lands, treat a
-    `verified` function that uses those constructs as covering everything
-    EXCEPT those specific library panics, and prefer the caught forms.
+    - `Option`/`Result::{unwrap, expect, unwrap_err, expect_err}`;
+    - the panicking primitive-int inherent methods `pow` / `abs` /
+      `div_euclid` / `rem_euclid` / `next_power_of_two` / `ilog`/`ilog2`/
+      `ilog10` (the METHOD form of overflow — the OPERATOR form `x * y` is
+      already PB049); and
+    - `str`/slice RANGE indexing `&s[a..b]` / `&v[a..b]` (which lowers to a
+      `core::ops::Index::index` `Call`, NOT a `ProjectionElem::Index`, so
+      PB054 does not see it — only element `v[i]` is a projection) plus the
+      panicking slice methods `<[T]>::split_at`/`split_at_mut`/`chunks`/
+      `chunks_exact`/`rchunks`/`windows`.
+  - **Documented residual — less-common library panics remain trusted (a
+    known gap, NOT a silent pass).** The catch-list above is the common-and-
+    dangerous subset, not exhaustive. Other library functions whose panic is
+    in un-walked `core` and that are NOT yet enumerated remain on the trusted
+    side until the prelude models them. **Operator-form arithmetic
+    (`+ - * / % << >>`) and element-projection indexing (`a[i]`) ARE fully
+    covered** (PB049 / PB054). Until the prelude lands, treat a `verified`
+    function that uses a not-yet-enumerated panicking library method as
+    covering everything EXCEPT that specific library panic, and prefer the
+    caught forms.
 - **Cross-crate aggregation (whole-workspace gate).** Each crate's
   per-crate `#27` gate only sees its own items, so on its own it cannot
   tell whether a callee in *another* workspace crate was verified. To close

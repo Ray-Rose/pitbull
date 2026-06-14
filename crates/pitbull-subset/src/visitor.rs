@@ -786,22 +786,31 @@ impl<'cfg> SubsetVisitor<'cfg> {
             Some(p) if p == "std::thread::spawn" || p.starts_with("std::thread::Builder::spawn") => {
                 self.reject(rules::PB028, span, "thread spawn");
             }
-            Some(p) if is_panicking_library_call(p) || is_panicking_int_method(p) => {
-                // Two families of un-walked-`core` panics caught at the call
+            Some(p)
+                if is_panicking_library_call(p)
+                    || is_panicking_int_method(p)
+                    || is_panicking_index_or_slice_call(p) =>
+            {
+                // Three families of un-walked-`core` panics caught at the call
                 // site (the panic lives INSIDE a `core` fn the v0.2 wrapper
                 // does NOT walk, and there is no prelude model yet, so without
                 // catching it HERE the call falls through the `Some(_)`
                 // "assume walked elsewhere" arm and is SILENTLY ACCEPTED):
                 //   1. Option/Result `unwrap`/`expect`/`unwrap_err`/`expect_err`
                 //      — panic on the wrong variant (violating the README's
-                //      "no reachable `unwrap`/`expect`"); and
+                //      "no reachable `unwrap`/`expect`");
                 //   2. primitive-int inherent methods that panic on overflow
                 //      or a zero/`MIN` argument — `pow`/`abs`/`div_euclid`/
                 //      `rem_euclid`/`next_power_of_two`/`ilog*`. The OPERATOR
                 //      form (`x * y`, `x / y`) is caught by PB049, but the
                 //      METHOD form (`x.pow(y)`) was silently "verified"
-                //      despite the README's unqualified "no integer arithmetic
-                //      overflow" claim (deep-audit 2026-06-14).
+                //      despite the README's "no integer arithmetic overflow"
+                //      claim; and
+                //   3. `str`/slice RANGE indexing (`&s[a..b]` → the `Index`
+                //      trait `Call`, which PB054's projection path does not
+                //      see — only element `v[i]` is a projection) plus the
+                //      panicking `split_at`/`chunks`/`windows` slice methods
+                //      (deep-audit + tracked-residual closure 2026-06-14).
                 // Both are treated exactly like a `panic!` call site (PB043):
                 // strict mode rejects; default mode emits a (pending)
                 // PanicReachability obligation — the honest "cannot prove this
@@ -2938,6 +2947,48 @@ pub fn is_panicking_int_method(p: &str) -> bool {
         || p.ends_with("::ilog2")
         || p.ends_with("::ilog10")
 }
+/// Whether `p` names a `str`/slice RANGE-index or split/chunk library call
+/// that PANICS on out-of-bounds / a bad split point / a zero size.
+///
+/// ## Why (tracked-residual closure 2026-06-14)
+///
+/// Element indexing `v[i]` is a MIR `ProjectionElem::Index` caught by PB054.
+/// But RANGE indexing `&v[a..b]` / `&s[a..b]` does NOT lower to a
+/// projection — it lowers to a `Call` to the `Index` trait method
+/// `std::ops::Index::index` (verified empirically), whose out-of-bounds
+/// panic lives in un-walked `core` and which PB054 therefore never sees.
+/// Likewise `<[T]>::split_at` (panics `mid > len`) and the
+/// `chunks`/`windows` family (panic on a zero size) are library `Call`s.
+/// Caught at the call site and routed through the same fail-closed PB043
+/// handling as `unwrap`/`pow`, so `&s[a..b]` is honestly "cannot prove
+/// in-bounds" rather than silently "verified".
+///
+/// ## Matching
+///
+/// `ops::Index::index` / `ops::IndexMut::index_mut` for the range/byte
+/// index (anchored on the trait path, so a user trait of a different name
+/// is not matched). The slice methods are anchored on the
+/// `slice::<impl [T]>` inherent-impl rendering and matched by exact method
+/// suffix, so `split_at_unchecked` (unsafe; `_unchecked`), `chunks_exact`
+/// vs `chunks` etc. are each distinguished precisely.
+#[must_use]
+pub fn is_panicking_index_or_slice_call(p: &str) -> bool {
+    if p.ends_with("ops::Index::index") || p.ends_with("ops::IndexMut::index_mut") {
+        return true;
+    }
+    if p.contains("slice::<impl") {
+        return p.ends_with("::split_at")
+            || p.ends_with("::split_at_mut")
+            || p.ends_with("::chunks")
+            || p.ends_with("::chunks_mut")
+            || p.ends_with("::chunks_exact")
+            || p.ends_with("::chunks_exact_mut")
+            || p.ends_with("::rchunks")
+            || p.ends_with("::rchunks_mut")
+            || p.ends_with("::windows");
+    }
+    false
+}
 /// Extract the canonical Rust type name (`"u32"`, `"i64"`, ...) from
 /// a shadow `Ty` when it represents a primitive integer; otherwise
 /// `None`. Free-standing because it's a pure type-shape inspection
@@ -4661,6 +4712,63 @@ mod tests {
             report.errors,
             report.vc_obligations,
         );
+    }
+    // ----- range-index + split_at/chunks library panics ----------------
+    // Tracked-residual closure 2026-06-14: `&s[a..b]` lowers to the Index
+    // trait Call (not a PB054 projection); split_at/chunks panic in core.
+    /// `is_panicking_index_or_slice_call` matches range/byte indexing
+    /// (`ops::Index::index`) and the panicking slice split/chunk methods,
+    /// and excludes element-index projections / non-panicking slice methods.
+    #[test]
+    fn is_panicking_index_or_slice_call_classification() {
+        let positive = [
+            "std::ops::Index::index",
+            "core::ops::Index::index",
+            "std::ops::IndexMut::index_mut",
+            "core::slice::<impl [T]>::split_at",
+            "core::slice::<impl [T]>::split_at_mut",
+            "core::slice::<impl [T]>::chunks",
+            "core::slice::<impl [T]>::chunks_exact",
+            "core::slice::<impl [T]>::windows",
+        ];
+        for p in positive {
+            assert!(is_panicking_index_or_slice_call(p), "should be flagged: {p}");
+        }
+        let negative = [
+            "core::slice::<impl [T]>::len",
+            "core::slice::<impl [T]>::iter",
+            "core::slice::<impl [T]>::first",      // returns Option, not a panic itself
+            "core::slice::<impl [T]>::split_first", // returns Option
+            "my_crate::MyIndex::index",            // user trait named index, not ops::Index
+            "core::slice::<impl [T]>::as_ptr",
+        ];
+        for p in negative {
+            assert!(!is_panicking_index_or_slice_call(p), "should NOT be flagged: {p}");
+        }
+    }
+    /// Default mode: range-index (`Index::index`) and `split_at`/`chunks`
+    /// emit a PanicReachability obligation (honest "cannot prove in-bounds /
+    /// valid split"), so `&s[a..b]` is no longer silently "verified".
+    #[test]
+    fn range_index_and_slice_methods_emit_obligation() {
+        let cfg = SubsetConfig::default_for_test();
+        for path in [
+            "std::ops::Index::index",
+            "core::slice::<impl [T]>::split_at",
+            "core::slice::<impl [T]>::chunks",
+        ] {
+            let mut v = SubsetVisitor::new(&cfg);
+            v.visit_body(&body_calling(path), false);
+            let report = v.into_report();
+            assert!(
+                report.vc_obligations.iter().any(|o| matches!(
+                    o.kind,
+                    crate::vc::VcObligationKind::PanicReachability,
+                )),
+                "{path}: must emit a PanicReachability obligation; got {:?}",
+                report.vc_obligations,
+            );
+        }
     }
     /// Strict mode preserves the v0.1-style hard reject. The
     /// obligation is NOT emitted (no point — the violation
