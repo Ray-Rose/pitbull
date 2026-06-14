@@ -90,6 +90,15 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-01-29 --component rustc-dev rust-src
       - uses: Swatinem/rust-cache@v2
+      - name: Install z3 (best-effort; solver-dependent e2e tests skip without it)
+        shell: bash
+        # Lets the discharge e2e tests actually run (else they skip via
+        # no_solver_available). Non-blocking: a failed install just means
+        # those tests skip. The 2-solver-agreement test also needs cvc5,
+        # which we don't install — it skips gracefully (see that test).
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y z3 || true; fi
+          if [ "$RUNNER_OS" = "Windows" ]; then choco install z3 -y || true; fi
       - name: Build wrapper (nightly + opt-in)
         env:
           PITBULL_USE_RUSTC_PUBLIC: "1"
@@ -101,7 +110,14 @@ jobs:
         # the wrapper *was* built in the previous step.
         env:
           PITBULL_REQUIRE_E2E: "1"
+          # Audit 2026-05-31 (H1 fix): run on the SAME nightly + opt-in as
+          # the wrapper build. Previously this step ran `cargo test` on
+          # STABLE without the opt-in, which rebuilt pitbull-rustc as the
+          # STUB (different rustc fingerprint, opt-in unset) at the same
+          # target path — so the e2e tests exercised the stub, silently
+          # defeating this job's entire purpose.
+          PITBULL_USE_RUSTC_PUBLIC: "1"
         # --test-threads=1: the wrapper writes a unique temp pid in
         # filenames, but parallel invocations against the same
         # corpus file would still race on the output artifact path.
-        run: cargo test --workspace --all-features -- --test-threads=1
+        run: cargo +nightly-2026-01-29 test --workspace --all-features -- --test-threads=1
