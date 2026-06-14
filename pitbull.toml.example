@@ -23,6 +23,17 @@ vc_timeout_seconds = 60
 # stderr-only notes that do not affect the verdict. Transparency notes
 # never affect the exit code regardless of this setting.
 fail_on_coverage_gaps = true
+# The PRELUDE allow-list (fail-closed library boundary). With this true (the
+# default), a call into core/std/alloc is accepted only if it is on the
+# trusted-total allow-list (is_trusted_total_library_call); any other stdlib
+# call emits an untrusted-stdlib coverage gap and fails closed. This inverts
+# the historic trust-all-stdlib posture, under which an un-enumerated
+# panicking stdlib method was a silent false discharge. In-crate calls and
+# user trait-impls are unaffected. Set false to restore trust-all-stdlib
+# (e.g. while migrating a crate whose total stdlib surface the prelude does
+# not yet enumerate — a total method not on the list is otherwise a
+# conservative false REJECT, never a false discharge). See SAFETY-MANUAL §3.6.
+strict_library_acceptance = true
 # Per-function preconditions surfaced to the SMT solver as hypotheses.
 # Keys are fully-qualified function paths; values are arrays of
 # predicates.

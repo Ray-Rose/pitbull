@@ -239,6 +239,17 @@ fn corpus_runs_full_pipeline() {
                         ));
                     }
                 }
+                // Prelude regression guard (2026-06-14): an accept file must not
+                // trip the fail-closed library default — i.e. every stdlib call
+                // it makes must be on the prelude allow-list. A coverage gap is
+                // NOT a subset violation, so the check above would miss it.
+                if stderr.contains("untrusted stdlib") {
+                    failures.push(format!(
+                        "[accept] {name}: a stdlib call is not on the prelude \
+                         allow-list (untrusted-stdlib coverage gap); add it to \
+                         `is_trusted_total_library_call`:\n{stderr}"
+                    ));
+                }
             }
             Err(e) => failures.push(format!("[accept] {name}: wrapper failed: {e}")),
         }
@@ -3304,5 +3315,36 @@ fn completeness_net_panicking_stdlib_rejected_total_verified() {
         "panicking-stdlib completeness net found {} problem(s):\n\n{}",
         failures.len(),
         failures.join("\n\n"),
+    );
+}
+
+/// The PRELUDE fail-closed flip, end to end. A stdlib call NOT on the
+/// trusted-total allow-list (`core::mem::swap` — total, but un-modelled) must
+/// now FAIL CLOSED (exit != 0, with an `untrusted stdlib` coverage gap), where
+/// before the flip it was silently trusted-as-total (exit 0). This is the
+/// regression guard for the inversion itself: it confirms an un-enumerated
+/// stdlib method can no longer slip through as a silent false discharge. An
+/// allow-listed total call (`wrapping_add`) must still verify (exit 0), and
+/// the opt-out (`strict_library_acceptance = false`) restores the old trust.
+#[test]
+fn prelude_flip_fails_closed_on_untrusted_stdlib_e2e() {
+    let Some(env) = E2eEnv::probe() else {
+        skip_or_require("prelude_flip");
+        return;
+    };
+    // Unlisted stdlib → fails closed under the default.
+    let swap_src = "pub fn f(a: &mut u32, b: &mut u32) { core::mem::swap(a, b); }\n";
+    let (stderr, code) = run_wrapper_on_source(&env, swap_src, &[]).expect("wrapper run");
+    assert!(
+        !wrapper_verified(code) && stderr.contains("untrusted stdlib"),
+        "unlisted stdlib `core::mem::swap` must FAIL CLOSED (untrusted-stdlib gap); \
+         got exit {code:?}, stderr:\n{stderr}",
+    );
+    // Allow-listed total stdlib → still verifies on its own.
+    let wadd_src = "pub fn g(a: u32, b: u32) -> u32 { a.wrapping_add(b) }\n";
+    let (stderr2, code2) = run_wrapper_on_source(&env, wadd_src, &[]).expect("wrapper run");
+    assert!(
+        wrapper_verified(code2),
+        "allow-listed `wrapping_add` must still verify; got exit {code2:?}, stderr:\n{stderr2}",
     );
 }

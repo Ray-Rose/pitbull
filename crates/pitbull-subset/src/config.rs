@@ -97,6 +97,21 @@ pub struct VerificationSection {
     /// notes never affect the exit code regardless.
     #[serde(default = "default_fail_on_coverage_gaps")]
     pub fail_on_coverage_gaps: bool,
+    /// If true (the default), the **prelude allow-list** is enforced: a call
+    /// into the standard library (`core::` / `std::` / `alloc::`) that is
+    /// NOT on the trusted-total allow-list
+    /// ([`crate::visitor::is_trusted_total_library_call`]) and is not already
+    /// caught as a known panicking method emits a COVERAGE-GAP note (so it
+    /// fails closed via `fail_on_coverage_gaps`). This INVERTS the historic
+    /// fail-OPEN posture where any un-enumerated stdlib call was trusted as
+    /// total — under which an un-modelled panicking method was a silent false
+    /// discharge. In-crate calls and user trait-impls are unaffected (they are
+    /// not in a stdlib namespace and are owned by the reachability gates).
+    /// Set to `false` to restore the pre-prelude trust-all-stdlib behavior
+    /// (e.g. while migrating a crate whose total stdlib surface the prelude
+    /// does not yet enumerate). See `docs/SAFETY-MANUAL.md` §3.6.
+    #[serde(default = "default_strict_library_acceptance")]
+    pub strict_library_acceptance: bool,
     /// Per-function precondition lists. Keys are fully-qualified
     /// function paths (matched against `CrateDef::name()` for each
     /// item the wrapper walks). Values are arrays of SMT-LIB 2
@@ -128,6 +143,7 @@ impl Default for VerificationSection {
             solver_versions: std::collections::BTreeMap::new(),
             strict_panic_acceptance: false,
             fail_on_coverage_gaps: default_fail_on_coverage_gaps(),
+            strict_library_acceptance: default_strict_library_acceptance(),
             preconditions: std::collections::BTreeMap::new(),
         }
     }
@@ -136,6 +152,12 @@ impl Default for VerificationSection {
 /// a coverage gap drives the exit code so it cannot be mistaken for a clean
 /// verification by a CI gate).
 fn default_fail_on_coverage_gaps() -> bool {
+    true
+}
+/// Default for `verification.strict_library_acceptance`: `true` (fail closed —
+/// the prelude allow-list is enforced, so an un-modelled stdlib call is a
+/// visible coverage gap rather than a silent trust-as-total false discharge).
+fn default_strict_library_acceptance() -> bool {
     true
 }
 fn default_vc_timeout() -> u64 { 60 }

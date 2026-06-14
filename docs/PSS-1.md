@@ -1914,6 +1914,33 @@ the std form and now also matches. No shadow type changes.
   method the matcher misses fails it loudly. (It does NOT close the fail-OPEN
   posture itself — that remains the prelude allow-list's job, §3.4 — but it
   converts "what did we forget?" from an unknown-unknown into a tested list.)
+- ✅ PRELUDE FLIP — library-call boundary inverted to FAIL-CLOSED (2026-06-14).
+  The structural fix the three sweeps + the completeness net pointed to. The
+  trust arm `classify_called_function::Some(p)` no longer silently trusts an
+  un-matched callee: a stdlib-namespace path (`is_stdlib_namespace_path` —
+  `core::`/`std::`/`alloc::` prefix) that is not on the positive trusted-total
+  allow-list (`is_trusted_total_library_call`) now emits an untrusted-stdlib
+  COVERAGE GAP (→ exit 1 via `fail_on_coverage_gaps`), governed by the new
+  `verification.strict_library_acceptance` (default true). This INVERTS the
+  historic fail-OPEN posture: an un-enumerated panicking stdlib method is now
+  gapped, not trusted-as-total — so the cardinal-sin class the sweeps kept
+  finding can no longer hide. The allow-list is a compact FAMILY enumeration
+  (int `wrapping_*`/`checked_*`/`saturating_*`/bit-ops; `cmp::Ord`
+  min/max/clamp; `convert::From`/`TryFrom`; total `char`/slice/str/`Option`/
+  `Result` methods), kept DISJOINT from the deny matchers by a guard at its
+  head, and completed empirically against the corpus + `NET_TOTAL` (no accept
+  file gaps; `NET_TOTAL` all stay exit 0). Design notes: (a) the visitor is
+  crate-blind, so scoping the gap to the `core::`/`std::`/`alloc::` PREFIX
+  (rather than "non-local") is what lets it run in the visitor without
+  threading the local crate name — in-crate calls and `<mycrate::T as core::…>`
+  user trait-impls render outside those prefixes and are untouched; (b) the
+  residual inverts to a far smaller, sound one — a total method not yet on the
+  allow-list is a conservative false REJECT (fixable by extending the list, or
+  `strict_library_acceptance=false`), never a false discharge. Pinned by
+  `is_trusted_total_library_call` / `is_stdlib_namespace_path` /
+  `prelude_arm_fails_closed_on_untrusted_stdlib` unit tests, the e2e
+  `prelude_flip_fails_closed_on_untrusted_stdlib_e2e`, and a prelude-gap guard
+  added to the accept-corpus harness.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1921,7 +1948,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  324 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  328 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1934,7 +1961,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 324 passing, 0 warnings, clippy clean
+# Stable: 328 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

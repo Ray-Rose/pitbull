@@ -162,16 +162,37 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
       2026-06-14 **#2** boundary sweep / completeness net as the extended
       int-method family; radix-free, buffer-free `char` methods
       (`is_alphabetic`, `len_utf8`, `from_u32`, …) are total and not flagged.
-  - **Documented residual — less-common library panics remain trusted (a
-    known gap, NOT a silent pass).** The catch-list above is the common-and-
-    dangerous subset, not exhaustive. Other library functions whose panic is
-    in un-walked `core` and that are NOT yet enumerated remain on the trusted
-    side until the prelude models them. **Operator-form arithmetic
-    (`+ - * / % << >>`) and element-projection indexing (`a[i]`) ARE fully
-    covered** (PB049 / PB054). Until the prelude lands, treat a `verified`
-    function that uses a not-yet-enumerated panicking library method as
-    covering everything EXCEPT that specific library panic, and prefer the
-    caught forms.
+  - **The prelude allow-list — the boundary is now FAIL-CLOSED (prelude flip,
+    2026-06-14).** The catch-list above is no longer the safety boundary: it
+    is an *optimization* that turns a caught panicking method into a precise
+    `(PB043)` diagnostic. The boundary itself is now a positive **trusted-total
+    allow-list** (`visitor.rs::is_trusted_total_library_call`): under
+    `verification.strict_library_acceptance` (default **true**), a call into
+    `core`/`std`/`alloc` is accepted only if it is on that allow-list (the
+    `wrapping_*`/`checked_*`/`saturating_*`/… int methods, `Ord::min`/`max`/
+    `clamp`, `From`/`TryFrom`, the total `char`/slice/`Option`/`Result`
+    methods, …); **any other stdlib call — enumerated-as-panicking or not —
+    emits an untrusted-stdlib coverage gap and fails closed (exit 1).** This
+    inverts the historic fail-OPEN posture under which an un-enumerated
+    panicking stdlib method was silently trusted as total (a latent false
+    discharge). In-crate calls (`mycrate::…`) and a user type's impl of a
+    stdlib trait (`<mycrate::T as core::…>::m`, leading `<`) are NOT
+    stdlib-namespace paths, so they are untouched and owned by the `#27` /
+    cross-crate reachability gates. **Operator-form arithmetic
+    (`+ - * / % << >>`) and element-projection indexing (`a[i]`) ARE covered**
+    by PB049 / PB054 regardless.
+  - **The (now inverse, far smaller) residual.** Two things to know: (1) a
+    genuinely *total* stdlib method the allow-list does not yet enumerate is
+    **conservatively REJECTED** (a false *reject* — never a false discharge);
+    fix it by adding the method to `is_trusted_total_library_call` (gate the
+    addition against the corpus + `NET_TOTAL` regression set), or set
+    `strict_library_acceptance = false` to restore trust-all-stdlib during
+    migration. (2) The namespace test keys on the `core::`/`std::`/`alloc::`
+    prefix; a `<primitive as core_trait>::method` rendering (e.g. some
+    `From`/`Ord` dispatch) starts with `<` and escapes it, so it is trusted
+    rather than gapped — sound, because those primitive-trait methods are
+    total conversions/comparisons (the panicking primitive methods are
+    INHERENT and render with the prefix, so they are covered).
 - **Cross-crate aggregation (whole-workspace gate).** Each crate's
   per-crate `#27` gate only sees its own items, so on its own it cannot
   tell whether a callee in *another* workspace crate was verified. To close

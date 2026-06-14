@@ -830,25 +830,43 @@ impl<'cfg> SubsetVisitor<'cfg> {
                     self.emit_panic_reachability_obligation(p, span);
                 }
             }
-            Some(_) => {
+            Some(p) => {
                 // A known callee path not matched by any classifier above.
-                // Trust-boundary posture (audit 2026-06-14 — replaces the
-                // old "the reachability driver walks the callee's body"
-                // claim, which described the test-only `ReachabilityDriver`
-                // that production does NOT run):
-                //   - An IN-CRATE callee is forced to be walked by the #27
-                //     reachability gate in the wrapper (or the run fails
-                //     closed), so its own rules fire when it is visited as a
-                //     separate subject.
-                //   - A NON-LOCAL callee (core/std/alloc, a dependency) is
-                //     NOT walked. Such functions are TRUSTED to be total
-                //     (panic-free) — modelling them precisely is the
-                //     prelude's job in v0.3+. The KNOWN panic-bearing
-                //     exceptions (the `unwrap`/`expect` family just above,
-                //     and `core::panicking::*`) are already caught, so the
-                //     residual trusted surface is the total stdlib. This
-                //     boundary is documented in docs/SAFETY-MANUAL.md §3.
-                // Either way, nothing to reject at THIS call site.
+                // PRELUDE FAIL-CLOSED DEFAULT (2026-06-14) — inverts the
+                // historic trust-all-stdlib posture:
+                //   - An IN-CRATE callee (`crate::…` / `mycrate::…`) or a
+                //     user type's impl of a stdlib trait
+                //     (`<mycrate::T as core::…>::m`) is NOT a stdlib-namespace
+                //     path, so it is NOT gapped here — it is walked as its own
+                //     subject and owned by the #27 / cross-crate reachability
+                //     gates (which fail closed if it is unverified).
+                //   - A STDLIB callee (`core::`/`std::`/`alloc::`) that is on
+                //     the prelude allow-list (`is_trusted_total_library_call`)
+                //     is trusted as total. One that is NOT — and was not
+                //     caught as a known panicking method above — is an
+                //     UN-MODELLED library call: it emits a coverage gap so it
+                //     fails closed (it was previously a silent trust-as-total,
+                //     i.e. a latent false discharge for any un-enumerated
+                //     panicking stdlib method). `strict_library_acceptance`
+                //     (default true) governs this; see SAFETY-MANUAL §3.6.
+                if self.config.verification.strict_library_acceptance
+                    && is_stdlib_namespace_path(p)
+                    && !is_trusted_total_library_call(p)
+                {
+                    self.audit_note(
+                        span,
+                        format!(
+                            "untrusted stdlib call `{p}`: not on the prelude allow-list \
+                             of total (panic-free) methods, so its panic-freedom is \
+                             unproven — fails closed. Add it to the prelude \
+                             (`is_trusted_total_library_call`) if it is genuinely total, \
+                             or annotate the caller `#[pitbull::trusted]`."
+                        ),
+                    );
+                }
+                // Otherwise: trusted-total stdlib, or a non-stdlib (in-crate /
+                // dependency) callee owned by the reachability gates — nothing
+                // to reject at THIS call site.
             }
             None => {
                 // We saw a Call terminator whose const operand has no
@@ -3126,6 +3144,186 @@ pub fn is_panicking_index_or_slice_call(p: &str) -> bool {
         || p.ends_with("::as_rchunks")
         || p.ends_with("::as_rchunks_mut")
 }
+/// Whether `p` is a call INTO the standard library (`core` / `std` / `alloc`)
+/// — the surface the prelude fail-closed default governs.
+///
+/// Stdlib calls render with a `core::` / `std::` / `alloc::` PREFIX: inherent
+/// methods (`core::num::<impl u32>::wrapping_add`), free fns
+/// (`core::char::from_u32`), and trait methods whose receiver is a primitive
+/// (`std::cmp::Ord::min`, `std::convert::From::from` — empirically the trait
+/// path, not a `<u32 as …>` form). In-crate calls render `crate::…` /
+/// `mycrate::…`, and a USER type's impl of a stdlib trait renders
+/// `<mycrate::T as std::cmp::Ord>::cmp` (leading `<` + the user crate) — so a
+/// plain prefix test cleanly separates "stdlib call" from "in-crate call",
+/// WITHOUT the visitor needing to know the local crate name. (Residual: a
+/// `<primitive as core_trait>::m` rendering would start `<` and escape this
+/// test — but such methods are conversions/comparisons that are total, and
+/// the panicking primitive methods are INHERENT, so they render with the
+/// prefix and are covered.)
+#[must_use]
+pub fn is_stdlib_namespace_path(p: &str) -> bool {
+    p.starts_with("core::") || p.starts_with("std::") || p.starts_with("alloc::")
+}
+/// The **prelude allow-list**: stdlib calls TRUSTED as total (panic-free).
+///
+/// This is the fail-CLOSED counterpart to the `is_panicking_*` deny matchers.
+/// At the `classify_called_function` trust arm, a stdlib-namespace call
+/// ([`is_stdlib_namespace_path`]) that is neither caught as panicking NOR on
+/// this allow-list is gapped (a coverage gap → exit 1). The panicking methods
+/// are filtered by the deny matchers *before* this is consulted, so a path
+/// reaching here is already known not to be one of them; we nonetheless
+/// enumerate the total surface POSITIVELY (by family) so this is a real
+/// allow-list, not "everything-minus-the-deny-list" (which would be the old
+/// fail-open). Compact family matching keeps it maintainable; it is completed
+/// empirically against the corpus + `NET_TOTAL` regression set, and grows as
+/// the verifiable subset's legitimate stdlib surface grows.
+#[must_use]
+pub fn is_trusted_total_library_call(p: &str) -> bool {
+    // The allow-list and the deny matchers are DISJOINT by construction: a
+    // known panicking method is never trusted as total. In production the deny
+    // matchers run first in `classify_called_function` (so this is
+    // belt-and-suspenders), but enforcing it here makes the predicate correct
+    // standalone and robust to any future reordering — the compact `::is_` /
+    // `::to_` family checks below would otherwise also match the panicking
+    // `is_digit` / `to_digit`.
+    if is_panicking_library_call(p)
+        || is_panicking_int_method(p)
+        || is_panicking_index_or_slice_call(p)
+        || is_panicking_char_method(p)
+    {
+        return false;
+    }
+    // --- Option / Result total methods (panicking `unwrap`/`expect`/
+    //     `unwrap_err`/`expect_err` are caught by is_panicking_library_call
+    //     before this is consulted; `*_unchecked` is unsafe → PB002). ---
+    if p.contains("option::Option") || p.contains("result::Result") {
+        return p.ends_with("::is_some")
+            || p.ends_with("::is_none")
+            || p.ends_with("::is_ok")
+            || p.ends_with("::is_err")
+            || p.ends_with("::is_some_and")
+            || p.ends_with("::is_none_or")
+            || p.ends_with("::is_ok_and")
+            || p.ends_with("::is_err_and")
+            || p.contains("::unwrap_or")  // unwrap_or / unwrap_or_else / unwrap_or_default
+            || p.ends_with("::map")
+            || p.ends_with("::map_or")
+            || p.ends_with("::map_or_else")
+            || p.ends_with("::map_err")
+            || p.ends_with("::and_then")
+            || p.ends_with("::or_else")
+            || p.ends_with("::ok")
+            || p.ends_with("::err")
+            || p.ends_with("::ok_or")
+            || p.ends_with("::ok_or_else")
+            || p.ends_with("::as_ref")
+            || p.ends_with("::as_mut")
+            || p.ends_with("::take")
+            || p.ends_with("::replace")
+            || p.ends_with("::filter")
+            || p.ends_with("::flatten")
+            || p.ends_with("::cloned")
+            || p.ends_with("::copied")
+            || p.ends_with("::unwrap_or_default");
+    }
+    // --- Integer inherent total methods: `core::num::<impl {int}>::M` ---
+    if p.contains("num::<impl") {
+        // Total method-name families (the `::` anchor pins the method segment).
+        if p.contains("::wrapping_")
+            || p.contains("::checked_")
+            || p.contains("::saturating_")
+            || p.contains("::overflowing_")
+            || p.contains("::unbounded_")
+            || p.contains("::from_")  // from_le_bytes/from_be_bytes/from_ne_bytes (from_str_radix is panicking, caught earlier)
+            || p.contains("::to_")    // to_le_bytes/to_be_bytes/to_ne_bytes/to_le/to_be
+        {
+            return true;
+        }
+        return p.ends_with("::midpoint")
+            || p.ends_with("::abs_diff")
+            || p.ends_with("::unsigned_abs")
+            || p.ends_with("::signum")
+            || p.ends_with("::is_positive")
+            || p.ends_with("::is_negative")
+            || p.ends_with("::is_power_of_two")
+            || p.ends_with("::count_ones")
+            || p.ends_with("::count_zeros")
+            || p.ends_with("::leading_zeros")
+            || p.ends_with("::trailing_zeros")
+            || p.ends_with("::leading_ones")
+            || p.ends_with("::trailing_ones")
+            || p.ends_with("::rotate_left")  // INTEGER bit-rotate (total); slice rotate is panicking + on the deny list
+            || p.ends_with("::rotate_right")
+            || p.ends_with("::swap_bytes")
+            || p.ends_with("::reverse_bits")
+            // unsigned `isqrt` only — signed `isqrt` panics and is caught earlier.
+            || (p.ends_with("::isqrt") && p.contains("num::<impl u"));
+    }
+    // --- cmp / Ord (primitive receivers render as the trait path) ---
+    if p.ends_with("::cmp::Ord::min")
+        || p.ends_with("::cmp::Ord::max")
+        || p.ends_with("::cmp::Ord::clamp")
+        || p.ends_with("::cmp::Ord::cmp")
+        || p.ends_with("::cmp::min")
+        || p.ends_with("::cmp::max")
+        || p.contains("::cmp::PartialOrd::")
+        || p.contains("::cmp::PartialEq::")
+        || p.contains("::cmp::Ordering::")
+    {
+        return true;
+    }
+    // --- Conversions: total / Result-returning ---
+    if p.ends_with("::convert::From::from")
+        || p.ends_with("::convert::Into::into")
+        || p.ends_with("::convert::TryFrom::try_from")
+        || p.ends_with("::convert::TryInto::try_into")
+        || p.ends_with("::convert::identity")
+    {
+        return true;
+    }
+    // --- char total methods + free fns (panicking radix/encode caught earlier) ---
+    if p.contains("char::methods::<impl char>") {
+        return p.contains("::is_")          // is_alphabetic/is_numeric/is_whitespace/is_ascii*/…
+            || p.contains("::to_")          // to_uppercase/to_lowercase/to_ascii_*/…
+            || p.contains("::make_ascii_")
+            || p.contains("::eq_ignore_ascii_case")
+            || p.ends_with("::len_utf8")
+            || p.ends_with("::len_utf16");
+    }
+    if p.ends_with("char::from_u32") {
+        return true; // total: returns Option (from_u32_unchecked is unsafe → PB002; from_digit panics → caught earlier)
+    }
+    // --- slice / str total methods (panicking split/chunk/swap/… caught earlier) ---
+    if p.contains("::slice::<impl [T]>") || p.contains("::str::<impl str>") {
+        return p.ends_with("::len")
+            || p.ends_with("::is_empty")
+            || p.ends_with("::first")
+            || p.ends_with("::last")
+            || p.ends_with("::first_chunk")
+            || p.ends_with("::last_chunk")
+            || p.ends_with("::split_first")
+            || p.ends_with("::split_last")
+            || p.ends_with("::split_first_chunk")
+            || p.ends_with("::split_last_chunk")
+            || p.ends_with("::get")  // returns Option (get_unchecked is unsafe → PB002)
+            || p.ends_with("::get_mut")
+            || p.ends_with("::iter")
+            || p.ends_with("::iter_mut")
+            || p.ends_with("::split_at_checked")
+            || p.ends_with("::split_at_mut_checked")
+            || p.ends_with("::as_ptr")
+            || p.ends_with("::as_mut_ptr")
+            || p.ends_with("::as_bytes")
+            || p.ends_with("::contains")
+            || p.ends_with("::starts_with")
+            || p.ends_with("::ends_with")
+            || p.ends_with("::fill")
+            || p.ends_with("::sort")
+            || p.ends_with("::sort_unstable")
+            || p.ends_with("::reverse");
+    }
+    false
+}
 /// Extract the canonical Rust type name (`"u32"`, `"i64"`, ...) from
 /// a shadow `Ty` when it represents a primitive integer; otherwise
 /// `None`. Free-standing because it's a pure type-shape inspection
@@ -4859,6 +5057,122 @@ mod tests {
         for p in negative {
             assert!(!is_panicking_char_method(p), "should NOT be a panicking char method: {p}");
         }
+    }
+    /// The prelude allow-list (`is_trusted_total_library_call`): the total
+    /// stdlib surface the corpus + NET_TOTAL exercise stays allow-listed,
+    /// while total-but-UNLISTED and panicking calls are not (they fail closed).
+    #[test]
+    fn is_trusted_total_library_call_classification() {
+        let allowed = [
+            "core::num::<impl u32>::wrapping_add",
+            "core::num::<impl i32>::checked_div",
+            "core::num::<impl u32>::saturating_mul",
+            "core::num::<impl u32>::midpoint",
+            "core::num::<impl u32>::abs_diff",
+            "core::num::<impl u32>::isqrt", // UNSIGNED isqrt is total
+            "core::num::<impl u32>::to_le_bytes",
+            "core::num::<impl u32>::from_le_bytes",
+            "core::num::<impl u32>::count_ones",
+            "std::cmp::Ord::min",
+            "std::cmp::Ord::max",
+            "std::cmp::Ord::clamp",
+            "std::convert::From::from",
+            "core::convert::TryFrom::try_from",
+            "std::char::methods::<impl char>::is_alphabetic",
+            "std::char::methods::<impl char>::to_ascii_uppercase",
+            "std::char::methods::<impl char>::len_utf8",
+            "core::char::from_u32",
+            "core::slice::<impl [T]>::len",
+            "core::slice::<impl [T]>::get",
+            "core::slice::<impl [T]>::first_chunk",
+            "std::option::Option::<T>::is_some",
+            "core::result::Result::<T, E>::map",
+        ];
+        for p in allowed {
+            assert!(is_trusted_total_library_call(p), "should be allow-listed total: {p}");
+        }
+        let denied = [
+            "core::mem::swap",          // total but UNLISTED → fails closed (conservative)
+            "core::mem::replace",       // unlisted
+            "core::ptr::read",          // unlisted
+            "core::hint::black_box",    // unlisted
+            "core::num::<impl i32>::isqrt", // SIGNED isqrt PANICS (not total)
+            "core::num::<impl u32>::pow",   // panicking (not on the allow-list)
+            "core::num::<impl u32>::next_multiple_of", // panicking
+            "core::slice::<impl [T]>::swap",           // panicking slice method
+            "std::char::methods::<impl char>::to_digit", // panicking
+            "std::iter::Iterator::sum",                  // panicking
+        ];
+        for p in denied {
+            assert!(!is_trusted_total_library_call(p), "should NOT be allow-listed: {p}");
+        }
+    }
+    /// `is_stdlib_namespace_path` separates stdlib calls (governed by the
+    /// prelude) from in-crate calls and user trait-impls (owned by the
+    /// reachability gates) — purely by the leading path segment.
+    #[test]
+    fn is_stdlib_namespace_path_classification() {
+        for p in ["core::mem::swap", "std::cmp::Ord::min", "alloc::vec::Vec::<T>::new"] {
+            assert!(is_stdlib_namespace_path(p), "should be a stdlib path: {p}");
+        }
+        for p in [
+            "corpus_test::helper",
+            "mycrate::module::f",
+            "crate::helper",
+            // A USER type's impl of a stdlib trait renders with a leading `<`
+            // and the user crate — NOT a stdlib-namespace path.
+            "<corpus_test::Foo as std::cmp::Ord>::cmp",
+        ] {
+            assert!(!is_stdlib_namespace_path(p), "should NOT be a stdlib path: {p}");
+        }
+    }
+    /// The prelude fail-closed arm: under `strict_library_acceptance` (default),
+    /// an UNLISTED stdlib call emits an untrusted-stdlib coverage gap; an
+    /// allow-listed total call and an in-crate callee do not; and the opt-out
+    /// restores the historic trust-all-stdlib behavior.
+    #[test]
+    fn prelude_arm_fails_closed_on_untrusted_stdlib() {
+        let cfg = SubsetConfig::default_for_test();
+        assert!(
+            cfg.verification.strict_library_acceptance,
+            "default must be fail-closed",
+        );
+        // UNLISTED stdlib → coverage gap (fails closed).
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_calling("core::mem::swap"), false);
+        let report = v.into_report();
+        assert!(
+            report.coverage_gap_count() >= 1
+                && report.audit_notes.iter().any(|n| n.message.contains("untrusted stdlib")),
+            "unlisted `core::mem::swap` must emit an untrusted-stdlib coverage gap; notes: {:?}",
+            report.audit_notes,
+        );
+        // Allow-listed total stdlib → no gap.
+        let mut v2 = SubsetVisitor::new(&cfg);
+        v2.visit_body(&body_calling("core::num::<impl u32>::wrapping_add"), false);
+        assert_eq!(
+            v2.into_report().coverage_gap_count(),
+            0,
+            "allow-listed total call must not gap",
+        );
+        // In-crate callee (not a stdlib namespace) → no gap.
+        let mut v3 = SubsetVisitor::new(&cfg);
+        v3.visit_body(&body_calling("corpus_test::helper"), false);
+        assert_eq!(
+            v3.into_report().coverage_gap_count(),
+            0,
+            "in-crate callee must not gap (owned by the reachability gates)",
+        );
+        // Opt-out → trust-all-stdlib (no gap).
+        let mut cfg_off = SubsetConfig::default_for_test();
+        cfg_off.verification.strict_library_acceptance = false;
+        let mut v4 = SubsetVisitor::new(&cfg_off);
+        v4.visit_body(&body_calling("core::mem::swap"), false);
+        assert_eq!(
+            v4.into_report().coverage_gap_count(),
+            0,
+            "opt-out (strict_library_acceptance=false) must restore trust-all-stdlib",
+        );
     }
     /// Default mode: `x.pow(y)` / `x.abs()` / `x.div_euclid(y)` emit a
     /// PanicReachability obligation (honest "cannot prove no overflow"), so

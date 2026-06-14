@@ -42,23 +42,28 @@ fn-pointers / closures, floats, `as` casts, slice bounds, and overflow. A
 few constructs are specified but **not yet fully enforced** by the v0.2
 scaffold — loop/recursion termination (PB041/PB042) and implicit drop-glue
 under `verify_roots` narrowing — each tracked per-rule in `docs/PSS-1.md`
-§17.1. One residual is worth calling out for the AoRTE claim specifically:
-the panic of a *library method* lives inside un-walked `core`, so it is
-caught at the call site only for the enumerated families — currently
-`Option`/`Result::unwrap`/`expect`, the panicking int methods
+§17.1. The panic of a *library method* lives inside un-walked `core`, so it
+is caught at the call site. As of the **prelude flip** this boundary is
+**fail-closed by default** (`verification.strict_library_acceptance`): a call
+into `core`/`std`/`alloc` is accepted only if it is on the explicit
+*trusted-total* allow-list (`is_trusted_total_library_call` — the
+`wrapping_*`/`checked_*`/`saturating_*` int methods, `Ord::min`/`max`/`clamp`,
+`From`/`TryFrom`, the total `char`/slice/`Option`/`Result` methods, …);
+**any other stdlib call fails closed as a coverage gap (exit 1)**, whether or
+not we have separately enumerated it as panicking. The enumerated panicking
+families — `unwrap`/`expect`; the panicking int methods
 `pow`/`abs`/`div_euclid`/`div_ceil`/`next_multiple_of`/`from_str_radix`/signed
-`isqrt`/the always-panicking `strict_*` family/… plus
-`Iterator::sum`/`product`/`step_by` and the `char` methods
-(`to_digit`/`from_digit`/`is_digit`, which panic on `radix ∉ 2..=36`, plus
-`encode_utf8`/`encode_utf16` into an undersized buffer),
-`str`/slice range
-indexing (`&s[a..b]` via the `Index` trait), and the panicking `[T]`/`str`
-methods (`split_at`, `swap`, `copy_from_slice`, `rotate_left`/`right`,
-`chunks`/`windows`, `as_chunks` (panics on a zero chunk size),
-`select_nth_unstable`, …). Operator-form arithmetic
-(`x * y`) and element-projection indexing (`a[i]`) are fully covered
-regardless. Less-common panicking library methods not yet on the list
-remain trusted pending the prelude — see `docs/SAFETY-MANUAL.md` §3.6.
+`isqrt`/the `strict_*` family; `Iterator::sum`/`product`/`step_by`; the `char`
+radix/encode methods; `str`/slice range indexing and
+`split_at`/`swap`/`copy_from_slice`/`chunks`/`as_chunks`/… — still produce a
+precise `(PB043)` diagnostic, but they are now an *optimization over* the
+fail-closed default, not the safety boundary itself: an un-modelled panicking
+stdlib method can no longer be silently trusted. Operator-form arithmetic
+(`x * y`) and element-projection indexing (`a[i]`) are covered by PB049/PB054
+regardless. The residual is now the *inverse* and far smaller: a genuinely
+*total* stdlib method the allow-list does not yet enumerate is **conservatively
+rejected** (a false *reject*, never a false discharge) until it is added — see
+`docs/SAFETY-MANUAL.md` §3.6.
 Pitbull will not claim to have proven what it has not: an unimplemented
 rule is a documented gap, never a silent pass.
 ## Why this list looks brutal
