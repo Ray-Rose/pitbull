@@ -1578,6 +1578,24 @@ the std form and now also matches. No shadow type changes.
   false-discharge (a bad `unsafe Send` needs concurrency → PB028; a drop
   panic → the walked drop body → PB043; FFI calls are `unsafe` →
   PB001/PB002).
+- ✅ FFI surface enforced (PB056/PB057/PB058) + PB016 reclassified
+  (2026-06-14, follow-up to the coverage-gap audit). The HIR pre-pass now
+  flags `extern` blocks (PB056, `ItemKind::ForeignMod`), non-Rust-ABI fn
+  definitions (PB058, `FnHeader::abi.is_rustic_abi()` is false), and
+  `#[no_mangle]`/`#[export_name]` (PB057, via `codegen_fn_attrs` — the
+  `NO_MANGLE` flag or a `symbol_name`), each failing closed (exit 1).
+  Macro-expansion spans are skipped (F7 posture); a normal Rust fn does not
+  fire. Pinned e2e by `ffi_constructs_fire_pb056_pb057_pb058`. This closes
+  the last expressible silent subset-membership gaps the coverage-gap audit
+  found. PB016 (`Drop` impl) is deliberately NOT enforced as a syntactic
+  reject — that would wrongly reject safe RAII; it is TRANSITIVELY COVERED
+  for AoRTE: the drop method body is walked, so a panicking drop fires
+  PB043 (verified: `impl Drop { fn drop(&mut self){ panic!() } }` → pending
+  PB043 → exit 1) and a panic-free drop is genuinely safe. The only
+  residual is a panicking drop reached ONLY via implicit drop-glue under
+  `verify_roots` narrowing — the #27 drop-glue follow-up (`callee_paths`
+  tracks `Call`, not `Drop`, terminators); with the default empty
+  `verify_roots` (full-crate walk) every drop body is walked.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

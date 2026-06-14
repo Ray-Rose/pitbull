@@ -1857,6 +1857,62 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
                 });
             }
         }
+        // PB056 / PB057 / PB058 — FFI surface (coverage-gap audit
+        // 2026-06-14). `extern` blocks, non-Rust-ABI fn definitions, and
+        // `#[no_mangle]` / `#[export_name]` cross the FFI boundary the v0.2
+        // model does not cover (the README lists FFI as out-of-subset).
+        // Like PB003 these are item/attr-level — foreign items have no MIR
+        // body, and ABI + linkage do not survive into MIR — so detect at
+        // HIR. Macro-expansion spans are skipped (same F7 posture as PB001).
+        if !item.span.from_expansion() {
+            let ffi: Option<(pitbull_subset::rules::RuleId, String)> = match &item.kind
+            {
+                rustc_hir::ItemKind::ForeignMod { .. } => {
+                    Some((pitbull_subset::rules::PB056, "`extern` block (FFI)".to_string()))
+                }
+                rustc_hir::ItemKind::Fn { sig, .. } if !sig.header.abi.is_rustic_abi() => {
+                    Some((
+                        pitbull_subset::rules::PB058,
+                        format!("non-Rust ABI fn (`extern {:?}`)", sig.header.abi),
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((rule, detail)) = ffi {
+                let span =
+                    rustc_span_to_shadow(self.tcx, item.span, &mut self.filename_table);
+                self.violations.push(pitbull_subset::SubsetError {
+                    rule,
+                    span,
+                    detail,
+                    in_spec: false,
+                });
+            }
+            // PB057: `#[no_mangle]` / `#[export_name]` exports a fn under a
+            // fixed symbol callable by external (non-Rust) code whose
+            // calling contract is outside our model. `no_mangle`/`export_name`
+            // are built-in attributes parsed into codegen attrs (not
+            // path-matchable HIR attrs), so read them from `codegen_fn_attrs`.
+            if matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
+                let cfa = self.tcx.codegen_fn_attrs(item.owner_id.to_def_id());
+                let no_mangle = cfa.flags.contains(
+                    rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NO_MANGLE,
+                );
+                if no_mangle || cfa.symbol_name.is_some() {
+                    let span = rustc_span_to_shadow(
+                        self.tcx,
+                        item.span,
+                        &mut self.filename_table,
+                    );
+                    self.violations.push(pitbull_subset::SubsetError {
+                        rule: pitbull_subset::rules::PB057,
+                        span,
+                        detail: "`#[no_mangle]` / `#[export_name]` (FFI linkage)".to_string(),
+                        in_spec: false,
+                    });
+                }
+            }
+        }
         rustc_hir::intravisit::walk_item(self, item);
     }
     fn visit_block(&mut self, b: &'tcx rustc_hir::Block<'tcx>) {

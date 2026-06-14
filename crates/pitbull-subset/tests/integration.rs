@@ -2693,3 +2693,44 @@ fn unsafe_impl_and_trait_fire_pb003() {
          stderr:\n{stderr}",
     );
 }
+/// Coverage-gap audit (2026-06-14): the FFI surface — `extern` blocks
+/// (PB056), `#[no_mangle]`/`#[export_name]` (PB057), and non-Rust-ABI fn
+/// definitions (PB058) — is item/attr-level with no MIR body and was
+/// SILENTLY accepted. The HIR pre-pass now flags all three and fails
+/// closed; a normal Rust fn in the same file must NOT fire.
+#[test]
+fn ffi_constructs_fire_pb056_pb057_pb058() {
+    let Some(env) = E2eEnv::probe() else {
+        let require = std::env::var_os("PITBULL_REQUIRE_E2E").is_some();
+        if require {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("ffi_constructs_fire_pb056_pb057_pb058: SKIPPED — prerequisites missing.");
+        return;
+    };
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut src = std::env::temp_dir();
+    src.push(format!("pitbull-ffi-{}-{}.rs", std::process::id(), counter));
+    fs::write(
+        &src,
+        "extern \"C\" { fn ext_c(x: u32) -> u32; }\n\
+         pub extern \"C\" fn cfn(x: u32) -> u32 { x }\n\
+         #[no_mangle] pub fn nm(x: u32) -> u32 { x }\n\
+         pub fn normal(x: u32) -> u32 { x }\n",
+    )
+    .expect("write FFI probe");
+    let result = run_one_corpus_file_full(&env, &src, &[]);
+    let _ = fs::remove_file(&src);
+    let (stderr, code) = result.expect("wrapper should run");
+    for rule in ["PB056", "PB057", "PB058"] {
+        assert!(
+            stderr.contains(rule),
+            "{rule} must fire on the FFI surface; stderr:\n{stderr}",
+        );
+    }
+    assert_eq!(
+        code,
+        Some(1),
+        "FFI constructs must FAIL CLOSED (exit 1); stderr:\n{stderr}",
+    );
+}
