@@ -2964,7 +2964,7 @@ where
     std::panic::set_hook(Box::new(|_| {}));
     let mut s: u64 = seed | 1;
     let mut panicked = false;
-    let mut probe = |x: u32, panicked: &mut bool| {
+    let probe = |x: u32, panicked: &mut bool| {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(x))).is_err() {
             *panicked = true;
         }
@@ -3007,6 +3007,11 @@ fn probe_add_one(x: u32) -> u32 {
     x + 1
 }
 const ADD_ONE_SRC: &str = "pub fn add_one(x: u32) -> u32 { x + 1 }\n";
+fn probe_median3(a: u32, b: u32, c: u32) -> u32 {
+    a.min(b).max(a.max(b).min(c))
+}
+const MEDIAN3_SRC: &str =
+    "pub fn median3(a: u32, b: u32, c: u32) -> u32 { a.min(b).max(a.max(b).min(c)) }\n";
 
 fn skip_or_require(name: &str) {
     if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
@@ -3056,6 +3061,84 @@ fn differential_zero_obligation_verified_implies_fuzz_clean() {
         "FALSE DISCHARGE: wrapper VERIFIED `mix` but fuzzing found a panic!",
     );
     assert!(!fuzz_panicked, "`mix` (wrapping ops) must never panic");
+}
+
+/// STRONG differential #2, solver-free and call-family-diverse: `median3`
+/// uses only `Ord::min`/`max` (total, non-panicking) — no arithmetic, no
+/// indexing, no `as` casts, no loops — so Pitbull emits ZERO obligations and
+/// the wrapper exits 0 (verified) on its own (empirically confirmed
+/// 2026-06-14). The fuzz must then (a) never panic AND (b) always return the
+/// middle of the sorted triple — a correctness oracle the `mix` proof lacks.
+/// This is a second, independent `verified => fuzz-clean` witness that
+/// exercises a DIFFERENT trusted-total call family (`min`/`max` vs the
+/// `wrapping_*` arithmetic of `mix`), widening the empirical coverage of
+/// "what Pitbull verifies as zero-obligation is genuinely AoRTE-safe."
+#[test]
+fn differential_median3_zero_obligation_verified_implies_fuzz_clean() {
+    // Nested fn (captures nothing) so the loop can read the flags between
+    // calls without an outstanding mutable borrow. Declared before any
+    // statement so it reads as a local helper (no items-after-statements).
+    fn check(a: u32, b: u32, c: u32, fuzz_panicked: &mut bool, oracle_failed: &mut bool) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe_median3(a, b, c))) {
+            Err(_) => *fuzz_panicked = true,
+            Ok(m) => {
+                let mut sorted = [a, b, c];
+                sorted.sort_unstable();
+                if m != sorted[1] {
+                    *oracle_failed = true;
+                }
+            }
+        }
+    }
+    let Some(env) = E2eEnv::probe() else {
+        skip_or_require("differential_median3");
+        return;
+    };
+    let (stderr, code) = run_wrapper_on_source(&env, MEDIAN3_SRC, &[]).expect("wrapper run");
+    assert!(
+        wrapper_verified(code),
+        "Pitbull should VERIFY `median3` (min/max are total; zero obligations, no \
+         solver needed); got exit {code:?}, stderr:\n{stderr}",
+    );
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut fuzz_panicked = false;
+    let mut oracle_failed = false;
+    // Boundary triples: all-equal, MIN/MAX saturation, and both monotone
+    // orderings (so the min/max chain is exercised in every direction).
+    for (a, b, c) in [
+        (0u32, 0, 0),
+        (u32::MAX, u32::MAX, u32::MAX),
+        (0, u32::MAX, 0),
+        (u32::MAX, 0, u32::MAX),
+        (1, 2, 3),
+        (3, 2, 1),
+    ] {
+        check(a, b, c, &mut fuzz_panicked, &mut oracle_failed);
+    }
+    let mut s: u64 = 0x3ED1_C0DE_0BAD_F00D;
+    for _ in 0..100_000 {
+        s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+        let a = s.wrapping_mul(0x2545_F491_4F6C_DD1D) as u32;
+        s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+        let b = s.wrapping_mul(0x2545_F491_4F6C_DD1D) as u32;
+        s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+        let c = s.wrapping_mul(0x2545_F491_4F6C_DD1D) as u32;
+        check(a, b, c, &mut fuzz_panicked, &mut oracle_failed);
+        if fuzz_panicked || oracle_failed {
+            break;
+        }
+    }
+    std::panic::set_hook(prev);
+    assert!(
+        !(wrapper_verified(code) && fuzz_panicked),
+        "FALSE DISCHARGE: wrapper VERIFIED `median3` but fuzzing found a panic!",
+    );
+    assert!(!fuzz_panicked, "`median3` (min/max only) must never panic");
+    assert!(
+        !oracle_failed,
+        "`median3` must always return the middle of the sorted triple {{a, b, c}}",
+    );
 }
 
 /// NEGATIVE control: unconstrained `add_one` (`x + 1`, NO precondition) can

@@ -1800,22 +1800,26 @@ the std form and now also matches. No shadow type changes.
   counterpart to the static discharge logic (it catches the exact
   false-discharge class the deep audit found in `unwrap`/`pow` by *reasoning*).
   Two kinds of proof: (1) UNCONDITIONAL AoRTE proofs safe on every input —
-  bitwise CRC-32 (with the canonical `0xCBF43926` known-answer), a guarded
-  binary search (oracle: agrees with linear scan), and power-of-two
-  ring-buffer addressing (oracle: always in capacity) — three of the
-  positive proofs PSS-1 §15 names; (2) PRECONDITION-RESPECTING proofs that
+  bitwise CRC-32 and CRC-16/CCITT-FALSE (with the canonical `0xCBF43926` /
+  `0x29B1` known-answers), in-place insertion sort (oracle: matches `std`'s
+  sort ⇒ sorted + a permutation), a fixed-point Q16.16 PID step (all-total
+  saturating / wrapping / clamp / shift ops; oracle: zero gains ⇒ 0),
+  branchless median-of-three (oracle: the middle of the sorted triple), a
+  guarded binary search (oracle: agrees with linear scan), and power-of-two
+  ring-buffer addressing (oracle: always in capacity) — the positive proofs
+  PSS-1 §15 names; (2) PRECONDITION-RESPECTING proofs that
   fuzz ONLY the admitted domain of Pitbull's discharged shapes — `at(s,i)`
   under `i < len` (PB054) and `add_one(x)` under `x < 100` (PB049) — a
   direct empirical check that each discharged precondition is SUFFICIENT for
   safety. A control test confirms the net has teeth: `add_one(u32::MAX)`
   (the precondition dropped) DOES overflow-panic under `overflow-checks`, so
-  a discharge resting on an insufficient precondition would be caught. 6
+  a discharge resting on an insufficient precondition would be caught. 10
   tests.
 - ✅ End-to-end AoRTE differential wired (2026-06-14). Closes the loop: the
   `pitbull-rustc` wrapper's STATIC verdict (its exit code — 0 only with zero
   violations / undischarged / coverage-gaps) now gates the EMPIRICAL fuzz
   programmatically in `integration.rs`, so a false discharge fails the suite.
-  Three probes: (1) the STRONG claim exercisable WITHOUT a solver — `mix`
+  Four probes: (1) the STRONG claim exercisable WITHOUT a solver — `mix`
   (wrapping ops, no indexing) emits ZERO obligations so the wrapper exits 0
   on its own, and 100k fuzzed `(a,b)` pairs must be panic-free (`verified ⟹
   fuzz-clean`, asserted directly); (2) a NEGATIVE control — unconstrained
@@ -1824,10 +1828,14 @@ the std form and now also matches. No shadow type changes.
   genuinely-unsafe fn; (3) solver-gated — `add_one` under
   `#[pitbull::requires("x < 100")]` discharges with a solver (then the
   admitted-domain fuzz must be clean), and on a solverless host confirms the
-  empirical side + notes the SMT claim couldn't be exercised. 3 tests (gated
-  on the nightly wrapper like the corpus e2e). NEXT: the remaining §15 proofs
-  (insertion sort, MAC-frame parser, PID controller); and the Miri /
-  Tree-Borrows pass for UB (not just panics).
+  empirical side + notes the SMT claim couldn't be exercised; (4) a SECOND
+  zero-obligation witness in a DIFFERENT trusted-total call family —
+  `median3` (only `Ord::min`/`max`; no arithmetic, indexing, `as` casts, or
+  loops) verifies on its own (exit 0, empirically confirmed), then 100k
+  fuzzed triples must be panic-free AND equal the sorted middle (a
+  correctness oracle `mix` lacks). 4 tests (gated on the nightly wrapper like
+  the corpus e2e). NEXT: the remaining §15 proof (the MAC-frame parser); and
+  the Miri / Tree-Borrows pass for UB (not just panics).
 - ✅ CRITICAL false-discharge fix: panicking slice/str methods (deep audit,
   2026-06-14). A 4-agent adversarial re-audit of the whole codebase
   (verified against real MIR) PROVED a false discharge: `<[T]>::swap`,
@@ -1857,7 +1865,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  316 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  321 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1870,7 +1878,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 316 passing, 0 warnings, clippy clean
+# Stable: 321 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

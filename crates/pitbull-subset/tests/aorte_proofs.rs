@@ -191,6 +191,126 @@ fn ring_index_always_in_capacity_and_never_panics() {
     }
 }
 
+/// In-place insertion sort with guarded indexing. AoRTE-safe: `a.swap(j-1,
+/// j)` runs only while `0 < j <= i < len`, so both indices are in bounds;
+/// `j - 1` is guarded by `j > 0`. (PSS-1 §15 names insertion sort.)
+fn insertion_sort(a: &mut [u32]) {
+    let mut i = 1;
+    while i < a.len() {
+        let mut j = i;
+        while j > 0 && a[j - 1] > a[j] {
+            a.swap(j - 1, j);
+            j -= 1;
+        }
+        i += 1;
+    }
+}
+
+#[test]
+fn insertion_sort_correct_and_never_panics() {
+    let mut rng = Rng::new(0x1235_0820_0000_0001);
+    // Sort is O(n^2); ITERS/8 over arrays up to 32 is still ~25k sorts.
+    for _ in 0..ITERS / 8 {
+        let len = rng.below(33);
+        let orig: Vec<u32> = (0..len).map(|_| rng.next_u32() % 1000).collect();
+        let mut mine = orig.clone();
+        insertion_sort(&mut mine);
+        // Oracle: equal to std's sort of the same input ⇒ sorted AND a
+        // permutation (the two properties §15 asks for).
+        let mut reference = orig.clone();
+        reference.sort_unstable();
+        assert_eq!(mine, reference, "insertion_sort must match std sort");
+    }
+}
+
+/// CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF), bitwise — pure wrapping
+/// shift/xor, AoRTE-safe on any input. Shift amounts (8, 1) are < 16, so no
+/// over-shift; `u8 -> u16` is a widening cast. (PSS-1 §15 names CRC-CCITT.)
+fn crc16_ccitt(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    let mut i = 0usize;
+    while i < data.len() {
+        crc ^= (data[i] as u16) << 8; // i < len ⇒ in-bounds
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+            bit += 1;
+        }
+        i += 1;
+    }
+    crc
+}
+
+#[test]
+fn crc16_ccitt_known_answer_and_never_panics() {
+    // Canonical CRC-16/CCITT-FALSE check value for "123456789" is 0x29B1.
+    assert_eq!(crc16_ccitt(b"123456789"), 0x29B1, "CRC-16/CCITT-FALSE check value");
+    let mut rng = Rng::new(0xCC17_0000_0000_0001);
+    for _ in 0..ITERS {
+        let data = rng.bytes(64);
+        let a = crc16_ccitt(&data);
+        assert_eq!(a, crc16_ccitt(&data), "CRC-16 must be a pure function");
+    }
+}
+
+/// Fixed-point (Q16.16) PID step with saturating integral and wrapping
+/// products widened to `i64` (so `i32 * i32` cannot overflow). Saturating /
+/// wrapping / shift / clamp are all total — AoRTE-safe on any input.
+/// (PSS-1 §15 names a PID controller.)
+fn pid_step(setpoint: i32, measured: i32, integral: &mut i32, kp: i32, ki: i32) -> i32 {
+    let error = setpoint.wrapping_sub(measured);
+    *integral = integral.saturating_add(error);
+    let p = (kp as i64).wrapping_mul(error as i64) >> 16;
+    let i_term = (ki as i64).wrapping_mul(*integral as i64) >> 16;
+    p.wrapping_add(i_term).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+#[test]
+fn pid_step_never_panics() {
+    let mut rng = Rng::new(0x91D0_0000_0000_0001);
+    // Oracle: with zero gains, the output is 0 regardless of inputs.
+    let mut zero_integ = 0i32;
+    assert_eq!(
+        pid_step(rng.next_u32() as i32, rng.next_u32() as i32, &mut zero_integ, 0, 0),
+        0,
+        "zero-gain PID output must be 0",
+    );
+    // Fuzz with arbitrary gains/inputs and a PERSISTENT integral term (so the
+    // saturating accumulation is exercised across iterations).
+    let mut integral = 0i32;
+    for _ in 0..ITERS {
+        let out = pid_step(
+            rng.next_u32() as i32,
+            rng.next_u32() as i32,
+            &mut integral,
+            rng.next_u32() as i32,
+            rng.next_u32() as i32,
+        );
+        // Must never panic; the result is always a valid i32 by construction.
+        let _ = out;
+    }
+}
+
+/// Branchless median-of-three (a voting reducer). `min`/`max` are total — no
+/// indexing, no arithmetic — so this is AoRTE-safe AND Pitbull emits ZERO
+/// obligations on it (see the e2e differential, where it is a 2nd
+/// `verified ⟹ fuzz-clean` proof). (PSS-1 §15 names a voting reducer.)
+fn median3(a: u32, b: u32, c: u32) -> u32 {
+    a.min(b).max(a.max(b).min(c))
+}
+
+#[test]
+fn median3_correct_and_never_panics() {
+    let mut rng = Rng::new(0x3ED1_0000_0000_0001);
+    for _ in 0..ITERS {
+        let (a, b, c) = (rng.next_u32() % 1000, rng.next_u32() % 1000, rng.next_u32() % 1000);
+        let m = median3(a, b, c);
+        let mut sorted = [a, b, c];
+        sorted.sort_unstable();
+        assert_eq!(m, sorted[1], "median3({a},{b},{c}) must be the middle value");
+    }
+}
+
 // =====================================================================
 // 2. Precondition-respecting proofs — Pitbull's discharged-under-a-
 //    -precondition shapes. We fuzz ONLY the admitted input domain and
