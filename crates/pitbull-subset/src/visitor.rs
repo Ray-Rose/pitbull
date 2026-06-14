@@ -2933,8 +2933,18 @@ pub fn is_panicking_library_call(p: &str) -> bool {
 /// correctly excluded: `wrapping_*` / `overflowing_*` (`::wrapping_pow`,
 /// `::overflowing_pow` end `_pow`, not `::pow`), `checked_*`, `saturating_*`,
 /// `unsigned_abs` (`_abs`, not `::abs`), `abs_diff` (`_diff`), `isqrt`.
+///
+/// Also covers the iterator-FOLD form of overflow — `Iterator::sum` /
+/// `Iterator::product` — which panic on overflow under `overflow-checks`
+/// (PSS-1 PB049 requires that profile), the same class as `x.pow(y)` and the
+/// `x * y` operator (deep audit 2026-06-14). These are trait methods (not
+/// `num::<impl`), so they are checked before the int-method anchor.
 #[must_use]
 pub fn is_panicking_int_method(p: &str) -> bool {
+    // Iterator folds that panic on integer overflow (debug / overflow-checks).
+    if p.ends_with("iter::Iterator::sum") || p.ends_with("iter::Iterator::product") {
+        return true;
+    }
     if !p.contains("num::<impl") {
         return false;
     }
@@ -2967,27 +2977,54 @@ pub fn is_panicking_int_method(p: &str) -> bool {
 ///
 /// `ops::Index::index` / `ops::IndexMut::index_mut` for the range/byte
 /// index (anchored on the trait path, so a user trait of a different name
-/// is not matched). The slice methods are anchored on the
-/// `slice::<impl [T]>` inherent-impl rendering and matched by exact method
-/// suffix, so `split_at_unchecked` (unsafe; `_unchecked`), `chunks_exact`
-/// vs `chunks` etc. are each distinguished precisely.
+/// is not matched). The inherent methods are anchored on the `[T]` / `str`
+/// inherent-impl rendering (`::slice::<impl` / `::str::<impl`) and matched
+/// by exact method suffix, so the `_unchecked` (unsafe → PB002) and
+/// non-panicking siblings (`split_at_checked`, `len`, `iter`, `fill`, …) are
+/// each distinguished precisely. The list is the KNOWN panicking subset of
+/// the (stable) `[T]`/`str` inherent API — a deep audit (2026-06-14) proved
+/// `swap`/`rotate_*`/`copy_from_slice`/`clone_from_slice` were silently
+/// accepted (a CRITICAL false discharge), so the enumeration is now
+/// comprehensive over the stable panicking methods.
 #[must_use]
 pub fn is_panicking_index_or_slice_call(p: &str) -> bool {
+    // Range / `[]` indexing via the Index/IndexMut trait (str non-char-
+    // boundary / slice OOB). Element `v[i]` is a PB054 projection, not this.
     if p.ends_with("ops::Index::index") || p.ends_with("ops::IndexMut::index_mut") {
         return true;
     }
-    if p.contains("slice::<impl") {
-        return p.ends_with("::split_at")
-            || p.ends_with("::split_at_mut")
-            || p.ends_with("::chunks")
-            || p.ends_with("::chunks_mut")
-            || p.ends_with("::chunks_exact")
-            || p.ends_with("::chunks_exact_mut")
-            || p.ends_with("::rchunks")
-            || p.ends_with("::rchunks_mut")
-            || p.ends_with("::windows");
+    // Inherent `[T]` / `str` methods. Leading `::` on the str anchor avoids
+    // matching `c_str::<impl` (CStr) and similar.
+    let on_slice_or_str = p.contains("::slice::<impl") || p.contains("::str::<impl");
+    if !on_slice_or_str {
+        return false;
     }
-    false
+    // Split / chunk / window: panic on `mid > len` / a zero size.
+    p.ends_with("::split_at")
+        || p.ends_with("::split_at_mut")
+        || p.ends_with("::chunks")
+        || p.ends_with("::chunks_mut")
+        || p.ends_with("::chunks_exact")
+        || p.ends_with("::chunks_exact_mut")
+        || p.ends_with("::rchunks")
+        || p.ends_with("::rchunks_mut")
+        || p.ends_with("::rchunks_exact")
+        || p.ends_with("::rchunks_exact_mut")
+        || p.ends_with("::windows")
+        // Element swap / in-place rotate / cross-slice copy: panic on OOB
+        // index, `mid`/`k > len`, or a length mismatch (deep audit
+        // 2026-06-14 — these were the silently-accepted false discharges).
+        || p.ends_with("::swap")
+        || p.ends_with("::swap_with_slice")
+        || p.ends_with("::rotate_left")
+        || p.ends_with("::rotate_right")
+        || p.ends_with("::copy_from_slice")
+        || p.ends_with("::clone_from_slice")
+        || p.ends_with("::copy_within")
+        // Quickselect: panics on `index >= len`.
+        || p.ends_with("::select_nth_unstable")
+        || p.ends_with("::select_nth_unstable_by")
+        || p.ends_with("::select_nth_unstable_by_key")
 }
 /// Extract the canonical Rust type name (`"u32"`, `"i64"`, ...) from
 /// a shadow `Ty` when it represents a primitive integer; otherwise
@@ -4651,6 +4688,9 @@ mod tests {
             "core::num::<impl i64>::rem_euclid",
             "core::num::<impl u32>::next_power_of_two",
             "core::num::<impl u32>::ilog2",
+            // Iterator-fold overflow (same class; trait method, not num::<impl).
+            "std::iter::Iterator::sum",
+            "core::iter::Iterator::product",
         ];
         for p in positive {
             assert!(is_panicking_int_method(p), "should be a panicking int method: {p}");
@@ -4729,7 +4769,21 @@ mod tests {
             "core::slice::<impl [T]>::split_at_mut",
             "core::slice::<impl [T]>::chunks",
             "core::slice::<impl [T]>::chunks_exact",
+            "core::slice::<impl [T]>::rchunks_exact",
             "core::slice::<impl [T]>::windows",
+            // Deep-audit 2026-06-14: these were the silently-accepted ones.
+            "core::slice::<impl [T]>::swap",
+            "core::slice::<impl [T]>::swap_with_slice",
+            "core::slice::<impl [T]>::rotate_left",
+            "core::slice::<impl [T]>::rotate_right",
+            "core::slice::<impl [T]>::copy_from_slice",
+            "core::slice::<impl [T]>::clone_from_slice",
+            "core::slice::<impl [T]>::copy_within",
+            "core::slice::<impl [T]>::select_nth_unstable",
+            "core::slice::<impl [T]>::select_nth_unstable_by_key",
+            // str panicking methods (anchored on `::str::<impl`).
+            "core::str::<impl str>::split_at",
+            "core::str::<impl str>::split_at_mut",
         ];
         for p in positive {
             assert!(is_panicking_index_or_slice_call(p), "should be flagged: {p}");
@@ -4737,10 +4791,16 @@ mod tests {
         let negative = [
             "core::slice::<impl [T]>::len",
             "core::slice::<impl [T]>::iter",
-            "core::slice::<impl [T]>::first",      // returns Option, not a panic itself
-            "core::slice::<impl [T]>::split_first", // returns Option
-            "my_crate::MyIndex::index",            // user trait named index, not ops::Index
+            "core::slice::<impl [T]>::first",       // returns Option, not a panic itself
+            "core::slice::<impl [T]>::split_first",  // returns Option
+            "core::slice::<impl [T]>::split_at_checked", // returns Option (no panic)
+            "core::slice::<impl [T]>::fill",         // does not panic
+            "core::slice::<impl [T]>::sort_unstable", // does not panic
+            "my_crate::MyIndex::index",             // user trait named index, not ops::Index
             "core::slice::<impl [T]>::as_ptr",
+            "core::mem::swap",                       // free fn `swap`, not a slice method
+            "core::num::<impl u32>::rotate_left",    // bit-rotate, NOT a slice rotate (no panic)
+            "core::ffi::c_str::<impl CStr>::to_bytes", // CStr, not str (leading-:: anchor excludes)
         ];
         for p in negative {
             assert!(!is_panicking_index_or_slice_call(p), "should NOT be flagged: {p}");
@@ -4756,6 +4816,11 @@ mod tests {
             "std::ops::Index::index",
             "core::slice::<impl [T]>::split_at",
             "core::slice::<impl [T]>::chunks",
+            // The deep-audit CRITICAL set — previously silently accepted.
+            "core::slice::<impl [T]>::swap",
+            "core::slice::<impl [T]>::copy_from_slice",
+            "core::slice::<impl [T]>::rotate_left",
+            "core::str::<impl str>::split_at",
         ] {
             let mut v = SubsetVisitor::new(&cfg);
             v.visit_body(&body_calling(path), false);

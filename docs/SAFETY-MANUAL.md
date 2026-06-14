@@ -126,13 +126,20 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
     - `Option`/`Result::{unwrap, expect, unwrap_err, expect_err}`;
     - the panicking primitive-int inherent methods `pow` / `abs` /
       `div_euclid` / `rem_euclid` / `next_power_of_two` / `ilog`/`ilog2`/
-      `ilog10` (the METHOD form of overflow — the OPERATOR form `x * y` is
-      already PB049); and
+      `ilog10`, AND the iterator-fold overflow `Iterator::{sum, product}`
+      (the METHOD/fold form of overflow — the OPERATOR form `x * y` is
+      already PB049);
     - `str`/slice RANGE indexing `&s[a..b]` / `&v[a..b]` (which lowers to a
       `core::ops::Index::index` `Call`, NOT a `ProjectionElem::Index`, so
-      PB054 does not see it — only element `v[i]` is a projection) plus the
-      panicking slice methods `<[T]>::split_at`/`split_at_mut`/`chunks`/
-      `chunks_exact`/`rchunks`/`windows`.
+      PB054 does not see it — only element `v[i]` is a projection); and
+    - the panicking `[T]`/`str` inherent methods — `split_at`/`split_at_mut`,
+      `chunks`/`chunks_exact`/`rchunks`/`rchunks_exact`/`windows` (zero size),
+      `swap`/`swap_with_slice`, `rotate_left`/`rotate_right`,
+      `copy_from_slice`/`clone_from_slice`/`copy_within` (length mismatch /
+      OOB), and `select_nth_unstable`(`_by`/`_by_key`). A 2026-06-14 deep
+      audit PROVED `swap`/`copy_from_slice`/`rotate_*` were previously a
+      silent exit-0 "verified" (a CRITICAL false discharge); the enumeration
+      is now comprehensive over the stable panicking `[T]`/`str` API.
   - **Documented residual — less-common library panics remain trusted (a
     known gap, NOT a silent pass).** The catch-list above is the common-and-
     dangerous subset, not exhaustive. Other library functions whose panic is

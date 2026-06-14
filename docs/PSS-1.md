@@ -1814,6 +1814,28 @@ the std form and now also matches. No shadow type changes.
   wrapper AND fuzz in one test, asserting `verified ⟹ fuzz-clean`); add the
   remaining §15 proofs (insertion sort, MAC-frame parser, PID controller);
   and the Miri / Tree-Borrows pass for UB (not just panics).
+- ✅ CRITICAL false-discharge fix: panicking slice/str methods (deep audit,
+  2026-06-14). A 4-agent adversarial re-audit of the whole codebase
+  (verified against real MIR) PROVED a false discharge: `<[T]>::swap`,
+  `rotate_left`/`rotate_right`, `copy_from_slice`/`clone_from_slice`,
+  `copy_within`, `swap_with_slice`, `select_nth_unstable*` panic at runtime
+  (OOB / `mid > len` / length mismatch) but the wrapper reported exit 0
+  ("verified") with ZERO obligations — `is_panicking_index_or_slice_call`'s
+  suffix list was under-inclusive (`split_at`/`chunks`/`windows` were caught,
+  their siblings were not), and the `slice::<impl` anchor missed `str`
+  methods entirely. Fixed: the matcher now enumerates the COMPLETE stable
+  panicking `[T]`/`str` inherent API and anchors on `::slice::<impl` /
+  `::str::<impl` (the leading `::` excludes `c_str::<impl`/CStr). The same
+  audit added the iterator-fold overflow `Iterator::{sum, product}` (same
+  class as `pow`) and hardened `crate_of_path` to peel ALL leading `<`
+  (`<<A as T1>::Assoc as T2>::m` → `A`'s crate, not the fail-open `<crate`).
+  Verified e2e: `dst.copy_from_slice(src)` now emits PB043 → exit 1 (was
+  exit 0). Pinned by extended classification + obligation-emission unit
+  tests and a new corpus reject file `reject/PB043_slice_panic.rs`. The
+  re-audit ALSO disproved a flagged "cross-crate generic fail-open" — the
+  manifest's `referenced` and `universe` use the SAME generic-item path
+  format (empirically `corpus_test::generic_fn`, no `::<u32>` args), so the
+  universe-filter does not miss generic cross-crate callees.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

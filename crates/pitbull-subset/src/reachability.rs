@@ -348,7 +348,10 @@ pub struct ReachManifest {
 pub fn crate_of_path(path: &str) -> &str {
     // Trait-impl rendering `<Type as Trait>::method`: the owning crate is
     // the crate of `Type` (the Self type), inside the angle brackets.
-    let inner = path.strip_prefix('<').unwrap_or(path);
+    // `trim_start_matches` (not `strip_prefix`) peels ALL leading `<` so the
+    // doubly-qualified `<<A as T1>::Assoc as T2>::m` form also resolves to
+    // `A`'s crate rather than the fail-open `<crate` (deep audit 2026-06-14).
+    let inner = path.trim_start_matches('<');
     let self_ty = inner.split(" as ").next().unwrap_or(inner);
     match self_ty.split_once("::") {
         Some((krate, _)) => krate,
@@ -928,6 +931,13 @@ mod tests {
         assert_eq!(crate_of_path("crate_b::<impl X>::foo"), "crate_b");
         assert_eq!(crate_of_path("<crate_b::Foo as some::Trait>::method"), "crate_b");
         assert_eq!(crate_of_path("<crate_b::Foo<u32> as core::ops::Add>::add"), "crate_b");
+        // Doubly-qualified (associated-type Self) — deep audit 2026-06-14:
+        // `trim_start_matches('<')` peels both `<`, so the crate is `crate_b`,
+        // not the fail-open `<crate_b`.
+        assert_eq!(
+            crate_of_path("<<crate_b::A as t1::T1>::Assoc as t2::T2>::m"),
+            "crate_b",
+        );
         assert_eq!(crate_of_path("bare"), "bare");
         assert_eq!(crate_of_path(""), "");
     }

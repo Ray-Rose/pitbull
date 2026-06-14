@@ -46,11 +46,13 @@ under `verify_roots` narrowing — each tracked per-rule in `docs/PSS-1.md`
 the panic of a *library method* lives inside un-walked `core`, so it is
 caught at the call site only for the enumerated families — currently
 `Option`/`Result::unwrap`/`expect`, the panicking int methods
-`pow`/`abs`/`div_euclid`/…, `str`/slice range indexing (`&s[a..b]` via the
-`Index` trait), and `<[T]>::split_at`/`chunks`/`windows`. Operator-form
-arithmetic (`x * y`) and element-projection indexing (`a[i]`) are fully
-covered regardless. Less-common panicking library methods not yet on the
-list remain trusted pending the prelude — see `docs/SAFETY-MANUAL.md` §3.6.
+`pow`/`abs`/`div_euclid`/… plus `Iterator::sum`/`product`, `str`/slice range
+indexing (`&s[a..b]` via the `Index` trait), and the panicking `[T]`/`str`
+methods (`split_at`, `swap`, `copy_from_slice`, `rotate_left`/`right`,
+`chunks`/`windows`, `select_nth_unstable`, …). Operator-form arithmetic
+(`x * y`) and element-projection indexing (`a[i]`) are fully covered
+regardless. Less-common panicking library methods not yet on the list
+remain trusted pending the prelude — see `docs/SAFETY-MANUAL.md` §3.6.
 Pitbull will not claim to have proven what it has not: an unimplemented
 rule is a documented gap, never a silent pass.
 ## Why this list looks brutal
