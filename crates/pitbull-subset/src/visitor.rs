@@ -1989,10 +1989,22 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 ),
             );
         };
-        // Known SMT variable names: `result` + return-typed parameter
-        // names (uniform `BitVec<W>` sort).
-        let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
-        known.insert("result".to_string());
+        // SMT variable scopes — SOUNDNESS-CRITICAL split (audit 2026-05-31).
+        // POSTCONDITIONS may reference `result` (the return value) plus the
+        // return-typed args; PRECONDITIONS may reference the args ONLY.
+        // `result` is the OUTPUT: a precondition that constrains it would be
+        // assumed as a (circular) hypothesis ABOUT the output, which can
+        // vacuously discharge a false postcondition — e.g. `requires(result <
+        // 100)` + `ensures(result < 100)` on `fn f(x:u8)->u8 { x }` would make
+        // the main check `result=x ∧ result<100 ∧ ¬(result<100)` unsat and
+        // "discharge", though f(200)=200. Excluding `result` from the
+        // precondition scope makes such a precondition untranslatable, so the
+        // obligation stays pending (fail closed).
+        let mut known_post: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        known_post.insert("result".to_string());
+        let mut known_pre: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut ret_typed_args: Vec<String> = Vec::new();
         for (i, name) in self.current_body_arg_names.iter().enumerate() {
             if name.is_empty() {
@@ -2017,7 +2029,8 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // Parameter `i` is MIR local `i + 1`.
             if let Some(ld) = self.current_body_locals.get(i + 1) {
                 if primitive_int_name_from_ty(&ld.ty).as_deref() == Some(ret_ty) {
-                    known.insert(name.clone());
+                    known_post.insert(name.clone());
+                    known_pre.insert(name.clone());
                     ret_typed_args.push(name.clone());
                 }
             }
@@ -2032,7 +2045,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // "fail closed for anything we can't soundly capture".
         let mut assumptions: Vec<String> = Vec::new();
         for raw in &self.current_body_preconditions {
-            match translate_spec_to_assert(raw, &known, ret_ty) {
+            match translate_spec_to_assert(raw, &known_pre, ret_ty) {
                 Some(a) => assumptions.push(a),
                 None => {
                     return (
@@ -2040,10 +2053,10 @@ impl<'cfg> SubsetVisitor<'cfg> {
                         None,
                         Some(format!(
                             "PB076: precondition {raw:?} could not be translated to a \
-                             well-sorted assumption over `result`/return-typed args — use \
+                             well-sorted assumption over the return-typed arguments — use \
                              `<ident> <cmp> <literal>` or `<ident> <cmp> <ident>` over \
-                             return-typed names (raw SMT-LIB specs are deferred); \
-                             obligation pending.",
+                             those arg names (preconditions may NOT reference `result`, the \
+                             output; raw SMT-LIB specs are deferred); obligation pending.",
                         )),
                     );
                 }
@@ -2055,7 +2068,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // discharged.
         let mut post_terms: Vec<String> = Vec::new();
         for raw in &self.current_body_ensures {
-            match translate_spec_to_term(raw, &known, ret_ty) {
+            match translate_spec_to_term(raw, &known_post, ret_ty) {
                 Some(t) => post_terms.push(t),
                 None => {
                     return (
@@ -2095,6 +2108,13 @@ impl<'cfg> SubsetVisitor<'cfg> {
         let consistency = if assumptions.is_empty() {
             None
         } else {
+            // F1 vacuous-precondition guard. The check must reflect the FULL
+            // hypothesis set the main check assumes — the preconditions AND
+            // the captured body effect `(= result <effect>)` — so that a
+            // hypothesis contradicting the body effect is detected as vacuity
+            // (defense-in-depth alongside the input-only precondition scope
+            // above). A consistency `unsat` ⇒ the main check's `unsat` is
+            // vacuous ⇒ the wrapper refuses to claim discharge.
             let mut c = String::from("(set-logic QF_BV)\n");
             c.push_str(&decls);
             for a in &assumptions {
@@ -2103,6 +2123,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
                     c.push('\n');
                 }
             }
+            c.push_str(&format!("(assert (= result {effect}))\n"));
             c.push_str("(check-sat)\n");
             Some(c)
         };
@@ -5275,9 +5296,11 @@ mod tests {
         let cs = consistency.expect("preconditions present ⇒ a consistency check is emitted");
         assert!(cs.contains("(assert (bvult x #x00000064))"), "cs:\n{cs}");
         assert!(cs.trim_end().ends_with("(check-sat)"), "cs:\n{cs}");
-        // The consistency check tests assumption satisfiability only — it
-        // must NOT carry the body effect or the negated goal.
-        assert!(!cs.contains("(= result x)"), "consistency check must omit body effect:\n{cs}");
+        // F1 hardening (audit 2026-05-31): the consistency check carries the
+        // FULL hypothesis set — the preconditions AND the body effect — so a
+        // hypothesis contradicting the body effect is caught as vacuity. It
+        // must include `(= result x)` but still NOT carry the negated goal.
+        assert!(cs.contains("(= result x)"), "consistency check must include the body effect:\n{cs}");
         assert!(!cs.contains("(not "), "consistency check must omit the negated goal:\n{cs}");
     }
     #[test]
@@ -5298,6 +5321,36 @@ mod tests {
                 n.message.contains("precondition") && n.message.contains("could not be translated")
             }),
             "pending must explain the untranslatable precondition; got: {:?}",
+            report.audit_notes,
+        );
+    }
+    #[test]
+    fn q4a_precondition_referencing_result_fails_closed() {
+        // SOUNDNESS regression (audit 2026-05-31, CRITICAL). A precondition
+        // that references `result` (the OUTPUT) must NOT be usable as a
+        // hypothesis — assuming a constraint on the output is circular and
+        // would VACUOUSLY discharge a false postcondition. Trigger:
+        //   #[requires("result < 100")] #[ensures("result < 100")]
+        //   fn f(x: u32) -> u32 { x }
+        // f can return >= 100, so `ensures(result < 100)` is FALSE; before
+        // the fix the main check `result=x ∧ result<100 ∧ ¬(result<100)` was
+        // unsat and wrongly "discharged". The precondition must now be
+        // untranslatable (preconditions reference args only) ⇒ pending.
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_preconditions(vec!["result < 100".to_string()]);
+        v.set_current_ensures(vec!["result < 100".to_string()]);
+        v.visit_body(&q4a_u32_body(vec![q4a_return_x()]), false);
+        let report = v.into_report();
+        let (discharge, _c) = q4a_ensures_smt(&report);
+        assert!(
+            discharge.is_none(),
+            "a precondition referencing `result` must fail closed to pending, never \
+             produce a (vacuously) dischargeable problem",
+        );
+        assert!(
+            report.audit_notes.iter().any(|n| n.message.contains("precondition")),
+            "pending must explain the rejected result-referencing precondition; got: {:?}",
             report.audit_notes,
         );
     }

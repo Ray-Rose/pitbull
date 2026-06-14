@@ -960,6 +960,67 @@ fn wrapper_ensures_false_postcondition_not_discharged() {
         "Q.4a: an undischarged ensures obligation must drive a non-zero exit. Got {code:?}",
     );
 }
+/// SOUNDNESS regression (audit 2026-05-31, CRITICAL) — a precondition that
+/// references `result` (the OUTPUT) must NOT vacuously discharge a false
+/// postcondition. `#[requires("result < 100")] #[ensures("result < 100")]
+/// fn copy_arg(x: u32) -> u32 { x }`: `copy_arg(200) = 200 ≥ 100`, so the
+/// ensures is FALSE. Before the fix, treating the precondition as a
+/// hypothesis ABOUT the output made the main check unsat and wrongly
+/// reported `discharged`. The precondition now references the output, which
+/// is out of precondition scope ⇒ untranslatable ⇒ the obligation stays
+/// pending/undischarged. This MUST NOT report `discharged (unsat`. Z3-gated.
+#[test]
+fn wrapper_ensures_precondition_on_result_not_discharged() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_ensures_precondition_on_result_not_discharged: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-presult-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-presult-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::requires(\"result < 100\")]\n\
+         #[pitbull::ensures(\"result < 100\")]\n\
+         pub fn copy_arg(x: u32) -> u32 {\n\
+             x\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_ensures_precondition_on_result_not_discharged: SKIPPED (no solver)");
+        return;
+    }
+    // The cardinal-sin guard: this FALSE postcondition must NEVER be
+    // reported discharged, regardless of the result-referencing precondition.
+    assert!(
+        stderr.contains("(PB076)") && !stderr.contains("discharged (unsat"),
+        "CRITICAL: a precondition on `result` must not vacuously discharge a \
+         false ensures. Got code {code:?}, stderr:\n{stderr}",
+    );
+}
 /// Q.4b (2026-05-31) capstone — ensures over WRAPPING ARITHMETIC
 /// discharges. `add_one(x){ x + 1 }` with `requires(x < 100)` +
 /// `ensures(result < 101)`: the visitor walks the checked-add MIR
