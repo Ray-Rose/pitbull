@@ -378,3 +378,42 @@ fn control_unconstrained_add_one_does_overflow() {
          precondition; if this ever stops panicking, the net has lost its teeth",
     );
 }
+
+/// Ground-truth control for the second deep-audit finding (2026-06-14 #2).
+/// Each of these `core` methods was being silently reported `verified` (exit
+/// 0) before `is_panicking_int_method` was extended to catch it. This test
+/// pins the GROUND TRUTH the matcher relies on — that every one genuinely
+/// panics on the witnessed input — so the enumeration is anchored to runtime
+/// reality, not to a list that could quietly drift. (If any entry ever stops
+/// panicking, the corresponding matcher arm is dead and we want this to flag
+/// it.) The SAFE siblings (unsigned `isqrt`, `midpoint`) must NOT panic — the
+/// signedness/precision boundary the matcher must respect to avoid a false
+/// REJECT of total code.
+#[test]
+fn control_panicking_int_methods_do_panic_safe_ones_do_not() {
+    let p = |f: fn()| std::panic::catch_unwind(f).is_err();
+    // Must panic — these are the false-discharge class the matcher now flags.
+    assert!(p(|| { let _ = (-1i32).isqrt(); }), "signed isqrt(-1) must panic");
+    assert!(p(|| { let _ = 5u32.next_multiple_of(0); }), "next_multiple_of(_,0) must panic");
+    assert!(p(|| { let _ = 5u32.div_ceil(0); }), "div_ceil(_,0) must panic");
+    assert!(p(|| { let _ = u32::MAX.strict_add(1); }), "strict_add overflow must panic");
+    assert!(p(|| { let _ = u32::MAX.strict_mul(2); }), "strict_mul overflow must panic");
+    assert!(p(|| { let _ = i32::MIN.strict_neg(); }), "strict_neg(MIN) must panic");
+    assert!(p(|| { let _ = 1u32.strict_shl(32); }), "strict_shl over-shift must panic");
+    // `black_box` the step so the panic is a RUNTIME event (which is what we
+    // assert) rather than a const-evaluable one clippy rejects at compile time
+    // (`clippy::iterator_step_by_zero` is deny-by-default — it AGREES this
+    // panics; here we want to observe the panic, not be stopped by the lint).
+    assert!(
+        p(|| {
+            let _ = (0u32..10).step_by(std::hint::black_box(0)).count();
+        }),
+        "step_by(0) must panic",
+    );
+    // Must NOT panic — total siblings the matcher must let through (no false
+    // reject). A regression that flags these would degrade Pitbull to
+    // rejecting provably-safe code.
+    assert!(!p(|| { let _ = 5u32.isqrt(); }), "UNSIGNED isqrt is total");
+    assert!(!p(|| { let _ = 4u32.midpoint(6); }), "midpoint is total");
+    assert!(!p(|| { let _ = 4u32.abs_diff(6); }), "abs_diff is total");
+}

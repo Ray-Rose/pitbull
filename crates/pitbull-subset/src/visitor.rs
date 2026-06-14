@@ -2907,9 +2907,12 @@ pub fn is_panicking_library_call(p: &str) -> bool {
         || p.ends_with("::unwrap_err")
         || p.ends_with("::expect_err")
 }
-/// Whether `p` names a primitive-integer inherent method that PANICS — on
-/// overflow or a zero/`MIN` argument: `pow`, `abs`, `div_euclid`,
-/// `rem_euclid`, `next_power_of_two`, `ilog`/`ilog2`/`ilog10`.
+/// Whether `p` names a primitive-integer inherent method (or panicking
+/// iterator adapter) that PANICS — on overflow, a zero/`MIN`/negative
+/// argument, or a zero divisor/step: `pow`, `abs`, `div_euclid`,
+/// `rem_euclid`, `div_ceil`/`div_floor`, `next_power_of_two`,
+/// `next_multiple_of`, `ilog`/`ilog2`/`ilog10`, signed `isqrt`, the entire
+/// `strict_*` family, and `Iterator::sum`/`product`/`step_by`.
 ///
 /// ## Why (deep-audit 2026-06-14)
 ///
@@ -2931,8 +2934,26 @@ pub fn is_panicking_library_call(p: &str) -> bool {
 /// `core::num::<impl u32>::pow`), so a user method merely *named* `pow` is
 /// not matched. The NON-panicking families end in different suffixes and are
 /// correctly excluded: `wrapping_*` / `overflowing_*` (`::wrapping_pow`,
-/// `::overflowing_pow` end `_pow`, not `::pow`), `checked_*`, `saturating_*`,
-/// `unsigned_abs` (`_abs`, not `::abs`), `abs_diff` (`_diff`), `isqrt`.
+/// `::overflowing_pow` end `_pow`, not `::pow`), `checked_*` (incl.
+/// `checked_div_ceil` / `checked_next_multiple_of`, which end `_ceil` / `_of`
+/// after a `checked_` stem, not `::div_ceil` / `::next_multiple_of`),
+/// `saturating_*`, `unsigned_abs` (`_abs`, not `::abs`), `abs_diff`
+/// (`_diff`), `midpoint`, and UNSIGNED `isqrt` (total). `unbounded_shl/shr`
+/// (total) contain no `::strict_`.
+///
+/// ## Second deep-audit finding (2026-06-14 #2)
+///
+/// The `median3` §15 proof exercised the trusted-library boundary and a
+/// follow-on sweep proved a CLASS of false discharges this enumeration had
+/// missed, every one confirmed panic-bearing AND stable on the pinned
+/// nightly, every one reported `verified` (exit 0): signed `isqrt`
+/// (`self < 0`), `next_multiple_of` / `div_ceil` (zero rhs / overflow), the
+/// always-panicking `strict_*` family, and `Iterator::step_by(0)`. (The
+/// prior revision of this comment even rationalised `isqrt` as "correctly
+/// excluded" — true only for the unsigned impls.) Now enumerated and routed
+/// through the same fail-closed PB043 handling. `isqrt` is the one method
+/// whose panic depends on signedness, so it is matched only for the signed
+/// inherent impls (`<impl i…>`).
 ///
 /// Also covers the iterator-FOLD form of overflow — `Iterator::sum` /
 /// `Iterator::product` — which panic on overflow under `overflow-checks`
@@ -2941,21 +2962,43 @@ pub fn is_panicking_library_call(p: &str) -> bool {
 /// `num::<impl`), so they are checked before the int-method anchor.
 #[must_use]
 pub fn is_panicking_int_method(p: &str) -> bool {
-    // Iterator folds that panic on integer overflow (debug / overflow-checks).
-    if p.ends_with("iter::Iterator::sum") || p.ends_with("iter::Iterator::product") {
+    // Iterator adapters/folds that panic: `sum`/`product` overflow under
+    // overflow-checks; `step_by(0)` asserts `step != 0` at construction and
+    // panics. Trait methods (rendered `…::iter::Iterator::…`), checked before
+    // the `num::<impl>` anchor.
+    if p.ends_with("iter::Iterator::sum")
+        || p.ends_with("iter::Iterator::product")
+        || p.ends_with("iter::Iterator::step_by")
+    {
         return true;
     }
     if !p.contains("num::<impl") {
         return false;
     }
+    // `isqrt` is TOTAL on unsigned but PANICS on signed when `self < 0`. Flag
+    // it ONLY for the signed inherent impls — which render `<impl i8>` …
+    // `<impl i128>` / `<impl isize>`, all starting `<impl i` (every unsigned
+    // type starts `<impl u`) — so safe `u32::isqrt` is not falsely rejected.
+    if p.ends_with("::isqrt") {
+        return p.contains("num::<impl i");
+    }
     p.ends_with("::pow")
         || p.ends_with("::abs")
         || p.ends_with("::div_euclid")
         || p.ends_with("::rem_euclid")
+        || p.ends_with("::div_ceil")
+        || p.ends_with("::div_floor")
         || p.ends_with("::next_power_of_two")
+        || p.ends_with("::next_multiple_of")
         || p.ends_with("::ilog")
         || p.ends_with("::ilog2")
         || p.ends_with("::ilog10")
+        // The whole `strict_*` family panics on overflow ALWAYS (not just
+        // under overflow-checks): strict_{add,sub,mul,div,rem,neg,pow,shl,shr}
+        // and the strict_{add,sub}_{signed,unsigned} / strict_*_euclid kin.
+        // None of the non-panicking families (`checked_`/`wrapping_`/
+        // `saturating_`/`overflowing_`/`unbounded_`) contain `::strict_`.
+        || p.contains("::strict_")
 }
 /// Whether `p` names a `str`/slice RANGE-index or split/chunk library call
 /// that PANICS on out-of-bounds / a bad split point / a zero size.
@@ -4688,9 +4731,21 @@ mod tests {
             "core::num::<impl i64>::rem_euclid",
             "core::num::<impl u32>::next_power_of_two",
             "core::num::<impl u32>::ilog2",
-            // Iterator-fold overflow (same class; trait method, not num::<impl).
+            // Deep-audit 2026-06-14 #2 — the class that was silently verified:
+            "core::num::<impl i32>::isqrt", // SIGNED isqrt panics if self < 0
+            "core::num::<impl isize>::isqrt", // isize is signed too
+            "core::num::<impl u32>::next_multiple_of", // panics rhs==0 / overflow
+            "core::num::<impl u32>::div_ceil", // panics rhs==0
+            "core::num::<impl u32>::strict_add", // strict_* always panic on overflow
+            "core::num::<impl i32>::strict_sub",
+            "core::num::<impl u64>::strict_mul",
+            "core::num::<impl i32>::strict_neg",
+            "core::num::<impl u32>::strict_shl",
+            "core::num::<impl i32>::strict_add_unsigned",
+            // Iterator adapters/folds that panic (trait method, not num::<impl).
             "std::iter::Iterator::sum",
             "core::iter::Iterator::product",
+            "std::iter::Iterator::step_by", // step_by(0) panics at construction
         ];
         for p in positive {
             assert!(is_panicking_int_method(p), "should be a panicking int method: {p}");
@@ -4703,9 +4758,15 @@ mod tests {
             "core::num::<impl u32>::saturating_pow",
             "core::num::<impl i32>::unsigned_abs",
             "core::num::<impl u32>::abs_diff",
-            "core::num::<impl u32>::isqrt",
+            "core::num::<impl u32>::isqrt", // UNSIGNED isqrt is total (safe)
+            "core::num::<impl usize>::isqrt",
+            "core::num::<impl u32>::midpoint", // total
+            "core::num::<impl u32>::checked_div_ceil", // Option, no panic
+            "core::num::<impl u32>::checked_next_multiple_of", // Option, no panic
+            "core::num::<impl u32>::unbounded_shl", // total (no `::strict_`)
             "core::num::<impl u32>::count_ones",
             "my_crate::Widget::pow", // a user method named pow, not num::<impl>
+            "my_crate::Widget::isqrt", // user method named isqrt, not num::<impl>
         ];
         for p in negative {
             assert!(!is_panicking_int_method(p), "should NOT be a panicking int method: {p}");
@@ -4721,6 +4782,14 @@ mod tests {
             "core::num::<impl u32>::pow",
             "core::num::<impl i32>::abs",
             "core::num::<impl i32>::div_euclid",
+            // Deep-audit 2026-06-14 #2: the methods that were silently verified
+            // must now route all the way through to an obligation, not just
+            // match the predicate.
+            "core::num::<impl i32>::isqrt",
+            "core::num::<impl u32>::next_multiple_of",
+            "core::num::<impl u32>::div_ceil",
+            "core::num::<impl u32>::strict_add",
+            "std::iter::Iterator::step_by",
         ] {
             let mut v = SubsetVisitor::new(&cfg);
             v.visit_body(&body_calling(path), false);

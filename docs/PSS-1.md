@@ -1858,6 +1858,28 @@ the std form and now also matches. No shadow type changes.
   manifest's `referenced` and `universe` use the SAME generic-item path
   format (empirically `corpus_test::generic_fn`, no `::<u32>` args), so the
   universe-filter does not miss generic cross-crate callees.
+- ✅ CRITICAL false-discharge fix #2: panicking integer methods + iterator
+  adapters (deep audit 2026-06-14 **#2**). Adding the `median3` §15 proof
+  (which verifies via the trusted `Ord::min`/`max` boundary) prompted a
+  follow-on sweep of that boundary, which PROVED a whole CLASS of false
+  discharges `is_panicking_int_method` had missed — every one confirmed
+  panic-bearing AND stable on the pinned nightly, every one reported
+  `verified` (exit 0): SIGNED `isqrt` (`self < 0`), `next_multiple_of` and
+  `div_ceil` (zero rhs / overflow), the ALWAYS-panicking `strict_*` family
+  (`strict_add`/`sub`/`mul`/`div`/`rem`/`neg`/`pow`/`shl`/`shr`/… — panic on
+  overflow regardless of the `overflow-checks` profile), and
+  `Iterator::step_by(0)` (panics at construction). The prior revision of the
+  matcher's own doc-comment even rationalised `isqrt` as "correctly excluded"
+  — true only for the UNSIGNED impls, since signed `isqrt` panics on a
+  negative receiver. The matcher now enumerates these and discriminates
+  `isqrt` by signedness (matched only for `<impl i…>`, so total `u32::isqrt`
+  is not a false REJECT), routing each through the same fail-closed PB043
+  handling. Verified e2e: each panicking form emits PB043 → exit 1 (was exit
+  0), while `u32::isqrt`/`midpoint`/`wrapping_add`/`median3` stay verified
+  (exit 0). Pinned by extended classification + obligation-emission unit
+  tests, a ground-truth panic control in `tests/aorte_proofs.rs`, and new
+  corpus files `reject/PB043_int_method_panic.rs` +
+  `accept/PB043_int_method_total.rs`.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1865,7 +1887,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  321 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  322 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1878,7 +1900,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 321 passing, 0 warnings, clippy clean
+# Stable: 322 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

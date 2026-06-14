@@ -125,10 +125,20 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
     (reachability-integrity audit, 2026-06-14). Caught today:
     - `Option`/`Result::{unwrap, expect, unwrap_err, expect_err}`;
     - the panicking primitive-int inherent methods `pow` / `abs` /
-      `div_euclid` / `rem_euclid` / `next_power_of_two` / `ilog`/`ilog2`/
-      `ilog10`, AND the iterator-fold overflow `Iterator::{sum, product}`
-      (the METHOD/fold form of overflow — the OPERATOR form `x * y` is
-      already PB049);
+      `div_euclid` / `rem_euclid` / `div_ceil` / `div_floor` /
+      `next_power_of_two` / `next_multiple_of` / `ilog`/`ilog2`/`ilog10`,
+      SIGNED `isqrt` (panics on `self < 0`; UNSIGNED `isqrt` is total and is
+      NOT flagged), and the ALWAYS-panicking `strict_*` family (overflow
+      panics regardless of the `overflow-checks` profile), AND the panicking
+      iterator adapters `Iterator::{sum, product}` (fold-overflow) and
+      `Iterator::step_by` (`step_by(0)` panics at construction) — the
+      METHOD/fold form of overflow; the OPERATOR form `x * y` is already
+      PB049. A 2026-06-14 **#2** deep audit (prompted by the `median3` §15
+      proof exercising this very boundary) PROVED `isqrt` / `next_multiple_of`
+      / `div_ceil` / `strict_*` / `step_by` were previously a silent exit-0
+      "verified" — a false discharge of the same class as `pow`; the
+      int-method enumeration is now comprehensive over the stable panicking
+      inherent API;
     - `str`/slice RANGE indexing `&s[a..b]` / `&v[a..b]` (which lowers to a
       `core::ops::Index::index` `Call`, NOT a `ProjectionElem::Index`, so
       PB054 does not see it — only element `v[i]` is a projection); and

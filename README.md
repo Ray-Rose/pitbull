@@ -46,7 +46,9 @@ under `verify_roots` narrowing — each tracked per-rule in `docs/PSS-1.md`
 the panic of a *library method* lives inside un-walked `core`, so it is
 caught at the call site only for the enumerated families — currently
 `Option`/`Result::unwrap`/`expect`, the panicking int methods
-`pow`/`abs`/`div_euclid`/… plus `Iterator::sum`/`product`, `str`/slice range
+`pow`/`abs`/`div_euclid`/`div_ceil`/`next_multiple_of`/signed `isqrt`/the
+always-panicking `strict_*` family/… plus
+`Iterator::sum`/`product`/`step_by`, `str`/slice range
 indexing (`&s[a..b]` via the `Index` trait), and the panicking `[T]`/`str`
 methods (`split_at`, `swap`, `copy_from_slice`, `rotate_left`/`right`,
 `chunks`/`windows`, `select_nth_unstable`, …). Operator-form arithmetic
