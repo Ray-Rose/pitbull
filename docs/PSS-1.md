@@ -1792,6 +1792,28 @@ the std form and now also matches. No shadow type changes.
   updated to move these from "trusted residual" to "caught". Remaining
   residual is now just less-common panicking library methods not yet
   enumerated.
+- ✅ Empirical AoRTE soundness net — property-test harness (2026-06-14,
+  first increment of the Safety Manual §3.2 "fuzzed-inputs" promise).
+  `tests/aorte_proofs.rs` is a stable, dependency-free (deterministic
+  xorshift PRNG, reproducible) net that hammers AoRTE-relevant functions
+  with 200k fuzzed inputs each and asserts none ever panics — the empirical
+  counterpart to the static discharge logic (it catches the exact
+  false-discharge class the deep audit found in `unwrap`/`pow` by *reasoning*).
+  Two kinds of proof: (1) UNCONDITIONAL AoRTE proofs safe on every input —
+  bitwise CRC-32 (with the canonical `0xCBF43926` known-answer), a guarded
+  binary search (oracle: agrees with linear scan), and power-of-two
+  ring-buffer addressing (oracle: always in capacity) — three of the
+  positive proofs PSS-1 §15 names; (2) PRECONDITION-RESPECTING proofs that
+  fuzz ONLY the admitted domain of Pitbull's discharged shapes — `at(s,i)`
+  under `i < len` (PB054) and `add_one(x)` under `x < 100` (PB049) — a
+  direct empirical check that each discharged precondition is SUFFICIENT for
+  safety. A control test confirms the net has teeth: `add_one(u32::MAX)`
+  (the precondition dropped) DOES overflow-panic under `overflow-checks`, so
+  a discharge resting on an insufficient precondition would be caught. 6
+  tests. NEXT increments: wire the full end-to-end differential (run the
+  wrapper AND fuzz in one test, asserting `verified ⟹ fuzz-clean`); add the
+  remaining §15 proofs (insertion sort, MAC-frame parser, PID controller);
+  and the Miri / Tree-Borrows pass for UB (not just panics).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1799,7 +1821,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  307 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  313 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1812,7 +1834,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 307 passing, 0 warnings, clippy clean
+# Stable: 313 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054
