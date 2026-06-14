@@ -87,6 +87,16 @@ pub struct VerificationSection {
     /// in v0.1 if you want subset-level panic rejection.
     #[serde(default)]
     pub strict_panic_acceptance: bool,
+    /// If true (the default), COVERAGE-GAP audit notes — safety checks the
+    /// visitor could not run, with no compensating VC obligation — are
+    /// folded into the wrapper's exit code (exit 1), so a CI gate keyed on
+    /// the exit status cannot mistake "verified except the parts I could
+    /// not model" for a clean verification (the "no silent skips" posture).
+    /// Set to `false` to keep coverage gaps as stderr-only notes that do
+    /// not affect the verdict (the pre-2026-06-14 behavior). Transparency
+    /// notes never affect the exit code regardless.
+    #[serde(default = "default_fail_on_coverage_gaps")]
+    pub fail_on_coverage_gaps: bool,
     /// Per-function precondition lists. Keys are fully-qualified
     /// function paths (matched against `CrateDef::name()` for each
     /// item the wrapper walks). Values are arrays of SMT-LIB 2
@@ -117,9 +127,16 @@ impl Default for VerificationSection {
             solvers: default_solvers(),
             solver_versions: std::collections::BTreeMap::new(),
             strict_panic_acceptance: false,
+            fail_on_coverage_gaps: default_fail_on_coverage_gaps(),
             preconditions: std::collections::BTreeMap::new(),
         }
     }
+}
+/// Default for `verification.fail_on_coverage_gaps`: `true` (fail closed —
+/// a coverage gap drives the exit code so it cannot be mistaken for a clean
+/// verification by a CI gate).
+fn default_fail_on_coverage_gaps() -> bool {
+    true
 }
 fn default_vc_timeout() -> u64 { 60 }
 fn default_solver_agreement() -> u8 { 2 }

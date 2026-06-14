@@ -116,13 +116,22 @@ fn decide_pitbull_exit_code(
     violations: usize,
     undischarged_obligations: usize,
     unverified_reachable_callees: usize,
+    coverage_gaps: usize,
+    fail_on_coverage_gaps: bool,
     bridge_failed: bool,
 ) -> i32 {
+    // A coverage gap (a safety check that could not run, with no
+    // compensating obligation) drives the exit code only when the user
+    // hasn't opted out via `verification.fail_on_coverage_gaps = false`.
+    // Default is to fail closed: exit 0 must not mean "verified except the
+    // parts I could not model" (the "no silent skips" posture).
+    let coverage_gap_fail = fail_on_coverage_gaps && coverage_gaps > 0;
     let pitbull_exit_code = if bridge_failed {
         2
     } else if violations > 0
         || undischarged_obligations > 0
         || unverified_reachable_callees > 0
+        || coverage_gap_fail
     {
         1
     } else {
@@ -133,15 +142,17 @@ fn decide_pitbull_exit_code(
 #[cfg(test)]
 mod exit_code_tests {
     use super::decide_pitbull_exit_code;
+    // Args: (rustc_exit, violations, undischarged, unverified_callees,
+    //        coverage_gaps, fail_on_coverage_gaps, bridge_failed).
     #[test]
     fn clean_verification_is_zero() {
-        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 0, false), 0);
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 0, 0, true, false), 0);
     }
     #[test]
     fn violations_or_undischarged_is_one() {
-        assert_eq!(decide_pitbull_exit_code(0, 1, 0, 0, false), 1);
-        assert_eq!(decide_pitbull_exit_code(0, 0, 1, 0, false), 1);
-        assert_eq!(decide_pitbull_exit_code(0, 7, 3, 0, false), 1);
+        assert_eq!(decide_pitbull_exit_code(0, 1, 0, 0, 0, true, false), 1);
+        assert_eq!(decide_pitbull_exit_code(0, 0, 1, 0, 0, true, false), 1);
+        assert_eq!(decide_pitbull_exit_code(0, 7, 3, 0, 0, true, false), 1);
     }
     /// CRITICAL fail-open regression (audit 2026-06-14): if the
     /// rustc_public bridge fails, the subset check never runs and the
@@ -149,20 +160,36 @@ mod exit_code_tests {
     /// never exit 0 ("verified") off a clean rustc compile.
     #[test]
     fn bridge_failure_never_reports_verified() {
-        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 0, true), 2);
-        assert_ne!(decide_pitbull_exit_code(0, 0, 0, 0, true), 0);
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 0, 0, true, true), 2);
+        assert_ne!(decide_pitbull_exit_code(0, 0, 0, 0, 0, true, true), 0);
     }
     /// #27 fail-closed: an in-crate callee reachable from a verified root
     /// but skipped by verify_roots narrowing forces exit 1, never 0.
     #[test]
     fn unverified_reachable_callee_fails_closed() {
-        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 1, false), 1);
-        assert_ne!(decide_pitbull_exit_code(0, 0, 0, 2, false), 0);
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 1, 0, true, false), 1);
+        assert_ne!(decide_pitbull_exit_code(0, 0, 0, 2, 0, true, false), 0);
+    }
+    /// M1 (audit 2026-06-14): a COVERAGE GAP (a safety check that could not
+    /// run, with no compensating obligation) fails closed by default — exit
+    /// 0 must not mean "verified except the parts I couldn't model".
+    #[test]
+    fn coverage_gap_fails_closed_by_default() {
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 0, 1, true, false), 1);
+        assert_ne!(decide_pitbull_exit_code(0, 0, 0, 0, 3, true, false), 0);
+    }
+    /// ...but the user can opt out (`fail_on_coverage_gaps = false`): the
+    /// gap is then a stderr-only note and does not change the verdict.
+    #[test]
+    fn coverage_gap_opt_out_does_not_fail() {
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 0, 5, false, false), 0);
+        // ...but a real violation alongside still fails regardless of opt-out.
+        assert_eq!(decide_pitbull_exit_code(0, 1, 0, 0, 5, false, false), 1);
     }
     #[test]
     fn rustc_failure_takes_precedence() {
-        assert_eq!(decide_pitbull_exit_code(101, 0, 0, 0, false), 101);
-        assert_eq!(decide_pitbull_exit_code(101, 5, 5, 9, true), 101);
+        assert_eq!(decide_pitbull_exit_code(101, 0, 0, 0, 0, true, false), 101);
+        assert_eq!(decide_pitbull_exit_code(101, 5, 5, 9, 9, true, true), 101);
     }
 }
 #[cfg(rustc_public_real)]
@@ -238,6 +265,8 @@ fn main() {
         callbacks.violations,
         callbacks.undischarged_obligations,
         callbacks.unverified_reachable_callees,
+        callbacks.coverage_gap_notes,
+        callbacks.fail_on_coverage_gaps,
         callbacks.bridge_failed,
     ));
 }
@@ -277,6 +306,14 @@ struct PitbullCallbacks {
     /// skipped them (issue #27). Nonzero forces a fail-closed exit 1: a
     /// "verified" verdict must never rest on an unverified in-crate callee.
     unverified_reachable_callees: usize,
+    /// Number of COVERAGE-GAP audit notes — safety checks the visitor could
+    /// not run, with no compensating VC obligation (M1, audit 2026-06-14).
+    /// When `fail_on_coverage_gaps` is set, a nonzero count forces exit 1
+    /// so a CI gate cannot mistake a coverage gap for a clean verification.
+    coverage_gap_notes: usize,
+    /// Mirror of `verification.fail_on_coverage_gaps` (default true). Gates
+    /// whether `coverage_gap_notes` affects the exit code.
+    fail_on_coverage_gaps: bool,
 }
 #[cfg(rustc_public_real)]
 impl rustc_driver::Callbacks for PitbullCallbacks {
@@ -362,6 +399,9 @@ impl PitbullCallbacks {
         tcx: rustc_middle::ty::TyCtxt<'tcx>,
     ) {
         let cfg = load_config();
+        // M1: mirror the coverage-gap exit-code policy onto the callbacks so
+        // `main` can apply it after `rustc_internal::run` returns.
+        self.fail_on_coverage_gaps = cfg.verification.fail_on_coverage_gaps;
         let verify_roots = cfg.reachability.verify_roots.clone();
         let exclude = cfg.reachability.exclude.clone();
         let mut visitor = pitbull_subset::SubsetVisitor::new(&cfg);
@@ -787,13 +827,32 @@ impl PitbullCallbacks {
         for err in &report.errors {
             eprintln!("pitbull-rustc: {err}");
         }
-        // Audit notes are non-violations the visitor flagged for
-        // auditor review (e.g. an unclassifiable callee at a Call
-        // terminator — see classify_called_function in visitor.rs).
-        // They never block verification but surface here so the gap
-        // is visible.
+        // Audit notes are non-violations the visitor flagged for auditor
+        // review. A COVERAGE-GAP note (a safety check that could not run,
+        // with no compensating obligation) is folded into the exit code
+        // (M1, fail closed) so it is visible to a CI gate, not just on
+        // stderr; a TRANSPARENCY note is informational only.
         for note in &report.audit_notes {
             eprintln!("pitbull-rustc: {note}");
+        }
+        self.coverage_gap_notes = report.coverage_gap_count();
+        if self.coverage_gap_notes > 0 {
+            if self.fail_on_coverage_gaps {
+                eprintln!(
+                    "pitbull-rustc: {} coverage-gap audit note(s) — a safety check could \
+                     not run with no compensating obligation; failing closed (exit 1). \
+                     Set `[verification] fail_on_coverage_gaps = false` to downgrade these \
+                     to non-blocking notes.",
+                    self.coverage_gap_notes,
+                );
+            } else {
+                eprintln!(
+                    "pitbull-rustc: {} coverage-gap audit note(s) present but \
+                     `fail_on_coverage_gaps = false` — NOT affecting the exit code (the \
+                     verdict does not cover these sites).",
+                    self.coverage_gap_notes,
+                );
+            }
         }
         // VC obligations: discharge each through pitbull-vc and
         // surface the verdict on stderr. This is the v0.2 deductive

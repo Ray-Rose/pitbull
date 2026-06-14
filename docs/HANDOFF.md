@@ -23,7 +23,7 @@ repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 294 tests passing (171 subset-lib + 70 vc + 47 integration + 6 driver-bin),
+- **State:** 301 tests passing (176 subset-lib + 70 vc + 47 integration + 8 driver-bin),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -159,14 +159,14 @@ f10970d Initial v0.1.0-dev skeleton: PSS-1 subset enforcer
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **294 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **301 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The **294** breaks down: 1 (cargo-pitbull bin) + 5 (pitbull-rustc bin) + 171
-(subset lib) + 47 (integration) + 70 (vc) = 294. This supersedes the long
+The **301** breaks down: 1 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 176
+(subset lib) + 47 (integration) + 70 (vc) = 301. This supersedes the long
 Task-S-era narration that previously lived here (which still said "226" while
 the table said 277 — a drift caught and corrected in the 2026-06-14 deep
 audit). The lineage to today's number: the multi-solver agreement gate (Task
@@ -175,9 +175,10 @@ duplicate-solver / consistency-check CRITICAL fixes), the unary-negation
 missed-obligation CRITICAL (`-(iN::MIN)` now obligated), the proof-certificate
 arc (Task T.1/T.2/T.3 incl. HMAC-SHA256 signing and the `from_hex` HIGH),
 PB059 proc-macro allowlisting, the mixed-width-shift discharge (#25), and the
-drop-glue fail-closed reachability gate (#27). The most recent **+11 subset
-tests** (154→165) are the 2026-06-14 deep audit, which landed two soundness
-fixes. (1) The adapter **accept-on-unknown** hole (+7): `classify_adt` now
+drop-glue fail-closed reachability gate (#27). The most recent **+22 subset
+tests** (154→176) are the 2026-06-14 deep audit, which landed four soundness
+fixes (plus the cross-crate aggregation and the M1 exit-code work below).
+(1) The adapter **accept-on-unknown** hole (+7): `classify_adt` now
 classifies the rustc_public adapter's synthetic `__pitbull_*` placeholder ADTs
 explicitly and fails closed on unknown synthetics (`__pitbull_never` stays
 benign; the dyn/coroutine/foreign/unrigid placeholders reject), rather than
@@ -194,7 +195,17 @@ analyzed-vs-trusted boundary this exposed is now documented in
 `SAFETY-MANUAL.md` §3.6. That same audit also restored the clippy-error-clean
 invariant (a pre-existing collapsible-`if let` in
 `reachability.rs::callee_paths` had drifted to an `error:` under the current
-toolchain).
+toolchain). (3) **Cross-crate reachability aggregation** (+6): `ReachManifest`
++ `cross_crate_unverified` (the whole-workspace companion to the per-crate
+`#27` gate) — each wrapper run emits a manifest into `PITBULL_REACH_DIR`,
+`cargo pitbull check` aggregates them via `cargo metadata` and fails closed on
+a workspace-member callee no crate verified (warm-cache-safe via an
+INDETERMINATE bucket). (4) **M1 coverage-gap exit-code** (+5 subset, +2
+driver): `AuditNoteKind::{CoverageGap,Transparency}` — a safety check that
+could not run with no compensating obligation now folds into the exit code
+(fail closed, gated on `verification.fail_on_coverage_gaps`, default true), so
+exit 0 can't mean "verified except the parts I couldn't model". See
+`docs/PSS-1.md` §17.1 for the per-fix detail.
 
 ---
 
@@ -325,11 +336,11 @@ git log --oneline -1
 # Expected: a66a1a4 Milestone 2 Task O.3: #[pitbull::requires(...)] attribute extraction via HIR
 ```
 
-### Step 4.2 — Stable test suite (the 294-test baseline)
+### Step 4.2 — Stable test suite (the 301-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
-# Expected: "test result: ok" lines totaling 294 passing, 0 failed, 0 ignored
+# Expected: "test result: ok" lines totaling 301 passing, 0 failed, 0 ignored
 ```
 
 If you see `Application Control policy has blocked this file` on Windows: that's Smart App Control quarantining a fresh test binary. Run again — usually clears on the second try. If persistent, run `cargo +stable test --workspace --all-features` (without the -p flag) to use the workspace-mode binary path which SAC tends to accept.
@@ -404,7 +415,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 294 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 301 passing.
 # Note: the 2-of-N agreement capstone additionally requires BOTH z3 and
 # cvc5 on PATH; with PITBULL_REQUIRE_E2E set it panics if either is missing.
 ```
@@ -451,7 +462,7 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 294 passing (same as without Z3 — the new tests
+# Expected: 301 passing (same as without Z3 — the new tests
 # also pass via graceful-skip if no solver is present, but with
 # z3 they exercise the real `unsat` verdict path).
 ```

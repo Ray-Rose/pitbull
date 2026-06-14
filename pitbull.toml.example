@@ -13,6 +13,16 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 [verification]
 # Hard timeout per verification condition (seconds). Timeout counts as failure.
 vc_timeout_seconds = 60
+# Fail closed on COVERAGE GAPS (default true). A coverage gap is a
+# safety-relevant check the visitor could not run with no compensating
+# obligation (e.g. an unmodelable `p.0 + p.1`, a unary-negation skip, an
+# unclassifiable callee). With this true, such a gap drives the wrapper's
+# exit code to 1 — so a CI gate keyed on the exit status cannot mistake
+# "verified except the parts I could not model" for a clean verification
+# (the "no silent skips" posture). Set false to keep coverage gaps as
+# stderr-only notes that do not affect the verdict. Transparency notes
+# never affect the exit code regardless of this setting.
+fail_on_coverage_gaps = true
 # Per-function preconditions surfaced to the SMT solver as hypotheses.
 # Keys are fully-qualified function paths; values are arrays of
 # predicates.

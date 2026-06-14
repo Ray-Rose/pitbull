@@ -1723,6 +1723,26 @@ the std form and now also matches. No shadow type changes.
   deps stay trusted. RESIDUAL: a full multi-crate-narrowing e2e fixture, and
   forcing complete re-analysis on warm caches (today: INDETERMINATE note +
   "run a clean build").
+- ✅ Coverage-gap audit notes folded into the exit code (M1, 2026-06-14).
+  `decide_pitbull_exit_code` ignored audit notes, so a safety check the
+  visitor could not run with NO compensating obligation — an unmodelable
+  `p.0 + p.1`, a unary-negation skip, an unclassifiable callee — emitted a
+  stderr note but exited 0 ("verified"). That is a silent skip *w.r.t. the
+  CI gate*, against the project's "no silent skips" posture. Fixed by typing
+  each note: `AuditNoteKind::{CoverageGap, Transparency}` (serde-defaulting
+  to CoverageGap — fail closed on legacy notes). The visitor's `audit_note`
+  helper now defaults to CoverageGap; the 8 sites where an obligation is
+  emitted alongside (so the exit code already reflects it) or the check ran
+  safe (value-preserving cast, trusted/divergent/pending ensures, refused
+  preconditions) were moved to a new `audit_transparency`. The wrapper folds
+  `report.coverage_gap_count()` into the exit code (exit 1) gated on
+  `[verification] fail_on_coverage_gaps` (default true; set false to keep
+  gaps as non-blocking notes). 4 visitor sites stay CoverageGap (callee
+  unclassified, two PB049 binop skips, neg skip). Pinned by +5 subset tests
+  (kind filter, fail-closed serde default, gap-site tagged CoverageGap,
+  divergent-ensures tagged Transparency, clean-body zero gaps) and +2
+  exit-code tests (gap fails closed by default; opt-out doesn't fail);
+  corpus accept files still pass under the fail-closed default.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1730,7 +1750,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  294 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  301 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1743,7 +1763,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 294 passing, 0 warnings, clippy clean
+# Stable: 301 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

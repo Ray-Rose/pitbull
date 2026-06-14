@@ -232,13 +232,32 @@ impl<'cfg> SubsetVisitor<'cfg> {
         report.vc_obligations = self.vc_obligations;
         report
     }
-    /// Record a non-violation audit note. The note is informational
-    /// (does not block verification) but appears in `SubsetReport.audit_notes`
-    /// for an auditor's review.
+    /// Record a COVERAGE-GAP audit note: a safety-relevant check that could
+    /// not run, with NO compensating VC obligation emitted. It is folded
+    /// into the wrapper's exit code (fail closed, via
+    /// `verification.fail_on_coverage_gaps`) so the gap is visible to a CI
+    /// gate, not just on stderr (the "no silent skips" posture). This is the
+    /// FAIL-CLOSED DEFAULT: an audit note is a coverage gap unless its site
+    /// explicitly opts out via [`audit_transparency`]. A future note added
+    /// here therefore fails closed by default rather than silently passing.
     pub fn audit_note(&mut self, span: Span, message: impl Into<String>) {
         self.audit_notes.push(crate::diagnostic::AuditNote {
             span,
             message: message.into(),
+            kind: crate::diagnostic::AuditNoteKind::CoverageGap,
+        });
+    }
+    /// Record a TRANSPARENCY audit note: informational only and MUST NOT
+    /// affect the verdict. Use this only when the situation is already
+    /// reflected elsewhere — the check ran and concluded safe (e.g. a
+    /// value-preserving cast accepted), a VC obligation was emitted
+    /// alongside (so an undischarged obligation already drives the exit
+    /// code), or it records a user `#[pitbull::trusted]` opt-in.
+    pub fn audit_transparency(&mut self, span: Span, message: impl Into<String>) {
+        self.audit_notes.push(crate::diagnostic::AuditNote {
+            span,
+            message: message.into(),
+            kind: crate::diagnostic::AuditNoteKind::Transparency,
         });
     }
     /// Number of errors recorded so far.
@@ -359,7 +378,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // propagation of trusted ensures (so callers can use
             // them as hypotheses) is out of scope for the MVP.
             if !self.current_body_ensures.is_empty() {
-                self.audit_note(
+                self.audit_transparency(
                     body.span,
                     "PB076: ensures on trusted body — assumed but not \
                      proven; caller-side propagation of trusted \
@@ -399,7 +418,10 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // it flows through the same pending → undischarged → exit-1
             // path as a returning body, then add the explanatory note.
             self.emit_ensures_obligation(body.span);
-            self.audit_note(
+            // Transparency: emit_ensures_obligation above already pushed the
+            // (fail-closed, undischarged) obligation, so the exit code
+            // reflects the divergent-ensures case; this note just explains it.
+            self.audit_transparency(
                 body.span,
                 "PB076: function declares `#[pitbull::ensures]` but its body \
                  has no return point (it diverges — infinite loop, always \
@@ -945,7 +967,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // unsupported target width) still fails closed via the `None`
             // arm. See `value_preserving_int_cast` for the soundness gate.
             CastKind::IntToInt => match Self::value_preserving_int_cast(op, target_ty) {
-                Some((value, src_name, tgt_name)) => self.audit_note(
+                Some((value, src_name, tgt_name)) => self.audit_transparency(
                     span,
                     format!(
                         "PB051: `as` integer cast accepted — constant {value} is \
@@ -1817,7 +1839,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // assumption, the auditor learns about it via the report
         // rather than the precondition silently vanishing.
         for msg in pending_audit_notes {
-            self.audit_note(span, msg);
+            // Transparency: a VC obligation was emitted just above, so a
+            // refused precondition only makes that obligation HARDER to
+            // discharge (fewer assumptions = fail-closed) — the exit code
+            // already reflects it via the (likely undischarged) obligation.
+            self.audit_transparency(span, msg);
         }
     }
     /// Emit a PB049 `ArithmeticOverflow` obligation for unary
@@ -1906,7 +1932,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
             assumptions,
         });
         for msg in pending_audit_notes {
-            self.audit_note(span, msg);
+            // Transparency: a VC obligation was emitted just above, so a
+            // refused precondition only makes that obligation HARDER to
+            // discharge (fewer assumptions = fail-closed) — the exit code
+            // already reflects it via the (likely undischarged) obligation.
+            self.audit_transparency(span, msg);
         }
     }
     /// Emit a `PanicReachability` VC obligation for a panic call
@@ -1953,7 +1983,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
             assumptions,
         });
         for msg in pending_audit_notes {
-            self.audit_note(span, msg);
+            // Transparency: a VC obligation was emitted just above, so a
+            // refused precondition only makes that obligation HARDER to
+            // discharge (fewer assumptions = fail-closed) — the exit code
+            // already reflects it via the (likely undischarged) obligation.
+            self.audit_transparency(span, msg);
         }
     }
     /// Emit an `IndexBound` VC obligation for a slice/array index
@@ -2092,7 +2126,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
             assumptions,
         });
         for msg in pending_audit_notes {
-            self.audit_note(span, msg);
+            // Transparency: a VC obligation was emitted just above, so a
+            // refused precondition only makes that obligation HARDER to
+            // discharge (fewer assumptions = fail-closed) — the exit code
+            // already reflects it via the (likely undischarged) obligation.
+            self.audit_transparency(span, msg);
         }
     }
     /// Emit a `PB076 EnsuresPostcondition` VC obligation at a
@@ -2136,7 +2174,10 @@ impl<'cfg> SubsetVisitor<'cfg> {
         let (discharge_smt, consistency_smt, why_pending) =
             self.build_ensures_smt(ret_ty_name.as_deref());
         if let Some(reason) = why_pending {
-            self.audit_note(term_span, reason);
+            // Transparency: the EnsuresPostcondition obligation is pushed
+            // just below regardless, and reports "pending" → undischarged →
+            // exit code; this note only explains why it stayed pending.
+            self.audit_transparency(term_span, reason);
         }
         self.vc_obligations.push(crate::vc::VcObligation {
             id,
@@ -4087,6 +4128,64 @@ mod tests {
             report.audit_notes[0].message.contains("callee not classified"),
             "audit note message should explain the gap; got {:?}",
             report.audit_notes[0].message,
+        );
+    }
+    /// M1: the unclassifiable-callee note is a COVERAGE GAP (no rule could
+    /// be applied at the call site, no obligation emitted), so it is counted
+    /// by `coverage_gap_count()` and folds into the fail-closed exit code.
+    #[test]
+    fn unclassifiable_callee_note_is_coverage_gap() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_calling_unclassifiable(), false);
+        let report = v.into_report();
+        assert_eq!(
+            report.coverage_gap_count(),
+            1,
+            "an unclassifiable callee is a coverage gap; got {:?}",
+            report.audit_notes,
+        );
+        assert!(
+            report
+                .audit_notes
+                .iter()
+                .all(|n| n.kind == crate::diagnostic::AuditNoteKind::CoverageGap),
+            "all notes here must be CoverageGap; got {:?}",
+            report.audit_notes,
+        );
+    }
+    /// M1: a clean body has zero coverage gaps (so it can't false-positive
+    /// the fail-closed exit code).
+    #[test]
+    fn clean_body_has_no_coverage_gaps() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&empty_body(), false);
+        assert_eq!(v.into_report().coverage_gap_count(), 0);
+    }
+    /// M1: the divergent-`ensures` note is TRANSPARENCY — an
+    /// EnsuresPostcondition obligation is emitted alongside it (which drives
+    /// the exit code via undischarged), so the note itself must NOT
+    /// double-count as a coverage gap.
+    #[test]
+    fn divergent_ensures_note_is_transparency() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_ensures(vec!["result > 0".to_string()]);
+        // empty_body has no blocks → no Return terminator → divergent.
+        v.visit_body(&empty_body(), false);
+        let report = v.into_report();
+        assert!(
+            report.audit_notes.iter().any(|n| n.message.contains("no return point")),
+            "expected the divergent-ensures explanatory note; got {:?}",
+            report.audit_notes,
+        );
+        assert_eq!(
+            report.coverage_gap_count(),
+            0,
+            "the divergent-ensures note is Transparency (its obligation already \
+             drives the exit code); got {:?}",
+            report.audit_notes,
         );
     }
     /// Build a single-block body whose terminator is `Call(path)`. Used

@@ -54,9 +54,10 @@ impl fmt::Display for SubsetError {
 /// "this call wasn't classified" and can investigate whether a
 /// real PB rule should have fired.
 ///
-/// Audit notes are informational, never block verification, and do
-/// not count toward the violation total. They are surfaced alongside
-/// errors in the wrapper's stderr and (future) in SARIF as
+/// Audit notes never count toward the violation total, but a
+/// COVERAGE-GAP note IS folded into the wrapper's exit code (fail
+/// closed, config-gated) — see [`AuditNoteKind`]. They are surfaced
+/// alongside errors in the wrapper's stderr and (future) in SARIF as
 /// `result.kind = "informational"`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuditNote {
@@ -64,6 +65,40 @@ pub struct AuditNote {
     pub span: Span,
     /// Why the note exists.
     pub message: String,
+    /// Whether this is a real coverage gap (folded into the exit code,
+    /// fail closed) or a transparency note (informational only).
+    /// Defaults to `CoverageGap` on deserialize (fail closed) for
+    /// forward-compat with notes serialized before this field existed.
+    #[serde(default = "default_audit_note_kind")]
+    pub kind: AuditNoteKind,
+}
+/// Whether an [`AuditNote`] marks a real COVERAGE GAP or is purely a
+/// TRANSPARENCY note.
+///
+/// The project posture is "no silent skips". A coverage gap — a
+/// safety-relevant check that could not run, with no compensating VC
+/// obligation — is printed to stderr, but stderr is invisible to a CI
+/// gate keyed on the exit code. Folding coverage-gap notes into the exit
+/// code (fail closed, via `verification.fail_on_coverage_gaps`, default
+/// true) closes that hole: a "verified" exit can no longer mean "verified
+/// except the parts I could not model".
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditNoteKind {
+    /// A safety check that should have run was SKIPPED, and NO
+    /// obligation/violation was emitted for it — so it is invisible to
+    /// the exit code unless folded in. The fail-closed default (a new,
+    /// unclassified note is treated as a gap).
+    CoverageGap,
+    /// Informational only: the check ran and needed no action (e.g. a
+    /// value-preserving cast accepted), a VC obligation was emitted
+    /// alongside (so the exit code already reflects the situation), or
+    /// it records a user `#[pitbull::trusted]` opt-in. Never affects the
+    /// verdict.
+    Transparency,
+}
+/// Fail-closed serde default for [`AuditNote::kind`].
+fn default_audit_note_kind() -> AuditNoteKind {
+    AuditNoteKind::CoverageGap
 }
 impl fmt::Display for AuditNote {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -149,6 +184,19 @@ impl SubsetReport {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.phase_completed == PhaseCompleted::SubsetCheckComplete && self.errors.is_empty()
+    }
+    /// Number of COVERAGE-GAP audit notes — safety checks that could not
+    /// run, with no compensating VC obligation. The wrapper folds this
+    /// into the exit code (fail closed) when
+    /// `verification.fail_on_coverage_gaps` is set (the default), so a CI
+    /// gate keyed on the exit status cannot mistake a coverage gap for a
+    /// clean verification. Transparency notes are excluded.
+    #[must_use]
+    pub fn coverage_gap_count(&self) -> usize {
+        self.audit_notes
+            .iter()
+            .filter(|n| n.kind == AuditNoteKind::CoverageGap)
+            .count()
     }
     /// Render as SARIF 2.1.0 JSON. The schema is intentionally minimal here;
     /// full SARIF generation including code-flow stitching lives in
@@ -239,6 +287,29 @@ mod tests {
     fn aborted_report_is_not_clean() {
         let r = SubsetReport::aborted();
         assert!(!r.is_clean());
+    }
+    /// M1: `coverage_gap_count` counts only CoverageGap notes, not
+    /// Transparency ones — the filter that decides what folds into the
+    /// fail-closed exit code.
+    #[test]
+    fn coverage_gap_count_filters_by_kind() {
+        let note = |msg: &str, kind| AuditNote { span: Span::default(), message: msg.into(), kind };
+        let mut r = SubsetReport::new(vec![]);
+        r.audit_notes = vec![
+            note("gap", AuditNoteKind::CoverageGap),
+            note("info", AuditNoteKind::Transparency),
+            note("gap2", AuditNoteKind::CoverageGap),
+        ];
+        assert_eq!(r.coverage_gap_count(), 2, "only CoverageGap notes count");
+    }
+    /// M1 fail-closed serde default: a note serialized BEFORE the `kind`
+    /// field existed deserializes as CoverageGap (so an old report can't
+    /// silently downgrade a gap to a non-blocking note).
+    #[test]
+    fn audit_note_kind_defaults_to_coverage_gap_on_deserialize() {
+        let json = r#"{"span":{"lo":0,"hi":0,"file":0},"message":"old"}"#;
+        let note: AuditNote = serde_json::from_str(json).expect("deserialize legacy note");
+        assert_eq!(note.kind, AuditNoteKind::CoverageGap);
     }
     #[test]
     fn sarif_minimal_includes_rule_metadata() {
