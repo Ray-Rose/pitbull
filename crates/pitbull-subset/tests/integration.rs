@@ -2782,3 +2782,60 @@ fn mixed_width_const_shift_emits_obligation_not_silent_pass() {
         );
     }
 }
+/// Variable mixed-width discharge (safe subset, 2026-06-14): `u32 << y:u8`
+/// with `requires(y < 32)` now BINDS the precondition to the amount (it was
+/// left free pre-fix), so the over-shift obligation carries the assumption
+/// and discharges with a solver. A SIGNED amount (`y:i8`) is NOT bound and
+/// stays fail-closed. Solver-independent: pins that the unsigned amount's
+/// obligation gains the bound precondition (the wrapper's `[N assumption]`
+/// reporting), where pre-fix neither shift carried one.
+#[test]
+fn mixed_width_unsigned_amount_binds_precondition() {
+    let Some(env) = E2eEnv::probe() else {
+        let require = std::env::var_os("PITBULL_REQUIRE_E2E").is_some();
+        if require {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("mixed_width_unsigned_amount_binds_precondition: SKIPPED — prerequisites missing.");
+        return;
+    };
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut src = std::env::temp_dir();
+    src.push(format!("pitbull-25b-{}-{}.rs", std::process::id(), counter));
+    fs::write(
+        &src,
+        "pub fn g(x: u32, y: u8) -> u32 { x << y }\n\
+         pub fn h(x: u32, y: i8) -> u32 { x << y }\n",
+    )
+    .expect("write #25b probe");
+    let mut cfg = std::env::temp_dir();
+    cfg.push(format!("pitbull-25b-{}-{}.toml", std::process::id(), counter));
+    // The harness forces --crate-name=corpus_test, so paths are corpus_test::*.
+    fs::write(
+        &cfg,
+        "[project]\n\
+         name = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         [verification.preconditions]\n\
+         \"corpus_test::g\" = [\"y < 32\"]\n\
+         \"corpus_test::h\" = [\"y < 32\"]\n",
+    )
+    .expect("write #25b pitbull.toml");
+    let result = run_one_corpus_file_full(&env, &src, &[("PITBULL_TOML", cfg.as_os_str())]);
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&cfg);
+    let (stderr, _code) = result.expect("wrapper should run");
+    // Two shift obligations (one per fn).
+    assert_eq!(
+        stderr.matches("pb049-shl").count(),
+        2,
+        "expected two shift obligations (g + h); stderr:\n{stderr}",
+    );
+    // The UNSIGNED amount (g) now carries the bound precondition — pre-fix a
+    // variable mixed-width amount was left free, so NEITHER shift had one.
+    assert!(
+        stderr.contains("assumption"),
+        "the unsigned mixed-width amount must bind its precondition (an \
+         `[N assumption]` obligation); stderr:\n{stderr}",
+    );
+}

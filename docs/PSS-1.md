@@ -1622,6 +1622,25 @@ the std form and now also matches. No shadow type changes.
   (zero/sign-extend) — today such a shift fails closed (undischarged)
   rather than discharging. Supersedes the Task R "mixed-width shift audit
   note" follow-up.
+- ✅ Variable mixed-width shift discharge — safe subset (2026-06-14,
+  follow-up to #25). The amount is modelled at the VALUE width V; a
+  precondition now BINDS to it, but ONLY when that modelling is sound: the
+  amount type must be UNSIGNED and no wider than V. Then the amount
+  zero-extends into a free V-wide `rhs`, the precondition and the over-shift
+  `(bvuge rhs bits_V)` both compare UNSIGNED at V, and zero-extension
+  preserves unsigned comparisons against a fits-in-amount literal — so
+  proving `precond ⟹ rhs < bits_V` for ALL V-wide `rhs` implies it for the
+  narrower real amount. Hence `x: u32 << y: u8` + `requires(y < 32)` now
+  DISCHARGES (verified e2e: the obligation gains `[1 assumption]`). A SIGNED
+  amount (a negative value over-shifts yet satisfies a signed `< bits_V`
+  bound) or a WIDER amount (truncating to V hides high bits) is NOT bound →
+  free `rhs` → fail closed (verified: `u32 << y: i8` carries no assumption).
+  No SMT-encoder change — the soundness lives entirely in the visitor's
+  bind-only-when-sound gate (`int_type_info`-checked). Pinned by
+  `visitor::mixed_width_variable_shift_binds_precondition_only_when_sound`
+  and e2e `mixed_width_unsigned_amount_binds_precondition`. REMAINING: the
+  signed / wider-amount cases need modelling the amount at its OWN width
+  (zero/sign-extend + its own declaration); today they fail closed.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

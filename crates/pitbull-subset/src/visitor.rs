@@ -1575,15 +1575,35 @@ impl<'cfg> SubsetVisitor<'cfg> {
         //      the raw string verbatim. That preserves O.1's
         //      raw-SMT-LIB escape hatch.
         let lhs_arg = self.operand_arg_name(lhs);
-        // #25: for a mixed-width shift, do NOT bind preconditions to the
-        // amount (rhs) — its real width differs from the value width V we
-        // model it at, so a precondition bound at V width could be mis-sized.
-        // Leaving rhs unbound keeps a variable mixed-width amount FREE, so the
-        // over-shift obligation cannot vacuously discharge (fail closed). A
-        // sound variable-amount encoding (at the amount's own width) is the
-        // tracked follow-up.
+        // Variable mixed-width discharge (safe subset, 2026-06-14). For a
+        // mixed-width shift we model the amount at the VALUE width V (a free
+        // V-wide `rhs`). Binding a precondition to it is SOUND only when that
+        // modelling is a sound over-approximation: the amount type must be
+        // UNSIGNED and no wider than V. Then the real (narrower) amount
+        // zero-extends into `rhs`, both the precondition and the over-shift
+        // `(bvuge rhs bits_V)` compare UNSIGNED at V, and zero-extension
+        // preserves unsigned comparisons against a literal that fits the
+        // amount type — so proving `precond ⟹ rhs < bits_V` for ALL V-wide
+        // `rhs` implies it for the real amount (e.g. `u32 << y:u8` +
+        // `requires(y < 32)` discharges). A SIGNED amount (a negative value
+        // over-shifts yet satisfies a signed `< bits_V` bound) or a WIDER
+        // amount (truncating to V would hide high bits) is NOT sound to model
+        // at V, so it is left UNBOUND → free `rhs` → `(bvuge rhs bits_V)` is
+        // `sat` → fail CLOSED. Discharging those needs modelling the amount at
+        // its OWN width (zero/sign-extend) — the tracked follow-up.
         let rhs_arg = if mixed_width_shift {
-            None
+            let sound_at_value_width = matches!(
+                (
+                    crate::predicate::int_type_info(&rhs_name),
+                    crate::predicate::int_type_info(&lhs_name),
+                ),
+                (Some((false, a_bits)), Some((_, v_bits))) if a_bits <= v_bits
+            );
+            if sound_at_value_width {
+                self.operand_arg_name(rhs)
+            } else {
+                None
+            }
         } else {
             self.operand_arg_name(rhs)
         };
@@ -5080,6 +5100,83 @@ mod tests {
                      truncated value would hide a real over-shift; got {assumptions:?}",
                 ),
             }
+        }
+    }
+    /// Variable mixed-width discharge (safe subset, 2026-06-14): a precondition
+    /// on the amount BINDS to `rhs` (modelled at the value width) ONLY when the
+    /// amount is UNSIGNED and no wider than the value type — then
+    /// `x: u32 << y: u8` + `requires(y < 32)` carries `(bvult rhs ...)` and
+    /// (with a solver) discharges. A SIGNED amount (a negative value
+    /// over-shifts but satisfies a signed bound) or a WIDER amount
+    /// (truncation) is NOT bound → stays free → fail closed.
+    #[test]
+    fn mixed_width_variable_shift_binds_precondition_only_when_sound() {
+        use crate::mir_api::{BinOp, IntTy, UintTy};
+        let cfg = SubsetConfig::default_for_test();
+        let u32_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let amount_ty = |t: &str| -> Ty {
+            let kind = match t {
+                "u8" => RigidTy::Uint(UintTy::U8),
+                "i8" => RigidTy::Int(IntTy::I8),
+                "u64" => RigidTy::Uint(UintTy::U64),
+                _ => unreachable!("unmapped amount type in test"),
+            };
+            Ty { kind: TyKind::RigidTy(kind) }
+        };
+        // (amount type, expect the precondition bound to rhs?)
+        let cases = [
+            ("u8", true, "unsigned + narrower → bound (discharges with a solver)"),
+            ("i8", false, "signed → unbound (a negative amount over-shifts → fail closed)"),
+            ("u64", false, "wider than value → unbound (truncation unsound → fail closed)"),
+        ];
+        for (amt, expect_bound, label) in cases {
+            let mut v = SubsetVisitor::new(&cfg);
+            v.set_current_preconditions(vec!["y < 32".into()]);
+            let body = Body {
+                def_id: DefId(0),
+                arg_tys: vec![u32_ty(), amount_ty(amt)],
+                arg_names: vec!["x".into(), "y".into()],
+                return_ty: u32_ty(),
+                is_unsafe: false,
+                is_async: false,
+                locals: vec![
+                    LocalDecl { ty: u32_ty(), span: Span::default(), mutability: Mutability::Not },
+                    LocalDecl { ty: u32_ty(), span: Span::default(), mutability: Mutability::Not },
+                    LocalDecl { ty: amount_ty(amt), span: Span::default(), mutability: Mutability::Not },
+                ],
+                blocks: vec![BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Shl,
+                                Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                                Operand::Copy(Place { local: Local(2), projection: vec![] }),
+                            ),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator { kind: TerminatorKind::Return, span: Span::default() },
+                }],
+                span: Span::default(),
+            };
+            v.visit_body(&body, false);
+            let report = v.into_report();
+            assert_eq!(
+                report.vc_obligations.len(),
+                1,
+                "{label}: must emit one obligation; got {:?}",
+                report.vc_obligations,
+            );
+            let has_rhs_precond = report.vc_obligations[0]
+                .assumptions
+                .iter()
+                .any(|a| a.contains("rhs"));
+            assert_eq!(
+                has_rhs_precond, expect_bound,
+                "{label}: precondition-bound-to-rhs = {expect_bound}; got assumptions {:?}",
+                report.vc_obligations[0].assumptions,
+            );
         }
     }
     /// M-1 positive control: a body WITH a Return terminator and an
