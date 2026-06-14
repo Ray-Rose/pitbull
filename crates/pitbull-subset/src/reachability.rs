@@ -44,6 +44,22 @@
 //! In the v0.1 skeleton the tagger is stubbed: every Deinit is treated as
 //! out-of-phase (worst case for the user, safest for soundness). The real
 //! implementation queries `rustc_public::mir::MirPhase`.
+//!
+//! ## Production status (2026-06-14)
+//!
+//! `ReachabilityDriver` above is a COMPLETE, unit-tested reference
+//! implementation of the call-closure walk, but it is **not yet the
+//! production path**: the `pitbull-rustc` wrapper currently does a flat
+//! `all_local_items()` walk filtered by `verify_roots`, which on its own
+//! would skip in-crate callees of a root (a fail-open under explicit
+//! narrowing — issue #27). Until the driver is wired in (auto-walking the
+//! closure), the wrapper closes that hole the fail-CLOSED way: it collects
+//! the callees of every walked body (`callee_paths`) and, via
+//! `unverified_reachable_callees`, reports any in-crate function reachable
+//! from a verified root that was not itself verified — forcing a nonzero
+//! exit. Applied every run, this transitively requires the whole reachable
+//! in-crate closure to be covered before a "verified" verdict is possible.
+//! Both helpers are pure and live here so they are testable on stable.
 use crate::config::SubsetConfig;
 use crate::diagnostic::SubsetReport;
 use crate::mir_api::{Body, DefId, Span, Ty};
@@ -185,6 +201,65 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
     } else {
         pattern == path
     }
+}
+/// Extract the fully-qualified paths of the functions DIRECTLY called by
+/// this body — the targets of `TerminatorKind::Call` whose callee operand
+/// is a resolved function constant. Used by the wrapper's fail-closed
+/// reachability check to detect in-crate callees a `verify_roots`-narrowed
+/// walk would otherwise skip.
+///
+/// Only direct calls with a statically-known callee path are returned.
+/// Indirect calls (fn pointers, `dyn` dispatch) carry no static path and
+/// are independently rejected (PB031/PB032), so they cannot smuggle an
+/// unchecked in-crate callee past the subset gate. Drop glue
+/// (`TerminatorKind::Drop`) is not yet followed — a tracked gap.
+#[must_use]
+pub fn callee_paths(body: &Body) -> Vec<String> {
+    use crate::mir_api::{Operand, TerminatorKind};
+    let mut paths = Vec::new();
+    for block in &body.blocks {
+        if let TerminatorKind::Call { func, .. } = &block.terminator.kind {
+            if let Operand::Constant(c) = func {
+                if let Some(p) = &c.path {
+                    paths.push(p.clone());
+                }
+            }
+        }
+    }
+    paths
+}
+/// Compute the in-crate functions that are REACHABLE from a verified root
+/// (directly called by some walked body) yet were NOT themselves verified —
+/// the fail-open that `verify_roots` narrowing would otherwise hide
+/// (issue #27). A clean (empty) result requires every such callee to be
+/// either walked, `#[pitbull::trusted]` (explicit user opt-out), or
+/// `exclude`d (already absent from `local_universe`). Applied at every run,
+/// this transitively forces the whole reachable in-crate closure to be
+/// covered — each newly-walked body re-exposes its own unwalked callees —
+/// so a "verified" verdict can never rest on an unverified in-crate callee.
+///
+/// - `referenced`: paths called by walked bodies (union of `callee_paths`).
+/// - `local_universe`: paths of all non-excluded in-crate fns with bodies.
+/// - `walked`: paths actually visited.
+/// - `trusted`: paths the user marked `#[pitbull::trusted]`.
+///
+/// Returns the offending paths, sorted, for deterministic diagnostics.
+#[must_use]
+pub fn unverified_reachable_callees(
+    referenced: &HashSet<String>,
+    local_universe: &HashSet<String>,
+    walked: &HashSet<String>,
+    trusted: &HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = referenced
+        .iter()
+        .filter(|c| {
+            local_universe.contains(*c) && !walked.contains(*c) && !trusted.contains(*c)
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
 }
 #[cfg(test)]
 mod tests {
@@ -412,5 +487,78 @@ mod tests {
             path: "crate::SIZE".into(),
         }]);
         assert!(report.is_clean());
+    }
+    /// `callee_paths` returns the path of each directly-called function and
+    /// ignores indirect/path-less calls and non-Call terminators.
+    #[test]
+    fn callee_paths_extracts_direct_call_targets() {
+        use crate::mir_api::{
+            BasicBlock, BasicBlockData, ConstOperand, Local, Operand, Place, Terminator,
+            TerminatorKind,
+        };
+        let fn_const = |path: Option<&str>| {
+            Operand::Constant(ConstOperand {
+                ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
+                def_id: None,
+                path: path.map(str::to_string),
+                value: None,
+            })
+        };
+        let call_block = |func: Operand| BasicBlockData {
+            statements: vec![],
+            terminator: Terminator {
+                kind: TerminatorKind::Call {
+                    func,
+                    args: vec![],
+                    destination: Place { local: Local(0), projection: vec![] },
+                    target: Some(BasicBlock(0)),
+                },
+                span: Span::default(),
+            },
+        };
+        let mut body = empty_body(DefId(1));
+        body.blocks = vec![
+            call_block(fn_const(Some("crate::helper"))), // direct call -> captured
+            call_block(fn_const(None)),                  // path-less (indirect) -> ignored
+            BasicBlockData {
+                // non-Call terminator -> ignored
+                statements: vec![],
+                terminator: Terminator { kind: TerminatorKind::Return, span: Span::default() },
+            },
+        ];
+        assert_eq!(callee_paths(&body), vec!["crate::helper".to_string()]);
+    }
+    /// `unverified_reachable_callees` flags exactly the in-crate callees
+    /// reachable from a root but neither walked, trusted, nor out-of-crate.
+    /// This is the #27 fail-closed gate.
+    #[test]
+    fn unverified_reachable_callees_flags_skipped_in_crate_callee() {
+        let set = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<HashSet<_>>();
+        // root (walked) calls helper (in-crate, NOT walked) + an external fn.
+        let referenced = set(&["crate::helper", "std::vec::Vec::new"]);
+        let universe = set(&["crate::root", "crate::helper", "crate::helper2"]);
+        let walked = set(&["crate::root"]);
+        assert_eq!(
+            unverified_reachable_callees(&referenced, &universe, &walked, &set(&[])),
+            vec!["crate::helper".to_string()],
+            "an in-crate callee skipped by narrowing must be flagged (external callee is not in the universe, so never flagged)"
+        );
+        // Marking helper trusted is an explicit opt-out -> not flagged.
+        assert!(
+            unverified_reachable_callees(&referenced, &universe, &walked, &set(&["crate::helper"]))
+                .is_empty(),
+            "a trusted callee must not be flagged"
+        );
+        // Walking helper clears it.
+        assert!(
+            unverified_reachable_callees(
+                &referenced,
+                &universe,
+                &set(&["crate::root", "crate::helper"]),
+                &set(&[]),
+            )
+            .is_empty(),
+            "a walked callee must not be flagged"
+        );
     }
 }

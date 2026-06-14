@@ -2589,3 +2589,62 @@ verify_roots = [\"nonexistent_crate::nothing\"]
          did not contain PB018:\n{stderr}",
     );
 }
+/// #27 fail-closed reachability: when `verify_roots` narrows to a root
+/// that CALLS a non-root in-crate function, that callee is reachable but
+/// not walked. The wrapper must surface it (`PB-reachability`) and FAIL
+/// CLOSED (exit 1) — a "verified" verdict must never rest on an unverified
+/// in-crate callee. Pre-fix the callee was silently skipped and the
+/// wrapper exited 0 ("verified") even though the callee held a `Box`
+/// (PB011) that was never checked.
+#[test]
+fn verify_roots_fails_closed_on_unverified_in_crate_callee() {
+    let Some(env) = E2eEnv::probe() else {
+        let require = std::env::var_os("PITBULL_REQUIRE_E2E").is_some();
+        if require {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "verify_roots_fails_closed_on_unverified_in_crate_callee: SKIPPED — prerequisites missing.",
+        );
+        return;
+    };
+    // `root` (matched by verify_roots) calls `helper` (NOT matched).
+    // `helper` holds a `Box` (PB011) only ever checked if it is walked.
+    // The harness forces `--crate-name=corpus_test`, so item paths are
+    // `corpus_test::<fn>`; verify_roots matches `root` but not `helper`.
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut src_path = std::env::temp_dir();
+    src_path.push(format!("pitbull-27-callee-{}-{}.rs", std::process::id(), counter));
+    fs::write(
+        &src_path,
+        "pub fn root(x: u32) -> u32 { helper(x) }\n\
+         pub fn helper(x: u32) -> u32 { let b = Box::new(x); *b }\n",
+    )
+    .expect("write #27 probe source");
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-27-callee-{}-{}.toml", std::process::id(), counter));
+    fs::write(
+        &cfg_path,
+        "[project]\n\
+         name = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         [reachability]\n\
+         verify_roots = [\"corpus_test::root\"]\n",
+    )
+    .expect("write #27 pitbull.toml");
+    let result =
+        run_one_corpus_file_full(&env, &src_path, &[("PITBULL_TOML", cfg_path.as_os_str())]);
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&cfg_path);
+    let (stderr, code) = result.expect("wrapper should run");
+    assert!(
+        stderr.contains("PB-reachability") && stderr.contains("corpus_test::helper"),
+        "#27: the unverified in-crate callee must be surfaced; stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "#27: an unverified reachable in-crate callee must FAIL CLOSED \
+         (exit 1), not exit 0 (\"verified\"); stderr:\n{stderr}",
+    );
+}

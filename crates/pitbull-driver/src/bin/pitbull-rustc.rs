@@ -106,18 +106,24 @@ extern crate rustc_span;
 ///   - a bridge/analysis failure (the subset check could not run at all)
 ///     yields exit 2: we must NEVER report "verified" when no analysis
 ///     happened, even off a clean rustc compile with zero findings.
-///   - subset violations OR undischarged obligations yield exit 1.
+///   - subset violations OR undischarged obligations OR in-crate callees
+///     that a `verify_roots`-narrowed walk left unverified (#27) yield
+///     exit 1.
 ///   - otherwise exit 0 (clean verification).
 #[cfg(any(rustc_public_real, test))]
 fn decide_pitbull_exit_code(
     rustc_exit_code: i32,
     violations: usize,
     undischarged_obligations: usize,
+    unverified_reachable_callees: usize,
     bridge_failed: bool,
 ) -> i32 {
     let pitbull_exit_code = if bridge_failed {
         2
-    } else if violations > 0 || undischarged_obligations > 0 {
+    } else if violations > 0
+        || undischarged_obligations > 0
+        || unverified_reachable_callees > 0
+    {
         1
     } else {
         0
@@ -129,13 +135,13 @@ mod exit_code_tests {
     use super::decide_pitbull_exit_code;
     #[test]
     fn clean_verification_is_zero() {
-        assert_eq!(decide_pitbull_exit_code(0, 0, 0, false), 0);
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 0, false), 0);
     }
     #[test]
     fn violations_or_undischarged_is_one() {
-        assert_eq!(decide_pitbull_exit_code(0, 1, 0, false), 1);
-        assert_eq!(decide_pitbull_exit_code(0, 0, 1, false), 1);
-        assert_eq!(decide_pitbull_exit_code(0, 7, 3, false), 1);
+        assert_eq!(decide_pitbull_exit_code(0, 1, 0, 0, false), 1);
+        assert_eq!(decide_pitbull_exit_code(0, 0, 1, 0, false), 1);
+        assert_eq!(decide_pitbull_exit_code(0, 7, 3, 0, false), 1);
     }
     /// CRITICAL fail-open regression (audit 2026-06-14): if the
     /// rustc_public bridge fails, the subset check never runs and the
@@ -143,13 +149,20 @@ mod exit_code_tests {
     /// never exit 0 ("verified") off a clean rustc compile.
     #[test]
     fn bridge_failure_never_reports_verified() {
-        assert_eq!(decide_pitbull_exit_code(0, 0, 0, true), 2);
-        assert_ne!(decide_pitbull_exit_code(0, 0, 0, true), 0);
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 0, true), 2);
+        assert_ne!(decide_pitbull_exit_code(0, 0, 0, 0, true), 0);
+    }
+    /// #27 fail-closed: an in-crate callee reachable from a verified root
+    /// but skipped by verify_roots narrowing forces exit 1, never 0.
+    #[test]
+    fn unverified_reachable_callee_fails_closed() {
+        assert_eq!(decide_pitbull_exit_code(0, 0, 0, 1, false), 1);
+        assert_ne!(decide_pitbull_exit_code(0, 0, 0, 2, false), 0);
     }
     #[test]
     fn rustc_failure_takes_precedence() {
-        assert_eq!(decide_pitbull_exit_code(101, 0, 0, false), 101);
-        assert_eq!(decide_pitbull_exit_code(101, 5, 5, true), 101);
+        assert_eq!(decide_pitbull_exit_code(101, 0, 0, 0, false), 101);
+        assert_eq!(decide_pitbull_exit_code(101, 5, 5, 9, true), 101);
     }
 }
 #[cfg(rustc_public_real)]
@@ -224,6 +237,7 @@ fn main() {
         rustc_exit_code,
         callbacks.violations,
         callbacks.undischarged_obligations,
+        callbacks.unverified_reachable_callees,
         callbacks.bridge_failed,
     ));
 }
@@ -258,6 +272,11 @@ struct PitbullCallbacks {
     /// reported as "verified" when no analysis actually happened
     /// (audit 2026-06-14, CRITICAL fail-open: bridge failure → exit 0).
     bridge_failed: bool,
+    /// Count of in-crate functions reachable from a verified root that
+    /// were NOT themselves verified because `verify_roots` narrowing
+    /// skipped them (issue #27). Nonzero forces a fail-closed exit 1: a
+    /// "verified" verdict must never rest on an unverified in-crate callee.
+    unverified_reachable_callees: usize,
 }
 #[cfg(rustc_public_real)]
 impl rustc_driver::Callbacks for PitbullCallbacks {
@@ -355,6 +374,16 @@ impl PitbullCallbacks {
         // "no silent skips" posture forbids (audit 2026-05-29).
         let mut walked_fn_paths: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // #27 fail-closed reachability check. `local_fn_universe` is every
+        // non-excluded in-crate fn-with-body; `referenced_callees` is the
+        // union of the direct callees of every walked (non-trusted) body.
+        // After the walk, an entry in (referenced ∩ universe) that is
+        // neither walked nor trusted is an in-crate callee a
+        // verify_roots-narrowed walk skipped — surfaced fail-closed below.
+        let mut local_fn_universe: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut referenced_callees: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         // HIR pre-pass: rustc_public's MIR has already discarded
         // HIR-level `unsafe { ... }` block markers (operations inside
         // an unsafe block fire their own rules — PB004/PB007/PB009 —
@@ -383,6 +412,14 @@ impl PitbullCallbacks {
             }
             match item.kind() {
                 rustc_public::ItemKind::Fn => {
+                    // #27: record EVERY in-crate fn-with-body in the universe
+                    // BEFORE the verify_roots filter — a callee skipped by
+                    // narrowing is exactly "in the universe but not walked".
+                    // (Excluded items already `continue`d above, so they are
+                    // correctly absent from the universe.)
+                    if item.has_body() {
+                        local_fn_universe.insert(item_path.clone());
+                    }
                     let matches_root = verify_roots.is_empty()
                         || verify_roots
                             .iter()
@@ -497,12 +534,24 @@ impl PitbullCallbacks {
                     // before the short-circuit.
                     let is_trusted = hir_trusted.contains(&item_path);
                     visitor.visit_body(&shadow_body, is_trusted);
+                    // #27: record this body's direct in-crate callees so the
+                    // post-loop check can flag any that narrowing skipped.
+                    // Trusted bodies do NOT propagate — by trusting the spec
+                    // the user assumes responsibility for the body AND its
+                    // callees (mirrors reachability.rs's trusted-no-propagate).
+                    if !is_trusted {
+                        for cp in pitbull_subset::reachability::callee_paths(&shadow_body) {
+                            referenced_callees.insert(cp);
+                        }
+                    }
                 }
                 rustc_public::ItemKind::Static => {
                     // `verify_roots` is a reachability-closure filter
-                    // for fn items — it picks the set of bodies whose
-                    // *call closure* gets walked. It does NOT apply to
-                    // project-level items like statics: PB018 (`static
+                    // for fn items — it picks the ROOT bodies to walk; the
+                    // post-loop #27 check then fails closed on any in-crate
+                    // callee of a root that narrowing skipped (so the call
+                    // closure is ENFORCED, not silently dropped). It does
+                    // NOT apply to project-level items like statics: PB018 (`static
                     // mut`), PB021 (interior-mutable static),
                     // PB022 (forbidden static types) all reject ANY
                     // such item in the local crate regardless of which
@@ -554,6 +603,31 @@ impl PitbullCallbacks {
                 walked,
                 filtered_out,
             );
+            // #27 fail-closed reachability gate. A verify_roots-narrowed walk
+            // skips in-crate callees of the roots. Flag any in-crate function
+            // reachable from a verified (non-trusted) root that was NOT itself
+            // verified, and fail closed on it — a "verified" verdict must
+            // never rest on an unverified in-crate callee. Applied every run,
+            // this transitively forces the whole reachable in-crate closure to
+            // be covered. The user resolves it by widening verify_roots,
+            // leaving verify_roots empty (full-crate coverage), or marking the
+            // callee #[pitbull::trusted].
+            let unverified = pitbull_subset::reachability::unverified_reachable_callees(
+                &referenced_callees,
+                &local_fn_universe,
+                &walked_fn_paths,
+                &hir_trusted,
+            );
+            for callee in &unverified {
+                eprintln!(
+                    "pitbull-rustc: PB-reachability: in-crate function `{callee}` is \
+                     reachable from a verified root but was NOT verified (skipped by \
+                     verify_roots narrowing). Add it to [reachability] verify_roots, \
+                     leave verify_roots empty for full-crate coverage, or mark it \
+                     #[pitbull::trusted]. Treating as unverified (fail-closed).",
+                );
+            }
+            self.unverified_reachable_callees = unverified.len();
         } else if filtered_out > 0 {
             // Audit finding (2026-05-26 full-codebase sweep): when
             // `verify_roots` is empty but `exclude` patterns dropped

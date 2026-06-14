@@ -1527,6 +1527,29 @@ the std form and now also matches. No shadow type changes.
   (was mislabeled "checked by the driver"); the PB053 `char` comment no
   longer claims a char-arithmetic check that does not exist (and is not
   expressible in safe Rust).
+- ✅ #27 reachability fail-open hardened — `verify_roots` narrowing no
+  longer silently skips in-crate callees (2026-06-14). The wrapper walks
+  `all_local_items()` filtered by `verify_roots`; on its own that skips a
+  root's in-crate callees, so a root could be reported "verified" while a
+  function it calls (holding, say, a `Box`) went unchecked — a fail-open
+  under explicit narrowing. Now FAIL-CLOSED: the wrapper records every
+  walked (non-trusted) body's direct callees (`reachability::callee_paths`)
+  and, after the walk, flags any in-crate fn reachable from a verified root
+  that was neither walked, `#[pitbull::trusted]`, nor `exclude`d
+  (`reachability::unverified_reachable_callees`) — each forces exit 1.
+  Applied every run, this transitively requires the whole reachable
+  in-crate closure to be covered before a "verified" verdict is possible;
+  the user resolves a flag by widening `verify_roots`, leaving it empty
+  (full-crate coverage), or trusting the callee. The pure helpers live in
+  `pitbull-subset::reachability` (stable unit tests for callee extraction +
+  the flag set); the exit-code fold is pinned by
+  `unverified_reachable_callee_fails_closed`; the end-to-end behavior by
+  `verify_roots_fails_closed_on_unverified_in_crate_callee` (root calls a
+  non-root Box-holding helper → `PB-reachability` diagnostic + exit 1).
+  Honest-docs: `reachability.rs` now states the `ReachabilityDriver` BFS is
+  a tested reference NOT yet wired to production; auto-walking the closure
+  (vs. flagging) plus trait-dispatch / drop-glue edges remain the tracked
+  follow-up.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
