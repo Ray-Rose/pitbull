@@ -1550,6 +1550,34 @@ the std form and now also matches. No shadow type changes.
   a tested reference NOT yet wired to production; auto-walking the closure
   (vs. flagging) plus trait-dispatch / drop-glue edges remain the tracked
   follow-up.
+- ✅ Coverage-gap audit + PB003 enforcement (2026-06-14). A
+  defined-vs-enforced sweep of all 76 PSS-1 rules — each candidate probed
+  empirically through the real wrapper — confirmed the CARDINAL AoRTE
+  soundness is intact (no rule gap enables a false discharge in the
+  verifiable subset) but found several rules SILENTLY accepted: the
+  verifier reported "verified" for constructs the README lists as rejected
+  — PB003 (`unsafe impl`/`unsafe trait`), PB016 (`Drop` impl), and
+  PB056–PB058 (FFI: `extern` block / `#[no_mangle]` / non-Rust-ABI fn).
+  The remaining unenforced rules are sound deferrals: TRANSITIVELY COVERED
+  (PB014/PB017 heap-macros → PB011/PB012, verified via `format!`/`vec!`
+  probes; PB038 virtual call → PB031 `dyn`), DOCUMENTED-DEFERRED
+  (PB041/PB042 termination — already a known gap), ARCHITECTURALLY
+  OUT-OF-SCOPE for the v0.2 MIR scaffold (spec-mode PB044/PB055/PB064–070,
+  type-system PB034–037/PB040, build/const/cfg PB061–063, project-config),
+  or NOT EXPRESSIBLE in safe Rust (PB053 char arithmetic).
+  **PB003 is now ENFORCED:** the HIR pre-pass (which already finds PB001
+  unsafe blocks) detects `unsafe trait` (`ItemKind::Trait` safety) and
+  `unsafe impl` (`Impl::of_trait`→`TraitImplHeader::safety`), emits PB003,
+  and fails closed (exit 1). Macro-expansion spans are skipped (same F7
+  posture as PB001; a non-allowlisted macro emitting an unsafe impl is
+  caught by PB059); safe traits/impls do not fire. The "N unsafe blocks"
+  summary now counts PB001 only (PB003 joins the violation total). Pinned
+  e2e by `unsafe_impl_and_trait_fire_pb003`. REMAINING (now tracked here,
+  no longer silent): PB016 drop-site modeling and PB056–058 FFI surface —
+  each carries a far-future `FuturePlan`, and none is an AoRTE
+  false-discharge (a bad `unsafe Send` needs concurrency → PB028; a drop
+  panic → the walked drop body → PB043; FFI calls are `unsafe` →
+  PB001/PB002).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

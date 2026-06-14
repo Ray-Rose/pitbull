@@ -2648,3 +2648,48 @@ fn verify_roots_fails_closed_on_unverified_in_crate_callee() {
          (exit 1), not exit 0 (\"verified\"); stderr:\n{stderr}",
     );
 }
+/// Coverage-gap audit (2026-06-14): `unsafe impl` / `unsafe trait` are
+/// item-level constructs with no MIR body, so the MIR-body visitor never
+/// saw them and they were SILENTLY accepted — contradicting the README's
+/// "unsafe in any form: blocks, fn, trait, impl". The HIR pre-pass now
+/// detects them as PB003 and fails closed (exit 1). Safe traits/impls in
+/// the same file must NOT fire (no false positives).
+#[test]
+fn unsafe_impl_and_trait_fire_pb003() {
+    let Some(env) = E2eEnv::probe() else {
+        let require = std::env::var_os("PITBULL_REQUIRE_E2E").is_some();
+        if require {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("unsafe_impl_and_trait_fire_pb003: SKIPPED — prerequisites missing.");
+        return;
+    };
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut src = std::env::temp_dir();
+    src.push(format!("pitbull-pb003-{}-{}.rs", std::process::id(), counter));
+    fs::write(
+        &src,
+        "pub struct S(u32);\n\
+         unsafe impl Send for S {}\n\
+         pub unsafe trait Marker {}\n\
+         pub trait Safe {}\n\
+         impl Safe for S {}\n",
+    )
+    .expect("write PB003 probe");
+    let result = run_one_corpus_file_full(&env, &src, &[]);
+    let _ = fs::remove_file(&src);
+    let (stderr, code) = result.expect("wrapper should run");
+    assert!(stderr.contains("PB003"), "unsafe impl/trait must fire PB003; stderr:\n{stderr}");
+    assert_eq!(
+        code,
+        Some(1),
+        "unsafe impl/trait must FAIL CLOSED (exit 1); stderr:\n{stderr}",
+    );
+    // Exactly the two unsafe items — the safe trait/impl must NOT fire.
+    let pb003_count = stderr.matches("PB003").count();
+    assert_eq!(
+        pb003_count, 2,
+        "expected exactly 2 PB003 (unsafe impl + unsafe trait), got {pb003_count}; \
+         stderr:\n{stderr}",
+    );
+}

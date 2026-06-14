@@ -33,6 +33,16 @@ entry point. Pitbull rejects them at compile time; this is not a warning:
 - Build scripts, non-allowlisted proc macros, `include!`-family macros
 - Recursion or loops without explicit `#[decreases]` / `#[variant]` clauses
 See `docs/PSS-1.md` for the normative specification.
+
+**Enforcement status (v0.2 scaffold).** The core memory-safety rules above
+are enforced today: unsafe blocks/`fn`/`trait`/`impl`, heap & collections,
+interior mutability, concurrency primitives, trait objects / fn-pointers /
+closures, floats, `as` casts, slice bounds, and overflow. A few constructs
+are specified but **not yet enforced** by the v0.2 scaffold — chiefly the
+FFI surface (`extern` blocks / `#[no_mangle]` / non-Rust ABI), implicit
+drop-site modeling, and loop/recursion termination — each tracked per-rule
+in `docs/PSS-1.md` §17.1. Pitbull will not claim to have proven what it has
+not: an unimplemented rule is a documented gap, never a silent pass.
 ## Why this list looks brutal
 It is the same list SPARK started with. The deal SPARK has kept with its users
 for forty years is: tell us what we are not allowed to do, and in exchange we

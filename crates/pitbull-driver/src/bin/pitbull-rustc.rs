@@ -392,13 +392,20 @@ impl PitbullCallbacks {
         // the report. tcx.hir_visit_all_item_likes_in_crate is callable
         // here because tcx remains valid inside rustc_internal::run.
         let HirPrePass {
-            violations: hir_pb001_errors,
+            violations: hir_violations,
             filename_table: hir_filename_partials,
             preconditions: hir_preconditions,
             trusted: hir_trusted,
             ensures: hir_ensures,
         } = collect_hir_pre_pass(tcx, &cfg.subset.allowed_proc_macros);
-        self.hir_unsafe_blocks = hir_pb001_errors.len();
+        // The HIR pre-pass finds BOTH PB001 (unsafe blocks) and PB003
+        // (unsafe impl/trait). Count only PB001 for the "unsafe blocks"
+        // summary line so the diagnostic stays accurate; PB003 still flows
+        // into `report.errors` below and the total violation count.
+        self.hir_unsafe_blocks = hir_violations
+            .iter()
+            .filter(|e| e.rule == pitbull_subset::rules::PB001)
+            .count();
         // CrateDef gives `name()`, `span()`, `def_id()` as trait methods.
         // `ty()` is exposed as an inherent method on CrateItem (via the
         // `crate_def_with_ty!` macro), so no separate trait import needed.
@@ -663,11 +670,11 @@ impl PitbullCallbacks {
             );
         }
         let mut report = visitor.into_report();
-        // Append HIR-derived PB001 violations to the MIR-derived
-        // violations. The two walks see distinct constructs (HIR
-        // unsafe-blocks vs MIR statements/types), so there's no
-        // duplication concern.
-        report.errors.extend(hir_pb001_errors);
+        // Append HIR-derived violations (PB001 unsafe blocks + PB003
+        // unsafe impl/trait) to the MIR-derived violations. The two walks
+        // see distinct constructs (HIR unsafe-blocks / unsafe-items vs MIR
+        // statements/types), so there's no duplication concern.
+        report.errors.extend(hir_violations);
         // Drain the per-thread filename table the adapter accumulated
         // while building shadow Spans, then merge in the HIR-side
         // filename map. Both paths use DefaultHasher on the filename
@@ -1442,7 +1449,9 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 /// soundness tool must not ship. (Also clears clippy::type_complexity.)
 #[cfg(rustc_public_real)]
 struct HirPrePass {
-    /// PB001 (`unsafe {}` block) violations found at HIR level.
+    /// HIR-level violations: PB001 (`unsafe {}` block) and PB003
+    /// (`unsafe trait` / `unsafe impl`) — both are item/scope constructs
+    /// the MIR-body visitor cannot see.
     violations: Vec<pitbull_subset::SubsetError>,
     /// Partial DefId→filename table, merged for SARIF URIs.
     filename_table: std::collections::HashMap<u32, String>,
@@ -1811,6 +1820,41 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
                     // does NOT admit unsafe.
                     self.trusted.insert(fn_path.clone());
                 }
+            }
+        }
+        // PB003: `unsafe trait` / `unsafe impl`. The README's forbidden
+        // list is "unsafe in any form: blocks, fn, trait, impl". Blocks
+        // are PB001 (visit_block) and `unsafe fn` is PB002 (signature
+        // walk), but `unsafe trait`/`unsafe impl` are ITEM-level with no
+        // MIR body of their own, so the MIR-body visitor never sees them —
+        // pre-2026-06-14 they were SILENTLY accepted (coverage-gap audit).
+        // Detect them here at HIR. Macro-expansion spans are skipped (same
+        // F7 posture as PB001: a derive may emit an unsafe impl the user
+        // didn't author; a non-allowlisted such macro is caught by PB059).
+        let unsafe_item: Option<&str> = match &item.kind {
+            rustc_hir::ItemKind::Trait(_, _, safety, ..)
+                if matches!(safety, rustc_hir::Safety::Unsafe) =>
+            {
+                Some("`unsafe trait`")
+            }
+            rustc_hir::ItemKind::Impl(imp) => match imp.of_trait {
+                Some(header) if matches!(header.safety, rustc_hir::Safety::Unsafe) => {
+                    Some("`unsafe impl`")
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(kind) = unsafe_item {
+            if !item.span.from_expansion() {
+                let span =
+                    rustc_span_to_shadow(self.tcx, item.span, &mut self.filename_table);
+                self.violations.push(pitbull_subset::SubsetError {
+                    rule: pitbull_subset::rules::PB003,
+                    span,
+                    detail: format!("{kind} (unsafe in any form is rejected)"),
+                    in_spec: false,
+                });
             }
         }
         rustc_hir::intravisit::walk_item(self, item);
