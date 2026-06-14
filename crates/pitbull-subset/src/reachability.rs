@@ -209,21 +209,50 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 /// walk would otherwise skip.
 ///
 /// Only direct calls with a statically-known callee path are returned.
-/// Indirect calls (fn pointers, `dyn` dispatch) carry no static path and
-/// are independently rejected (PB031/PB032), so they cannot smuggle an
-/// unchecked in-crate callee past the subset gate. Drop glue
-/// (`TerminatorKind::Drop`) is not yet followed — a tracked gap.
+/// Indirect calls (fn pointers, `dyn` dispatch, closures) carry no static
+/// path, so they are not in this set — yet they still cannot smuggle an
+/// unchecked in-crate callee past narrowing. The precise argument (audit
+/// 2026-06-14, strengthening the earlier one-line assertion the deep-audit
+/// agent flagged as hand-wavy):
+///   1. This set forces the DIRECT-call closure of the roots to be walked:
+///      `unverified_reachable_callees` fails closed on any walked body's
+///      direct callee that wasn't itself walked, so iterating to a fixpoint
+///      walks every body reachable from a root by direct calls.
+///   2. To PERFORM an indirect call, a body must materialize the callee
+///      into a local of `fn`-ptr / `dyn` / closure type (MIR loads the
+///      receiver/fn-ptr into a typed temporary before the `Call`). The
+///      visitor visits that local's type and fires PB031 (`dyn`) / PB032
+///      (fn ptr) / PB033 (closure) — a hard violation.
+///   3. By (1) every body that performs an indirect call is itself walked
+///      (it is in the direct-call closure, or only reachable via an
+///      indirect call from a body already walked); by (2) that walk
+///      produces a violation. So a `verified` verdict (exit 0) is
+///      impossible whenever an indirect dispatch is reachable — the
+///      indirect target need not be in this set for soundness.
+///
+/// Drop glue (`TerminatorKind::Drop`) is not a `Call`, so it is not here;
+/// the wrapper separately injects every LOCAL `Drop::drop` impl into the
+/// referenced-callee set (#27 drop-glue, 2026-06-14) to close that path.
+///
+/// Cross-crate edges are out of this set by construction (callee paths in
+/// other crates are not in the local universe). Non-local callees are the
+/// TRUSTED stdlib/dependency surface — see `docs/SAFETY-MANUAL.md` §3 for
+/// that boundary and the panic-bearing exceptions
+/// (`Option`/`Result::unwrap`/`expect`) the visitor catches at the call
+/// site rather than trusting.
 #[must_use]
 pub fn callee_paths(body: &Body) -> Vec<String> {
-    use crate::mir_api::{Operand, TerminatorKind};
+    use crate::mir_api::{ConstOperand, Operand, TerminatorKind};
     let mut paths = Vec::new();
     for block in &body.blocks {
-        if let TerminatorKind::Call { func, .. } = &block.terminator.kind {
-            if let Operand::Constant(c) = func {
-                if let Some(p) = &c.path {
-                    paths.push(p.clone());
-                }
-            }
+        // Direct call with a statically-known callee path: the callee
+        // operand is a function constant carrying a resolved path.
+        if let TerminatorKind::Call {
+            func: Operand::Constant(ConstOperand { path: Some(p), .. }),
+            ..
+        } = &block.terminator.kind
+        {
+            paths.push(p.clone());
         }
     }
     paths

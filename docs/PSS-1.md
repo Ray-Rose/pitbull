@@ -1658,6 +1658,53 @@ the std form and now also matches. No shadow type changes.
   `<D as Drop>::drop` and exits 1 (was exit 0). Pinned by
   `drop_glue_under_narrowing_fails_closed`. This was the last
   fail-closed-under-narrowing residual from #27.
+- ✅ Adapter accept-on-unknown closed (2026-06-14). The rustc_public adapter
+  maps real `RigidTy` variants with no shadow analog (`Foreign`,
+  `CoroutineWitness`, a `Dynamic` reaching `rigid_ty`, `Never`, and the
+  non-rigid inner of a pattern type via `rigid_ty_of`) to synthetic
+  `__pitbull_*` placeholder ADTs. `classify_adt`'s final arm ACCEPTS any
+  unclassified path (correct for real user/stdlib ADTs), so these synthetics
+  were silently accepted — a latent fail-OPEN: an unanalyzable or
+  already-forbidden construct reported "verified" because the visitor didn't
+  recognize it. `classify_adt` now classifies the `__pitbull_*` namespace
+  EXPLICITLY and fails closed by default: `__pitbull_never` (the uninhabited
+  `!`) stays accepted (rejecting would false-positive on safe diverging code);
+  `dyn_trait_fallback`→PB031, `coroutine_witness`→PB027, `foreign`→PB056,
+  `unrigid`→PB039; and an UNKNOWN future synthetic also rejects (PB039) via the
+  catch-all, so a new adapter placeholder can never silently reopen the hole.
+  The bare single-segment `__pitbull_*` path is unconstructable from Rust
+  source (a real type path is always `crate::…`), so no real type is affected.
+  Pinned by 7 stable visitor tests (`synthetic_*`); the same audit restored the
+  clippy-error-clean invariant (a drifted collapsible-`if let` in
+  `reachability.rs::callee_paths`).
+- ✅ Panic-bearing library calls caught (2026-06-14, reachability-integrity —
+  a CRITICAL false-discharge on ubiquitous code). `Option`/`Result`'s
+  `unwrap` / `expect` / `unwrap_err` / `expect_err` panic on the wrong
+  variant, but that panic lives INSIDE the library fn (in `core`), which the
+  v0.2 wrapper does not walk (only `all_local_items()`) and has no prelude
+  model for. So the call lowered to `Call(core::option::Option::<T>::unwrap,
+  …)` fell through `classify_called_function`'s `Some(_)` "assume the callee
+  is walked elsewhere" arm — but the reachability driver that *would* have
+  walked it transitively is the dead `#[cfg(test)]` reference, never the
+  production path. Net effect: `fn f(x: Option<u32>) -> u32 { x.unwrap() }`
+  was reported **verified** (exit 0) despite panicking on `None`, directly
+  violating the README's "No reachable `panic!`, `unwrap`, `expect`"
+  guarantee. Fix: `is_panicking_library_call` recognizes these combinators
+  at the call site (anchored on the `option::Option` / `result::Result` type
+  qualifier + panicking method name, robust to post-mono generic args and the
+  `std::` re-export form; the non-panicking `unwrap_or*` family is excluded),
+  and routes them through the SAME PB043 handling as `panic!` — strict mode
+  rejects, default mode emits a pending `PanicReachability` obligation (the
+  honest "cannot prove this won't panic", undischarged → fail closed). Verified
+  end-to-end: 4 stable unit tests (classification, default-obligation,
+  strict-reject, the `unwrap_or` negative) plus a new corpus reject file
+  `reject/PB043_unwrap_panic.rs` that the nightly wrapper surfaces as `(PB043)`
+  on REAL rustc MIR. The `Some(_)` arm comment and `callee_paths` doc were
+  corrected to state the real analyzed-vs-trusted boundary (now in
+  `SAFETY-MANUAL.md` §3.6) instead of the stale "reachability driver walks the
+  callee" claim. RESIDUAL (documented, not closed): other panicking stdlib
+  functions and cross-crate closure coverage remain on the trusted side
+  pending the prelude / whole-workspace aggregation.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1665,7 +1712,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  226 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  288 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1678,7 +1725,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 226 passing, 0 warnings, clippy clean
+# Stable: 288 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

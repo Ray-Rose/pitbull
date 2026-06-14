@@ -95,6 +95,46 @@ against Coq/Lean (v0.2+).
   (PB068), but neither makes a wrong trusted spec correct.
 - `#[pitbull::requires]` clauses bind callers. A wrong precondition
   silently weakens the proof's claim.
+### 3.6 The reachability / analyzed-vs-trusted boundary
+The AoRTE guarantee (§1) covers every item **reachable from a verified
+entry point**. What the v0.2 scaffold actually *analyzes* versus what it
+*trusts* is a TCB boundary users must understand:
+- **Analyzed.** Every item of the **crate currently being compiled**
+  through the `pitbull-rustc` wrapper. With an empty
+  `[reachability] verify_roots` the whole crate is walked
+  (over-approximating, fail-safe). With a non-empty `verify_roots`, the
+  walk is narrowed to the roots, and the fail-closed `#27` gate then
+  forces the entire **in-crate direct-call closure** of those roots to be
+  covered or the run exits non-zero. Indirect dispatch
+  (`dyn`/fn-ptr/closure) inside any walked body is a hard subset
+  rejection (PB031/PB032/PB033), so it cannot route reachable code around
+  the walk (see `reachability.rs::callee_paths` for the soundness
+  argument). Local `Drop::drop` impls are injected into the gate so
+  implicit drop glue is covered too.
+- **Trusted, NOT analyzed.** Code in **other crates** —
+  `core`/`std`/`alloc`, registry dependencies, and any crate not compiled
+  through the wrapper (`RUSTC_WORKSPACE_WRAPPER` wraps workspace members,
+  not registry deps). These are assumed **total** (panic-free, AoRTE-safe)
+  exactly as SPARK trusts its runtime. Precisely modelling the standard
+  library is the **prelude's** job (§3.4), which is future work.
+  - **Exception — panic-bearing stdlib calls are caught, not trusted.**
+    The common combinators whose panic is invisible at the call site —
+    `Option`/`Result::{unwrap, expect, unwrap_err, expect_err}` — are
+    recognized by the visitor and produce a PB043 obligation (or a hard
+    reject under `strict_panic_acceptance`), so `x.unwrap()` is reported as
+    an unproven panic, never silently "verified" (reachability-integrity
+    audit, 2026-06-14). This list is the known-dangerous subset; other
+    panicking library functions remain on the trusted side until the
+    prelude models them.
+- **User obligation (multi-crate).** Because each crate is gated
+  independently, in a workspace you must ensure **every** member's
+  `verify_roots` jointly covers the reachable closure (or leave
+  `verify_roots` empty for full-crate coverage). A verified root in crate
+  A that calls into workspace crate B relies on B's *own* Pitbull run to
+  have verified that entry — the per-crate gate cannot see across the
+  crate boundary. Whole-workspace closure aggregation is tracked future
+  work; until then, **narrowing is a per-crate promise the operator must
+  make consistent across the build.**
 ## 4. User obligations
 For the guarantee to hold:
 1. **Pin the toolchain** to one of `SUPPORTED_TOOLCHAINS`.

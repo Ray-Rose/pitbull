@@ -764,11 +764,49 @@ impl<'cfg> SubsetVisitor<'cfg> {
             Some(p) if p == "std::thread::spawn" || p.starts_with("std::thread::Builder::spawn") => {
                 self.reject(rules::PB028, span, "thread spawn");
             }
+            Some(p) if is_panicking_library_call(p) => {
+                // Option/Result `unwrap`/`expect`/`unwrap_err`/`expect_err`
+                // PANIC on the wrong variant. The panic lives INSIDE the
+                // library fn (in `core`), which the v0.2 wrapper does NOT
+                // walk (only `all_local_items()`) and which has no prelude
+                // model yet — so without catching it HERE, the call would
+                // fall through the `Some(_)` "assume walked elsewhere" arm
+                // below and be SILENTLY ACCEPTED: a false "verified" on
+                // `x.unwrap()`, violating the README's "no reachable
+                // `unwrap`/`expect`" guarantee (audit 2026-06-14). Treat it
+                // exactly like a `panic!` call site (PB043): strict mode
+                // rejects; default mode emits a (pending) PanicReachability
+                // obligation — the honest "cannot prove this won't panic"
+                // verdict (undischarged → fail closed), never a silent pass.
+                if self.config.verification.strict_panic_acceptance {
+                    self.reject(
+                        rules::PB043,
+                        span,
+                        format!("panicking library call `{p}` (strict mode)"),
+                    );
+                } else {
+                    self.emit_panic_reachability_obligation(p, span);
+                }
+            }
             Some(_) => {
-                // Known callee, not in the std-classifier set: assume
-                // user code. The reachability driver walks the callee's
-                // body as a separate verification subject; rules fire
-                // there if needed.
+                // A known callee path not matched by any classifier above.
+                // Trust-boundary posture (audit 2026-06-14 — replaces the
+                // old "the reachability driver walks the callee's body"
+                // claim, which described the test-only `ReachabilityDriver`
+                // that production does NOT run):
+                //   - An IN-CRATE callee is forced to be walked by the #27
+                //     reachability gate in the wrapper (or the run fails
+                //     closed), so its own rules fire when it is visited as a
+                //     separate subject.
+                //   - A NON-LOCAL callee (core/std/alloc, a dependency) is
+                //     NOT walked. Such functions are TRUSTED to be total
+                //     (panic-free) — modelling them precisely is the
+                //     prelude's job in v0.3+. The KNOWN panic-bearing
+                //     exceptions (the `unwrap`/`expect` family just above,
+                //     and `core::panicking::*`) are already caught, so the
+                //     residual trusted surface is the total stdlib. This
+                //     boundary is documented in docs/SAFETY-MANUAL.md §3.
+                // Either way, nothing to reject at THIS call site.
             }
             None => {
                 // We saw a Call terminator whose const operand has no
@@ -1265,10 +1303,73 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // PB030: channels.
         if path.starts_with("std::sync::mpsc::") || path.starts_with("std::sync::mpmc::") {
             self.reject(rules::PB030, span, format!("channel type `{path}`"));
+            return;
         }
-        // Anything else: user-defined ADT or stdlib type we haven't
-        // classified. Accepted; the reachability driver will visit its
-        // bodies if reachable.
+        // Synthetic ADT placeholders emitted by the rustc_public adapter
+        // (`mir_api/adapter.rs`) for real `RigidTy` variants that have no
+        // shadow analog (Foreign, CoroutineWitness, a Dynamic that reached
+        // `rigid_ty`, Never, and the non-rigid inner of a pattern type).
+        // These are NOT real user/library types: the bare `__pitbull_*`
+        // single-segment path is unconstructable from Rust source (a real
+        // type path is always `crate::...`, never a bare segment), so any
+        // ADT carrying this prefix came from the adapter. We MUST classify
+        // them explicitly and fail closed by default — letting them reach
+        // the accept-everything fall-through below would be a fail-OPEN: an
+        // unanalyzable or already-forbidden construct silently "verified"
+        // because the visitor didn't recognize it (adapter accept-on-unknown
+        // audit, 2026-06-14). Each maps to the rule its real construct would
+        // have triggered; an UNKNOWN synthetic (a future adapter mapping not
+        // yet classified here) also fails closed via the catch-all.
+        if let Some(kind) = path.strip_prefix("__pitbull_") {
+            match kind {
+                // The never type `!` is uninhabited and benign — it appears
+                // in ordinary safe diverging code (panicking helpers, `loop
+                // {}`, `match` arms that never yield a value). Accept it;
+                // rejecting would be a false positive on safe code.
+                "never" => {}
+                // `dyn Trait` that reached `rigid_ty` instead of the
+                // `TyKind::Dynamic` fast path. PB031 is the primary detector;
+                // this is defense-in-depth for a Dynamic nested in a RigidTy.
+                "dyn_trait_fallback" => {
+                    self.reject(rules::PB031, span, "`dyn Trait` type (rigid-ty fallback)");
+                }
+                // Coroutine captured-state witness. Coroutines / `async` are
+                // PB026 / PB027; the witness type confirms their presence.
+                "coroutine_witness" => {
+                    self.reject(rules::PB027, span, "coroutine witness type");
+                }
+                // Foreign (`extern`) type. The FFI surface is PB056.
+                "foreign" => {
+                    self.reject(rules::PB056, span, "foreign (`extern`) type");
+                }
+                // `__pitbull_unrigid`: the non-rigid inner of a pattern type,
+                // which `rigid_ty_of` could not destructure (it may have
+                // erased a `dyn`/type-parameter). Plus, via the catch-all,
+                // ANY future synthetic placeholder not classified above.
+                // Fail closed — never silently accept a type the pipeline
+                // could not analyze. PB039 ("unresolvable") is the closest
+                // existing rule for "the visitor cannot reason about this".
+                "unrigid" => {
+                    self.reject(rules::PB039, span, "unanalyzable type (non-rigid pattern inner)");
+                }
+                other => {
+                    self.reject(
+                        rules::PB039,
+                        span,
+                        format!(
+                            "unclassified synthetic adapter type `__pitbull_{other}` — \
+                             failing closed (no sound model)"
+                        ),
+                    );
+                }
+            }
+            // Synthetic namespace fully handled above (any rejection was
+            // already pushed). This is the last classification step, so we
+            // fall off the end of the function — no early return needed.
+        }
+        // Anything else (a non-synthetic path that skipped the block above):
+        // a user-defined ADT or stdlib type we haven't classified. Accepted;
+        // the reachability driver will visit its bodies if reachable.
     }
     // -------------------------------------------------------------------------
     // Helpers.
@@ -2703,6 +2804,53 @@ pub fn is_panic_call_path(p: &str) -> bool {
                 | "std::rt::begin_panic_fmt",
         )
 }
+/// Whether a fully-qualified callee path names a standard-library
+/// `Option`/`Result` combinator that PANICS on the wrong variant —
+/// `unwrap`, `expect`, `unwrap_err`, `expect_err`.
+///
+/// ## Why this is soundness-critical (audit 2026-06-14)
+///
+/// The panic these raise lives INSIDE the library function (in `core`),
+/// not at the call site. The v0.2 wrapper walks only `all_local_items()`;
+/// it does NOT transitively walk into `core`, and there is no prelude
+/// model for these functions yet. A call to `x.unwrap()` lowers to
+/// `Call(core::option::Option::<T>::unwrap, …)`, whose body (with the
+/// real `core::panicking::panic` call) is never visited. Without
+/// recognizing the call HERE it falls through `classify_called_function`'s
+/// "assume walked elsewhere" (`Some(_)`) arm and is SILENTLY ACCEPTED — a
+/// false "verified" on ubiquitous code, directly violating the README's
+/// "No reachable `panic!`, `unwrap`, `expect`, or `unreachable!` call
+/// site" guarantee. The visitor treats a match exactly like a `panic!`
+/// site (PB043): strict mode rejects; default mode emits a pending
+/// `PanicReachability` obligation, so the verdict is the honest "cannot
+/// prove this won't panic" (undischarged) rather than a silent pass.
+///
+/// ## Matching
+///
+/// Post-monomorphization the path carries generic args, e.g.
+/// `core::option::Option::<u32>::unwrap` (plus the `std::` re-export
+/// form), so we anchor on the `option::Option` / `result::Result` type
+/// qualifier via `contains` (robust to the `<T>` infix and to the
+/// `<.. as ..>` trait-impl rendering) and the panicking method name.
+/// Intentionally conservative: a (rare) user extension method named
+/// `unwrap` on `Option` that does NOT panic would also be flagged — but
+/// the fail direction is safe (an extra obligation, never a missed one),
+/// the correct posture for a soundness-first tool. The non-panicking
+/// combinators end in `_or` / `_or_default` / `_or_else`, not a bare
+/// `::unwrap`/`::expect`, so they are NOT matched.
+///
+/// Free-standing so corpus / unit tests can pin the classification
+/// without the full visitor machinery, mirroring `is_panic_call_path`.
+#[must_use]
+pub fn is_panicking_library_call(p: &str) -> bool {
+    if !(p.contains("option::Option") || p.contains("result::Result")) {
+        return false;
+    }
+    p.ends_with("::unwrap")
+        || p.ends_with("::expect")
+        || p.ends_with("::unwrap_err")
+        || p.ends_with("::expect_err")
+}
 /// Extract the canonical Rust type name (`"u32"`, `"i64"`, ...) from
 /// a shadow `Ty` when it represents a primitive integer; otherwise
 /// `None`. Free-standing because it's a pure type-shape inspection
@@ -2992,6 +3140,115 @@ mod tests {
         assert!(
             !v.errors.iter().any(|e| e.rule == rules::PB020),
             "PB020 must not fire on unknown-size types"
+        );
+    }
+    // ----- adapter synthetic-ADT accept-on-unknown closure -------------
+    // The rustc_public adapter maps real RigidTy variants with no shadow
+    // analog to synthetic `__pitbull_*` placeholder ADTs. classify_adt
+    // must classify these EXPLICITLY (fail closed) rather than let them
+    // reach the user-ADT accept fall-through (adapter accept-on-unknown
+    // audit, 2026-06-14). These tests run on stable (the adapter itself
+    // is nightly-only, so the synthetic paths are constructed by hand).
+    fn body_returning_synthetic(path: &str) -> Body {
+        let mut body = empty_body();
+        body.return_ty = Ty {
+            kind: TyKind::RigidTy(RigidTy::Adt(AdtDef {
+                path: path.into(),
+                is_union: false,
+            })),
+        };
+        body
+    }
+    /// `__pitbull_dyn_trait_fallback` (a `dyn Trait` that reached rigid_ty)
+    /// must fire PB031, not be silently accepted.
+    #[test]
+    fn synthetic_dyn_trait_fallback_rejected_pb031() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_returning_synthetic("__pitbull_dyn_trait_fallback"), false);
+        assert!(
+            v.errors.iter().any(|e| e.rule == rules::PB031),
+            "dyn-trait fallback synthetic must fire PB031; got {:?}",
+            v.errors,
+        );
+    }
+    /// `__pitbull_coroutine_witness` must fire PB027.
+    #[test]
+    fn synthetic_coroutine_witness_rejected_pb027() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_returning_synthetic("__pitbull_coroutine_witness"), false);
+        assert!(
+            v.errors.iter().any(|e| e.rule == rules::PB027),
+            "coroutine-witness synthetic must fire PB027; got {:?}",
+            v.errors,
+        );
+    }
+    /// `__pitbull_foreign` (an `extern` type) must fire PB056.
+    #[test]
+    fn synthetic_foreign_rejected_pb056() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_returning_synthetic("__pitbull_foreign"), false);
+        assert!(
+            v.errors.iter().any(|e| e.rule == rules::PB056),
+            "foreign synthetic must fire PB056; got {:?}",
+            v.errors,
+        );
+    }
+    /// `__pitbull_unrigid` (a non-rigid pattern inner that may have erased
+    /// a dyn/type-param) must fail closed via PB039.
+    #[test]
+    fn synthetic_unrigid_rejected_pb039() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_returning_synthetic("__pitbull_unrigid"), false);
+        assert!(
+            v.errors.iter().any(|e| e.rule == rules::PB039),
+            "unrigid synthetic must fire PB039; got {:?}",
+            v.errors,
+        );
+    }
+    /// Fail-closed DEFAULT for the synthetic namespace: a FUTURE adapter
+    /// placeholder not yet classified here must STILL be rejected, so
+    /// adding a new synthetic mapping can never silently reopen the
+    /// accept-on-unknown hole.
+    #[test]
+    fn synthetic_unknown_fails_closed_pb039() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_returning_synthetic("__pitbull_some_future_kind"), false);
+        assert!(
+            v.errors.iter().any(|e| e.rule == rules::PB039),
+            "unknown synthetic must fail closed (PB039); got {:?}",
+            v.errors,
+        );
+    }
+    /// `__pitbull_never` (the `!` type) is benign and MUST be accepted —
+    /// rejecting it would false-positive on safe diverging code (panicking
+    /// helpers, `loop {}`, value-less `match` arms).
+    #[test]
+    fn synthetic_never_accepted() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_returning_synthetic("__pitbull_never"), false);
+        assert!(
+            v.errors.is_empty(),
+            "__pitbull_never must be accepted (benign uninhabited type); got {:?}",
+            v.errors,
+        );
+    }
+    /// A genuine user ADT must STILL flow through the accept fall-through —
+    /// the synthetic-namespace closure must not over-reach onto real types.
+    #[test]
+    fn real_user_adt_still_accepted_after_synthetic_closure() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_returning_synthetic("user_crate::MyStruct"), false);
+        assert!(
+            v.errors.is_empty(),
+            "a real user ADT must remain accepted; got {:?}",
+            v.errors,
         );
     }
     // ----- strict_panic_acceptance toggle (PB043) ----------------------
@@ -4057,6 +4314,119 @@ mod tests {
                 v.errors,
             );
         }
+    }
+    // ----- panic-bearing library calls (unwrap/expect) -----------------
+    // Reachability-integrity fix (audit 2026-06-14): the panic inside
+    // `Option`/`Result::unwrap`/`expect` is in `core` (not walked, no
+    // prelude model), so it must be caught at the CALL SITE or it is
+    // silently accepted — a false "verified" on `x.unwrap()`.
+    /// `is_panicking_library_call` recognizes the panic-bearing
+    /// Option/Result combinators (incl. post-mono generic-arg and
+    /// `std::` re-export forms) and does NOT match the non-panicking
+    /// `unwrap_or*` family or unrelated calls.
+    #[test]
+    fn is_panicking_library_call_classification() {
+        let positive = [
+            "core::option::Option::<u32>::unwrap",
+            "core::option::Option::unwrap",
+            "std::option::Option::<i64>::expect",
+            "core::result::Result::<u8, E>::unwrap",
+            "core::result::Result::<T, E>::unwrap_err",
+            "std::result::Result::<T, E>::expect_err",
+        ];
+        for p in positive {
+            assert!(is_panicking_library_call(p), "should be a panicking lib call: {p}");
+        }
+        let negative = [
+            "core::option::Option::<u32>::unwrap_or",
+            "core::option::Option::<u32>::unwrap_or_default",
+            "core::option::Option::<u32>::unwrap_or_else",
+            "core::option::Option::<u32>::is_some",
+            "core::option::Option::<u32>::map",
+            "my_crate::Thing::unwrap_widget", // user fn, not Option/Result
+            "core::result::Result::<T, E>::is_ok",
+            "",
+        ];
+        for p in negative {
+            assert!(!is_panicking_library_call(p), "should NOT be a panicking lib call: {p}");
+        }
+    }
+    /// Default mode: a call to `Option::unwrap` emits a PanicReachability
+    /// obligation (the honest "cannot prove this won't panic"), NOT a
+    /// silent accept. This is the headline reachability-integrity fix.
+    #[test]
+    fn default_unwrap_call_emits_panic_reachability_obligation() {
+        let cfg = SubsetConfig::default_for_test();
+        assert!(!cfg.verification.strict_panic_acceptance);
+        for path in [
+            "core::option::Option::<u32>::unwrap",
+            "std::option::Option::<u32>::expect",
+            "core::result::Result::<u32, ()>::unwrap",
+            "core::result::Result::<u32, ()>::unwrap_err",
+        ] {
+            let mut v = SubsetVisitor::new(&cfg);
+            v.visit_body(&body_calling(path), false);
+            let report = v.into_report();
+            assert!(
+                !report.errors.iter().any(|e| e.rule == rules::PB043),
+                "{path}: default mode must NOT hard-reject (obligation instead); got {:?}",
+                report.errors,
+            );
+            assert!(
+                report.vc_obligations.iter().any(|o| matches!(
+                    o.kind,
+                    crate::vc::VcObligationKind::PanicReachability,
+                )),
+                "{path}: must emit a PanicReachability obligation; got {:?}",
+                report.vc_obligations,
+            );
+        }
+    }
+    /// Strict mode: `Option::unwrap` is a hard PB043 reject (no
+    /// obligation), mirroring the strict-mode `panic!` posture.
+    #[test]
+    fn strict_mode_unwrap_call_rejects_pb043() {
+        let mut cfg = SubsetConfig::default_for_test();
+        cfg.verification.strict_panic_acceptance = true;
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_calling("core::option::Option::<u32>::unwrap"), false);
+        let report = v.into_report();
+        assert!(
+            report.errors.iter().any(|e| e.rule == rules::PB043),
+            "strict mode: unwrap must hard-reject PB043; got {:?}",
+            report.errors,
+        );
+        assert!(
+            !report.vc_obligations.iter().any(|o| matches!(
+                o.kind,
+                crate::vc::VcObligationKind::PanicReachability,
+            )),
+            "strict mode emits no obligation (the reject already terminates the check)",
+        );
+    }
+    /// Negative: the non-panicking `unwrap_or` must NOT be flagged —
+    /// neither a reject nor an obligation (it cannot panic on the empty
+    /// variant). Guards against over-reach that would false-positive on
+    /// safe code.
+    #[test]
+    fn unwrap_or_is_not_flagged_as_panic() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_calling("core::option::Option::<u32>::unwrap_or"), false);
+        let report = v.into_report();
+        assert!(
+            !report.errors.iter().any(|e| e.rule == rules::PB043),
+            "unwrap_or must not hard-reject; got {:?}",
+            report.errors,
+        );
+        assert!(
+            !report.vc_obligations.iter().any(|o| matches!(
+                o.kind,
+                crate::vc::VcObligationKind::PanicReachability,
+            )),
+            "unwrap_or must not emit a PanicReachability obligation; got {:?}",
+            report.vc_obligations,
+        );
     }
     /// Strict mode preserves the v0.1-style hard reject. The
     /// obligation is NOT emitted (no point — the violation
