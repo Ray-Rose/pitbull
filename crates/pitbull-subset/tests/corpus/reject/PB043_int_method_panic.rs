@@ -34,3 +34,7 @@ fn strict_sum(x: u32, y: u32) -> u32 {
 fn strided(n: u32, k: usize) -> usize {
     (0u32..n).step_by(k).count() // step_by(0) panics at construction
 }
+#[pitbull::verify]
+fn parse_radix(s: &str, r: u32) -> i32 {
+    i32::from_str_radix(s, r).unwrap_or(0) // panics if r is not in 2..=36
+}

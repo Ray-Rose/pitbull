@@ -149,7 +149,13 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
       OOB), and `select_nth_unstable`(`_by`/`_by_key`). A 2026-06-14 deep
       audit PROVED `swap`/`copy_from_slice`/`rotate_*` were previously a
       silent exit-0 "verified" (a CRITICAL false discharge); the enumeration
-      is now comprehensive over the stable panicking `[T]`/`str` API.
+      is now comprehensive over the stable panicking `[T]`/`str` API; and
+    - the `char` radix methods `to_digit` / `is_digit` and the
+      `char::from_digit` free fn, which panic when `radix` is outside
+      `2..=36` (the radix check is a `panic!` that runs BEFORE the `Option`
+      is returned). Caught in the same 2026-06-14 **#2** boundary sweep as
+      the extended int-method family; radix-free `char` methods
+      (`is_alphabetic`, `len_utf8`, `from_u32`, …) are total and not flagged.
   - **Documented residual — less-common library panics remain trusted (a
     known gap, NOT a silent pass).** The catch-list above is the common-and-
     dangerous subset, not exhaustive. Other library functions whose panic is

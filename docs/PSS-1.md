@@ -1879,7 +1879,20 @@ the std form and now also matches. No shadow type changes.
   (exit 0). Pinned by extended classification + obligation-emission unit
   tests, a ground-truth panic control in `tests/aorte_proofs.rs`, and new
   corpus files `reject/PB043_int_method_panic.rs` +
-  `accept/PB043_int_method_total.rs`.
+  `accept/PB043_int_method_total.rs`. The SAME sweep also caught
+  `i*::from_str_radix` (panics on `radix ∉ 2..=36`; folded into
+  `is_panicking_int_method`) and the `char` radix methods `to_digit` /
+  `is_digit` / `from_digit` (same radix panic — the check precedes the
+  `Option` return), which get a fourth call-site matcher
+  `is_panicking_char_method` wired into `classify_called_function` alongside
+  the unwrap/int/slice families; verified e2e (exit 1), with safe radix-free
+  `char` methods staying verified, and pinned by `reject/PB043_char_radix_
+  panic.rs` + `accept/PB043_char_radix_total.rs`. **Process note:** these two
+  false-discharge classes were found by *exercising the trusted-library
+  boundary* (the `median3` proof routed through `Ord::min`/`max`), which is
+  why the soundness posture must treat that boundary as fail-OPEN until a
+  prelude allow-list inverts it (§3.4) — each newly-reached panicking method
+  is a latent false discharge until enumerated.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1887,7 +1900,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  322 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  323 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1900,7 +1913,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 322 passing, 0 warnings, clippy clean
+# Stable: 323 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

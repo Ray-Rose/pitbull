@@ -789,9 +789,10 @@ impl<'cfg> SubsetVisitor<'cfg> {
             Some(p)
                 if is_panicking_library_call(p)
                     || is_panicking_int_method(p)
-                    || is_panicking_index_or_slice_call(p) =>
+                    || is_panicking_index_or_slice_call(p)
+                    || is_panicking_char_method(p) =>
             {
-                // Three families of un-walked-`core` panics caught at the call
+                // Four families of un-walked-`core` panics caught at the call
                 // site (the panic lives INSIDE a `core` fn the v0.2 wrapper
                 // does NOT walk, and there is no prelude model yet, so without
                 // catching it HERE the call falls through the `Some(_)`
@@ -810,8 +811,12 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 //      trait `Call`, which PB054's projection path does not
                 //      see — only element `v[i]` is a projection) plus the
                 //      panicking `split_at`/`chunks`/`windows` slice methods
-                //      (deep-audit + tracked-residual closure 2026-06-14).
-                // Both are treated exactly like a `panic!` call site (PB043):
+                //      (deep-audit + tracked-residual closure 2026-06-14); and
+                //   4. `char` radix methods `to_digit`/`is_digit`/`from_digit`
+                //      that panic when `radix` is outside `2..=36` (deep-audit
+                //      2026-06-14 #2, the same boundary sweep that caught the
+                //      extended int-method family above).
+                // All are treated exactly like a `panic!` call site (PB043):
                 // strict mode rejects; default mode emits a (pending)
                 // PanicReachability obligation — the honest "cannot prove this
                 // won't panic" (undischarged → fail closed), never a silent pass.
@@ -2993,12 +2998,40 @@ pub fn is_panicking_int_method(p: &str) -> bool {
         || p.ends_with("::ilog")
         || p.ends_with("::ilog2")
         || p.ends_with("::ilog10")
+        // `from_str_radix(_, radix)` panics if `radix` is not in `2..=36`
+        // (the assert precedes the `Result` return). `checked_*` has no
+        // `from_str_radix` variant, so the suffix is unambiguous.
+        || p.ends_with("::from_str_radix")
         // The whole `strict_*` family panics on overflow ALWAYS (not just
         // under overflow-checks): strict_{add,sub,mul,div,rem,neg,pow,shl,shr}
         // and the strict_{add,sub}_{signed,unsigned} / strict_*_euclid kin.
         // None of the non-panicking families (`checked_`/`wrapping_`/
         // `saturating_`/`overflowing_`/`unbounded_`) contain `::strict_`.
         || p.contains("::strict_")
+}
+/// Whether `p` names a `char` inherent method (or the `char::from_digit` free
+/// fn) that PANICS when its `radix` argument is out of `2..=36`.
+///
+/// ## Why (deep-audit 2026-06-14 #2)
+///
+/// `char::to_digit`, `char::is_digit`, and `char::from_digit` assert
+/// `radix <= 36` (`to_digit`/`is_digit` also reject `radix < 2` via the same
+/// path) BEFORE returning — `to_digit`/`from_digit` return an `Option`, but
+/// the radix check is a separate `panic!`, so a runtime `radix` the caller
+/// hasn't bounded panics inside un-walked `core`. The same class as the
+/// panicking int methods, found in the same boundary sweep, and routed
+/// through the same fail-closed PB043 handling. (`from_digit` is a free fn
+/// `std::char::from_digit`; the inherent methods render
+/// `…::char::methods::<impl char>::{to_digit, is_digit}`.)
+#[must_use]
+pub fn is_panicking_char_method(p: &str) -> bool {
+    if p.ends_with("char::from_digit") {
+        return true;
+    }
+    if !p.contains("char::methods::<impl char>") {
+        return false;
+    }
+    p.ends_with("::to_digit") || p.ends_with("::is_digit")
 }
 /// Whether `p` names a `str`/slice RANGE-index or split/chunk library call
 /// that PANICS on out-of-bounds / a bad split point / a zero size.
@@ -4742,6 +4775,7 @@ mod tests {
             "core::num::<impl i32>::strict_neg",
             "core::num::<impl u32>::strict_shl",
             "core::num::<impl i32>::strict_add_unsigned",
+            "core::num::<impl i32>::from_str_radix", // panics radix ∉ 2..=36
             // Iterator adapters/folds that panic (trait method, not num::<impl).
             "std::iter::Iterator::sum",
             "core::iter::Iterator::product",
@@ -4772,6 +4806,32 @@ mod tests {
             assert!(!is_panicking_int_method(p), "should NOT be a panicking int method: {p}");
         }
     }
+    /// `char` radix methods that panic when `radix ∉ 2..=36` (deep-audit
+    /// 2026-06-14 #2). `from_digit` is a free fn; `to_digit`/`is_digit` are
+    /// inherent. The safe `char` methods (which take no radix) are excluded.
+    #[test]
+    fn is_panicking_char_method_classification() {
+        let positive = [
+            "std::char::from_digit",
+            "core::char::from_digit",
+            "std::char::methods::<impl char>::to_digit",
+            "std::char::methods::<impl char>::is_digit",
+        ];
+        for p in positive {
+            assert!(is_panicking_char_method(p), "should be a panicking char method: {p}");
+        }
+        let negative = [
+            "std::char::methods::<impl char>::is_alphabetic", // total
+            "std::char::methods::<impl char>::is_numeric", // total
+            "std::char::methods::<impl char>::to_ascii_uppercase", // total
+            "std::char::methods::<impl char>::len_utf8", // total
+            "core::char::from_u32", // returns Option, no radix, total
+            "my_crate::Glyph::to_digit", // user method, not the char inherent impl
+        ];
+        for p in negative {
+            assert!(!is_panicking_char_method(p), "should NOT be a panicking char method: {p}");
+        }
+    }
     /// Default mode: `x.pow(y)` / `x.abs()` / `x.div_euclid(y)` emit a
     /// PanicReachability obligation (honest "cannot prove no overflow"), so
     /// the method-form overflow is no longer silently "verified".
@@ -4789,7 +4849,11 @@ mod tests {
             "core::num::<impl u32>::next_multiple_of",
             "core::num::<impl u32>::div_ceil",
             "core::num::<impl u32>::strict_add",
+            "core::num::<impl i32>::from_str_radix",
             "std::iter::Iterator::step_by",
+            // char radix methods (same boundary sweep, 4th matcher family).
+            "std::char::from_digit",
+            "std::char::methods::<impl char>::to_digit",
         ] {
             let mut v = SubsetVisitor::new(&cfg);
             v.visit_body(&body_calling(path), false);

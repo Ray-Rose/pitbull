@@ -410,10 +410,20 @@ fn control_panicking_int_methods_do_panic_safe_ones_do_not() {
         }),
         "step_by(0) must panic",
     );
+    // `from_str_radix` and the char radix methods panic on radix ∉ 2..=36.
+    // `black_box` the radix inline (keeping each closure non-capturing, so it
+    // still coerces to `fn()`) so it is a runtime value — the matcher's whole
+    // point is a radix the caller has not bounded.
+    assert!(p(|| { let _ = i32::from_str_radix("5", std::hint::black_box(37)); }), "from_str_radix(_,37) must panic");
+    assert!(p(|| { let _ = 'a'.to_digit(std::hint::black_box(37)); }), "to_digit(_,37) must panic");
+    assert!(p(|| { let _ = 'a'.is_digit(std::hint::black_box(37)); }), "is_digit(_,37) must panic");
+    assert!(p(|| { let _ = std::char::from_digit(5, std::hint::black_box(37)); }), "from_digit(_,37) must panic");
     // Must NOT panic — total siblings the matcher must let through (no false
     // reject). A regression that flags these would degrade Pitbull to
     // rejecting provably-safe code.
     assert!(!p(|| { let _ = 5u32.isqrt(); }), "UNSIGNED isqrt is total");
     assert!(!p(|| { let _ = 4u32.midpoint(6); }), "midpoint is total");
     assert!(!p(|| { let _ = 4u32.abs_diff(6); }), "abs_diff is total");
+    assert!(!p(|| { let _ = 'a'.is_alphabetic(); }), "char::is_alphabetic is total");
+    assert!(!p(|| { let _ = 'a'.len_utf8(); }), "char::len_utf8 is total");
 }
