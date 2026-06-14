@@ -1810,10 +1810,24 @@ the std form and now also matches. No shadow type changes.
   safety. A control test confirms the net has teeth: `add_one(u32::MAX)`
   (the precondition dropped) DOES overflow-panic under `overflow-checks`, so
   a discharge resting on an insufficient precondition would be caught. 6
-  tests. NEXT increments: wire the full end-to-end differential (run the
-  wrapper AND fuzz in one test, asserting `verified ⟹ fuzz-clean`); add the
-  remaining §15 proofs (insertion sort, MAC-frame parser, PID controller);
-  and the Miri / Tree-Borrows pass for UB (not just panics).
+  tests.
+- ✅ End-to-end AoRTE differential wired (2026-06-14). Closes the loop: the
+  `pitbull-rustc` wrapper's STATIC verdict (its exit code — 0 only with zero
+  violations / undischarged / coverage-gaps) now gates the EMPIRICAL fuzz
+  programmatically in `integration.rs`, so a false discharge fails the suite.
+  Three probes: (1) the STRONG claim exercisable WITHOUT a solver — `mix`
+  (wrapping ops, no indexing) emits ZERO obligations so the wrapper exits 0
+  on its own, and 100k fuzzed `(a,b)` pairs must be panic-free (`verified ⟹
+  fuzz-clean`, asserted directly); (2) a NEGATIVE control — unconstrained
+  `x + 1` must NOT be verified (it can overflow) AND the full-range fuzz
+  finds the overflow, pinning that Pitbull doesn't falsely-discharge a
+  genuinely-unsafe fn; (3) solver-gated — `add_one` under
+  `#[pitbull::requires("x < 100")]` discharges with a solver (then the
+  admitted-domain fuzz must be clean), and on a solverless host confirms the
+  empirical side + notes the SMT claim couldn't be exercised. 3 tests (gated
+  on the nightly wrapper like the corpus e2e). NEXT: the remaining §15 proofs
+  (insertion sort, MAC-frame parser, PID controller); and the Miri /
+  Tree-Borrows pass for UB (not just panics).
 - ✅ CRITICAL false-discharge fix: panicking slice/str methods (deep audit,
   2026-06-14). A 4-agent adversarial re-audit of the whole codebase
   (verified against real MIR) PROVED a false discharge: `<[T]>::swap`,
@@ -1843,7 +1857,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  313 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  316 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1856,7 +1870,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 313 passing, 0 warnings, clippy clean
+# Stable: 316 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

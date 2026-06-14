@@ -2894,3 +2894,231 @@ fn drop_glue_under_narrowing_fails_closed() {
          stderr:\n{stderr}",
     );
 }
+// =====================================================================
+// End-to-end AoRTE differential: link the wrapper's STATIC verdict to the
+// EMPIRICAL fuzz result, so a false discharge fails the suite LOUDLY.
+//
+// Strong invariant: if `pitbull-rustc` reports VERIFIED (exit 0 — and
+// `decide_pitbull_exit_code` returns 0 only with zero violations / zero
+// undischarged obligations / zero coverage gaps), then fuzzing the SAME
+// function must find NO panicking input. A panic under a "verified" verdict
+// is a counterexample-by-construction (Safety Manual §6). This closes the
+// loop that `tests/aorte_proofs.rs` opens (it fuzzes in isolation; here the
+// wrapper's verdict gates the claim). Each probe's Rust fn and its embedded
+// source string MUST stay in sync.
+// =====================================================================
+
+/// Invoke the wrapper on a source STRING (vs a corpus file) -> (stderr, exit).
+fn run_wrapper_on_source(
+    env: &E2eEnv,
+    source: &str,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> Result<(String, Option<i32>), String> {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut temp = std::env::temp_dir();
+    temp.push(format!("pitbull-diff-{}-{}.rs", std::process::id(), counter));
+    fs::write(&temp, source).map_err(|e| format!("write temp: {e}"))?;
+    let nightly_bin = env.nightly_sysroot.join("bin");
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<PathBuf> = vec![nightly_bin];
+    paths.extend(std::env::split_paths(&path_var));
+    let new_path = std::env::join_paths(paths).map_err(|e| format!("PATH: {e}"))?;
+    let mut out_art = std::env::temp_dir();
+    out_art.push(format!("pitbull-diff-out-{}-{}.rmeta", std::process::id(), counter));
+    let mut cmd = std::process::Command::new(&env.wrapper);
+    cmd.arg("--sysroot")
+        .arg(&env.nightly_sysroot)
+        .arg("--edition=2021")
+        .arg("--crate-type=lib")
+        .arg("--emit=metadata")
+        .arg("--crate-name=corpus_test")
+        .arg("-o")
+        .arg(&out_art)
+        .arg(&temp)
+        .env("PATH", &new_path)
+        .env("CARGO_PKG_NAME", "corpus_test");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output();
+    let _ = fs::remove_file(&temp);
+    let _ = fs::remove_file(&out_art);
+    let output = output.map_err(|e| format!("spawn wrapper: {e}"))?;
+    Ok((String::from_utf8_lossy(&output.stderr).into_owned(), output.status.code()))
+}
+
+/// `verified` <=> the wrapper exited 0 (clean: no violations / undischarged /
+/// coverage gaps). Exit-code-based, so it tracks `decide_pitbull_exit_code`.
+fn wrapper_verified(code: Option<i32>) -> bool {
+    code == Some(0)
+}
+
+/// Deterministic fuzz of a `u32 -> _` fn; returns true iff some input in the
+/// domain makes it panic. `domain == Some(n)` restricts to `[0, n)` (a
+/// precondition `x < n`); `None` is the full `u32` range.
+fn u32_fuzz_panics<F>(seed: u64, iters: usize, domain: Option<u32>, f: F) -> bool
+where
+    F: Fn(u32) + std::panic::RefUnwindSafe,
+{
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut s: u64 = seed | 1;
+    let mut panicked = false;
+    let mut probe = |x: u32, panicked: &mut bool| {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(x))).is_err() {
+            *panicked = true;
+        }
+    };
+    match domain {
+        Some(n) => {
+            probe(0, &mut panicked);
+            probe(n.saturating_sub(1), &mut panicked);
+        }
+        None => {
+            probe(0, &mut panicked);
+            probe(u32::MAX, &mut panicked);
+        }
+    }
+    for _ in 0..iters {
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        let r = s.wrapping_mul(0x2545_F491_4F6C_DD1D) as u32;
+        let x = match domain {
+            Some(n) if n > 0 => r % n,
+            _ => r,
+        };
+        probe(x, &mut panicked);
+        if panicked {
+            break;
+        }
+    }
+    std::panic::set_hook(prev);
+    panicked
+}
+
+// --- Probe fns. Each MUST match its embedded source string. ---
+fn probe_mix(a: u32, b: u32) -> u32 {
+    a.wrapping_add(b).wrapping_mul(2654435761)
+}
+const MIX_SRC: &str =
+    "pub fn mix(a: u32, b: u32) -> u32 { a.wrapping_add(b).wrapping_mul(2654435761) }\n";
+fn probe_add_one(x: u32) -> u32 {
+    x + 1
+}
+const ADD_ONE_SRC: &str = "pub fn add_one(x: u32) -> u32 { x + 1 }\n";
+
+fn skip_or_require(name: &str) {
+    if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+        panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing ({name})");
+    }
+    eprintln!("{name}: SKIPPED - e2e prerequisites missing.");
+}
+
+/// STRONG differential, exercisable WITHOUT a solver: `mix` uses only
+/// wrapping ops + no indexing, so Pitbull emits ZERO obligations and the
+/// wrapper exits 0 (verified) on its own. The fuzz must then find no panic —
+/// confirming `verified => panic-free` end to end.
+#[test]
+fn differential_zero_obligation_verified_implies_fuzz_clean() {
+    let Some(env) = E2eEnv::probe() else {
+        skip_or_require("differential_zero_obligation");
+        return;
+    };
+    let (stderr, code) = run_wrapper_on_source(&env, MIX_SRC, &[]).expect("wrapper run");
+    assert!(
+        wrapper_verified(code),
+        "Pitbull should VERIFY `mix` (zero obligations, no solver needed); \
+         got exit {code:?}, stderr:\n{stderr}",
+    );
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut s: u64 = 0x1234_5678_9ABC_DEF1;
+    let mut fuzz_panicked = false;
+    for (a, b) in [(0u32, 0u32), (u32::MAX, u32::MAX), (u32::MAX, 1), (1, u32::MAX)] {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe_mix(a, b))).is_err() {
+            fuzz_panicked = true;
+        }
+    }
+    for _ in 0..100_000 {
+        s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+        let a = s.wrapping_mul(0x2545_F491_4F6C_DD1D) as u32;
+        s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+        let b = s.wrapping_mul(0x2545_F491_4F6C_DD1D) as u32;
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe_mix(a, b))).is_err() {
+            fuzz_panicked = true;
+            break;
+        }
+    }
+    std::panic::set_hook(prev);
+    assert!(
+        !(wrapper_verified(code) && fuzz_panicked),
+        "FALSE DISCHARGE: wrapper VERIFIED `mix` but fuzzing found a panic!",
+    );
+    assert!(!fuzz_panicked, "`mix` (wrapping ops) must never panic");
+}
+
+/// NEGATIVE control: unconstrained `add_one` (`x + 1`, NO precondition) can
+/// overflow, so the wrapper must NOT verify it (exit != 0), and the fuzz
+/// (full range) DOES find the overflow. Pins that Pitbull does not
+/// falsely-discharge a genuinely-unsafe function (the contrapositive).
+#[test]
+fn differential_unconstrained_overflow_is_not_falsely_verified() {
+    let Some(env) = E2eEnv::probe() else {
+        skip_or_require("differential_unconstrained_overflow");
+        return;
+    };
+    let (stderr, code) = run_wrapper_on_source(&env, ADD_ONE_SRC, &[]).expect("wrapper run");
+    assert!(
+        !wrapper_verified(code),
+        "Pitbull must NOT verify unconstrained `x + 1` (it can overflow); \
+         got exit {code:?}, stderr:\n{stderr}",
+    );
+    let panicked = u32_fuzz_panics(0x0BAD_0001, 50_000, None, |x| {
+        let _ = probe_add_one(x);
+    });
+    assert!(
+        panicked,
+        "unconstrained `add_one` MUST overflow-panic on some input (x = u32::MAX) - \
+         if it doesn't, overflow-checks are off and the differential lost its teeth",
+    );
+}
+
+/// Solver-gated: `add_one` under `#[pitbull::requires]`. WITH a solver the
+/// obligation discharges -> exit 0 (verified) -> the fuzz over the admitted
+/// domain (x < 100) must be clean (a direct check that the discharged
+/// precondition is SUFFICIENT). WITHOUT a solver we can't make the strong
+/// claim, but still confirm the precondition-domain fuzz is clean.
+#[test]
+fn differential_precondition_discharge_is_sound() {
+    let Some(env) = E2eEnv::probe() else {
+        skip_or_require("differential_precondition_discharge");
+        return;
+    };
+    let req_src = concat!(
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n",
+        "#[pitbull::requires(\"x < 100\")]\n",
+        "pub fn add_one(x: u32) -> u32 { x + 1 }\n",
+    );
+    let (stderr, code) = run_wrapper_on_source(&env, req_src, &[]).expect("wrapper run");
+    let panicked = u32_fuzz_panics(0x00C0_0100, 50_000, Some(100), |x| {
+        let _ = probe_add_one(x);
+    });
+    assert!(
+        !panicked,
+        "`add_one` under x < 100 must never overflow; fuzz found a panic in the \
+         admitted domain - stderr:\n{stderr}",
+    );
+    if wrapper_verified(code) {
+        assert!(
+            stderr.contains("discharged") || stderr.contains("0 undischarged"),
+            "exit 0 should reflect a discharged obligation; stderr:\n{stderr}",
+        );
+    } else if no_solver_available(&stderr) {
+        eprintln!(
+            "differential_precondition_discharge: no solver on PATH - confirmed the \
+             precondition-domain fuzz is clean, but could not exercise the SMT \
+             discharge (verified => clean) strong claim. Install z3+cvc5 to do so.",
+        );
+    }
+}
