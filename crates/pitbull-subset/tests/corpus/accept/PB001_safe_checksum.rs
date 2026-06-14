@@ -10,7 +10,9 @@ fn checksum_pure(bytes: &[u8]) -> u32 {
     let mut i: usize = 0;
     // Loop variant: bytes.len() - i strictly decreases at each iteration.
     while i < bytes.len() {
-        sum = sum.wrapping_add(bytes[i] as u32);
+        // `u32::from` not `as`: PSS-1 PB051 bans `as` integer casts even
+        // when widening; the `From` conversion is the accepted form.
+        sum = sum.wrapping_add(u32::from(bytes[i]));
         i += 1;
     }
     sum

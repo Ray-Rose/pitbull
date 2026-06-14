@@ -207,6 +207,15 @@ fn corpus_runs_full_pipeline() {
             ran += 1;
             continue;
         }
+        if KNOWN_REJECTED_ACCEPT.contains(&rule_num) {
+            // Documented false positive (e.g. PB031 generic dispatch under
+            // the v0.2 no-monomorphization limitation): the verifier
+            // conservatively rejects this otherwise-valid file. Run-only.
+            let _ = run_one_corpus_file(&env, &path);
+            skipped_unimpl += 1;
+            ran += 1;
+            continue;
+        }
         let result = run_one_corpus_file(&env, &path);
         ran += 1;
         match result {
@@ -215,6 +224,20 @@ fn corpus_runs_full_pipeline() {
                     failures.push(format!(
                         "[accept] {name}: expected NO `{unexpected}` but it fired:\n{stderr}"
                     ));
+                }
+                // Strict accept check (audit 2026-05-31): an accept file must
+                // not be REJECTED by ANY rule, not merely the one it's named
+                // for. Assert the wrapper reports zero subset violations —
+                // catches a mislabeled accept file (or a regression that
+                // starts rejecting valid code) that the single-rule grep
+                // above would miss.
+                if let Some(n) = subset_violation_count(&stderr) {
+                    if n != 0 {
+                        failures.push(format!(
+                            "[accept] {name}: expected 0 subset violations but the \
+                             wrapper reported {n}:\n{stderr}"
+                        ));
+                    }
                 }
             }
             Err(e) => failures.push(format!("[accept] {name}: wrapper failed: {e}")),
@@ -289,6 +312,27 @@ const KNOWN_UNIMPLEMENTED_REJECT: &[u16] = &[41];
 ///   precondition through `pitbull.toml` (raw SMT-LIB form) —
 ///   that path IS fully wired.
 const KNOWN_UNDISCHARGED_ACCEPT: &[u16] = &[54];
+/// PB rule numbers whose corpus ACCEPT file is currently REJECTED by the
+/// verifier as a documented FALSE POSITIVE (conservative, sound — the
+/// verifier rejects safe code it cannot yet prove safe). Distinct from
+/// `KNOWN_UNDISCHARGED_ACCEPT` (detected-but-not-discharged): these emit
+/// subset violations, so the strict "zero subset violations" accept check
+/// below would otherwise flag them.
+///
+/// - PB031 (static dispatch): `accept/PB031_static_dispatch.rs` exercises
+///   generic dispatch that is monomorphic after instantiation. The v0.2
+///   wrapper walks the GENERIC body without a monomorphization pass, so the
+///   unresolved type parameter trips PB039 (`unresolvable impl Trait`) —
+///   fail-closed. Until the pipeline instantiates generics, this valid file
+///   is conservatively rejected. Audit 2026-05-31 (corpus mislabel finding).
+/// - PB050 (fixed-point): `accept/PB050_fixed_point.rs` uses a bit shift
+///   (`>> 16`). Rust lowers EVERY shift's amount to an implicit
+///   `IntToInt` cast in MIR (`16_i32 as u32`), and PB051 conservatively
+///   rejects all `IntToInt` casts — so any shift-using body trips PB051.
+///   Sound over-rejection, but a real precision gap (shifts are common):
+///   PB051 should exempt the compiler-inserted shift-amount cast. Tracked
+///   as a follow-up; until then this valid file is conservatively rejected.
+const KNOWN_REJECTED_ACCEPT: &[u16] = &[31, 50];
 /// Environment needed to drive the wrapper: paths to the built
 /// pitbull-rustc binary and the nightly sysroot.
 struct E2eEnv {
@@ -344,6 +388,17 @@ fn no_solver_available(stderr: &str) -> bool {
     stderr.contains("no configured solver is installed")
         || stderr.contains("undischarged (no solver)")
         || stderr.contains("z3 not installed")
+}
+/// Parse the count `N` from the wrapper's summary line
+/// "... N subset violation(s)". `None` if the line isn't present.
+fn subset_violation_count(stderr: &str) -> Option<usize> {
+    let idx = stderr.find(" subset violation")?;
+    // The token immediately before " subset violation" is the count.
+    stderr[..idx]
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .find(|tok| !tok.is_empty())?
+        .parse()
+        .ok()
 }
 /// True when `program` is invocable on PATH (mirrors how the wrapper
 /// spawns solvers). Used to gate the multi-solver agreement e2e test
