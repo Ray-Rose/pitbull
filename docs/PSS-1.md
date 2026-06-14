@@ -265,7 +265,25 @@ operand; FP intrinsics.
 ### PB051 — Narrowing or sign-changing `as` casts
 **Detects.** `Rvalue::Cast(CastKind::IntToInt, _, _)` and
 `FloatToInt` / `IntToFloat` / `PtrToInt` / `IntToPtr` / `PtrToPtr`.
-**Future.** v0.2 with auto-generated cast obligations.
+**Exemption (2026-06-13).** An `IntToInt` cast of an integer
+**constant** whose value is representable in the target type is
+*value-preserving* — there is no truncation and no sign-change, so the
+cast cannot alter the value and needs no obligation. Such casts are
+ACCEPTED (with a transparency audit note). Everything else still fails
+closed: every cast of a **non-constant** operand, and every
+value-CHANGING constant cast (narrowing like `300 as u8`, sign-flipping
+like `-1 as u32`, or an unsupported target width such as `u128` /
+`usize`), is rejected. The gate is `value_fits_in_int_ty`
+(`predicate.rs`) + `value_preserving_int_cast` (`visitor.rs`); the value
+must round-trip through both the source and target types, so the one
+lossy-extraction case (`u128` > `i128::MAX`) fails closed. This unblocks
+shift code: rustc lowers `x << 4` with a synthetic `const 4_i32 as u32`
+cast (the untyped `4` defaults to i32 and is cast to the value type for
+the shift-overflow bounds check), which PB051 previously rejected,
+making all `x << N` code unverifiable.
+**Future.** v0.2 with auto-generated cast obligations for the
+value-changing cases (so a `u64 as u32` narrowing emits a truncation VC
+rather than a hard reject).
 ### PB052 — Unbounded `usize`/`isize` arithmetic
 **Detects.** Any `usize`/`isize` arithmetic without a contract relating
 it to a slice length or known bound. Stricter on 16- and 32-bit
@@ -1459,6 +1477,35 @@ the std form and now also matches. No shadow type changes.
   calls) were re-audited and confirmed obligated or justifiably
   skipped; the SMT encodings (signed/unsigned overflow predicates,
   div MIN/-1, over-shift width, index bound) were confirmed sound.
+- ✅ PB051 value-preserving-constant cast exemption (PB051-on-shift,
+  2026-06-13). PB051 rejected EVERY `IntToInt` cast, which made shift
+  code unverifiable: rustc lowers `x << 4` with a synthetic
+  `const 4_i32 as u32` cast — the untyped `4` defaults to i32 and is
+  cast to the value type SOLELY for the shift-overflow bounds check
+  (the real `Shl` uses the original operand). The fix accepts an
+  `IntToInt` cast of an integer CONSTANT whose value is representable in
+  the target type: such a cast is value-preserving (no truncation, no
+  sign-change), so PB051's "truncation needs an obligation" rationale
+  does not apply and accepting it is sound. Gate:
+  `predicate::value_fits_in_int_ty` (the value must round-trip through
+  BOTH the source and target types, so the lone lossy-extraction case
+  `u128` > `i128::MAX` fails closed) + `visitor::value_preserving_int_cast`.
+  Every NON-constant cast (a variable read — including `let s = 4; x << s`)
+  and every value-CHANGING constant cast (narrowing `300 as u8`, sign-flip
+  `-1 as u32`, unsupported target `u128`/`usize`) still fails CLOSED.
+  Accepted casts leave a transparency audit note — never a silent
+  relaxation. Verified end-to-end on the real nightly wrapper: `x << 4` /
+  `x >> 4` (signed + unsigned) / `x <<= 4` / `x << y` analyze with 0
+  subset violations, while a genuine `x as u32` (u64→u32) narrowing still
+  emits PB051. Pinned by
+  `predicate::value_fits_in_int_ty_matches_two_complement_ranges`,
+  `visitor::pb051_const_cast_value_preservation_matrix`, and
+  `visitor::pb051_does_not_fire_on_real_shift_amount_cast`. SCOPE: this
+  closes the subset REJECTION only. The over-shift DISCHARGE for a
+  mixed-width `u32 << i32`-literal shift still routes to the pre-existing
+  "mixed-width shift" audit note (tracked separately under Task R);
+  same-type shifts (`i32 >> 4`, `u32 << y`) emit their PB049 over-shift
+  obligation as before.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

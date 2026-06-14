@@ -825,7 +825,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
             Rvalue::Cast(kind, op, target_ty) => {
                 self.visit_operand(op, span);
                 self.visit_ty(target_ty, span);
-                self.visit_cast(kind, span);
+                self.visit_cast(kind, op, target_ty, span);
             }
             Rvalue::BinaryOp(binop, lhs, rhs) => {
                 self.visit_operand(lhs, span);
@@ -884,17 +884,44 @@ impl<'cfg> SubsetVisitor<'cfg> {
             }
         }
     }
-    fn visit_cast(&mut self, kind: &CastKind, span: Span) {
+    fn visit_cast(&mut self, kind: &CastKind, op: &Operand, target_ty: &Ty, span: Span) {
         match kind {
-            // PB051: narrowing or sign-changing int casts. We reject *all*
-            // IntToInt casts in v0.1 because checking "narrowing" requires
-            // knowing both source and target widths, which the cast kind
-            // alone does not tell us; the conservative rejection forces
-            // users to use `try_from` (which we accept and the VC generator
-            // discharges).
-            CastKind::IntToInt => {
-                self.reject(rules::PB051, span, "`as` integer cast; use `TryFrom` instead");
-            }
+            // PB051: narrowing or sign-changing int casts. The cast kind
+            // alone does not tell us the source/target widths, so by
+            // default we reject every `IntToInt` cast and direct users to
+            // `TryFrom` (which we accept and the VC generator discharges).
+            //
+            // EXEMPTION (#31, 2026-06-13): a cast of an integer CONSTANT
+            // whose value provably fits the target type is value-
+            // preserving — there is nothing to truncate or sign-change, so
+            // PB051's rationale ("truncation needs an explicit obligation")
+            // does not apply and accepting it is sound. This is what
+            // unblocks shift code: rustc lowers `x << 4` with an implicit
+            // `const 4_i32 as u32` — the untyped literal `4` defaults to
+            // i32 and is cast to the value type SOLELY for the shift-
+            // overflow bounds check (the real `Shl` uses the original
+            // operand). That synthetic cast, and any other value-
+            // preserving constant cast, is now accepted. Every NON-constant
+            // cast and every value-CHANGING constant cast (narrowing like
+            // `300 as u8`, sign-flipping like `-1 as u32`, or an
+            // unsupported target width) still fails closed via the `None`
+            // arm. See `value_preserving_int_cast` for the soundness gate.
+            CastKind::IntToInt => match Self::value_preserving_int_cast(op, target_ty) {
+                Some((value, src_name, tgt_name)) => self.audit_note(
+                    span,
+                    format!(
+                        "PB051: `as` integer cast accepted — constant {value} is \
+                         value-preserving from {src_name} to {tgt_name} (no \
+                         truncation or sign-change). Non-constant or value-changing \
+                         casts remain rejected.",
+                    ),
+                ),
+                None => self.reject(
+                    rules::PB051,
+                    span,
+                    "`as` integer cast (non-constant or value-changing); use `TryFrom` instead",
+                ),
+            },
             // PB050: float casts.
             CastKind::FloatToInt | CastKind::IntToFloat | CastKind::FloatToFloat => {
                 self.reject(rules::PB050, span, "float cast");
@@ -910,6 +937,42 @@ impl<'cfg> SubsetVisitor<'cfg> {
             // Pointer coercion (auto-borrow, unsize). Mostly safe; the
             // resulting type is checked by visit_ty.
             CastKind::PointerCoercion => {}
+        }
+    }
+    /// PB051 value-preservation gate (SOUNDNESS-CRITICAL). Returns
+    /// `Some((value, src_ty_name, tgt_ty_name))` ONLY when `op` is an
+    /// integer constant whose value is representable in BOTH its own
+    /// (source) type and the cast's `target_ty` — i.e. the `IntToInt`
+    /// cast provably preserves the value, with no truncation and no
+    /// sign-change. In every other case it returns `None`, so the caller
+    /// fails closed and PB051 still fires:
+    ///   - a non-constant operand (a variable read like `copy _2`, which
+    ///     includes a shift amount bound via `let s = 4; x << s`),
+    ///   - a constant whose integer value couldn't be extracted,
+    ///   - a value outside the target range (narrowing / sign-flipping),
+    ///   - a non-primitive or unsupported-width source/target (`u128`,
+    ///     `usize`/`isize`), rejected by `value_fits_in_int_ty`.
+    ///
+    /// The SOURCE-range check is not redundant with the target check: it
+    /// rejects the one lossy-extraction case — a `u128` constant above
+    /// `i128::MAX`, which the adapter stores as a negative `i128` — by
+    /// failing closed rather than trusting the wrapped value.
+    fn value_preserving_int_cast(
+        op: &Operand,
+        target_ty: &Ty,
+    ) -> Option<(i128, String, String)> {
+        let Operand::Constant(c) = op else {
+            return None;
+        };
+        let value = c.value?;
+        let src_name = primitive_int_name_from_ty(&c.ty)?;
+        let tgt_name = primitive_int_name_from_ty(target_ty)?;
+        if crate::predicate::value_fits_in_int_ty(value, &src_name)
+            && crate::predicate::value_fits_in_int_ty(value, &tgt_name)
+        {
+            Some((value, src_name, tgt_name))
+        } else {
+            None
         }
     }
     fn visit_aggregate_kind(&mut self, kind: &AggregateKind, span: Span) {
@@ -4601,6 +4664,176 @@ mod tests {
                 report.audit_notes,
             );
         }
+    }
+    /// #31 (2026-06-13): PB051 value-preserving-constant exemption.
+    /// A cast of an integer CONSTANT whose value fits the target type is
+    /// value-preserving (no truncation, no sign-change) and is ACCEPTED;
+    /// every non-constant or value-changing cast still fails CLOSED. The
+    /// headline case is `4_i32 as u32` — the synthetic cast rustc inserts
+    /// for `x << 4`'s shift-overflow bounds check.
+    #[test]
+    fn pb051_const_cast_value_preservation_matrix() {
+        use crate::mir_api::{CastKind, IntTy, UintTy};
+        let cfg = SubsetConfig::default_for_test();
+        let i32_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Int(IntTy::I32)) };
+        let u8_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U8)) };
+        let u32_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let u64_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U64)) };
+        let u128_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U128)) };
+        let const_op = |value: i128, ty: Ty| {
+            Operand::Constant(ConstOperand { ty, def_id: None, path: None, value: Some(value) })
+        };
+        // (operand, target_ty, accept?, label)
+        let cases: Vec<(Operand, Ty, bool, &str)> = vec![
+            (const_op(4, i32_ty()), u32_ty(), true, "4_i32 as u32 (the `x << 4` shift cast)"),
+            (const_op(200, u32_ty()), u8_ty(), true, "200_u32 as u8 (value fits despite narrowing width)"),
+            (const_op(300, i32_ty()), u8_ty(), false, "300_i32 as u8 (truncating)"),
+            (const_op(-1, i32_ty()), u32_ty(), false, "-1_i32 as u32 (sign-flipping)"),
+            (const_op(300, u32_ty()), u8_ty(), false, "300_u32 as u8 (truncating)"),
+            (const_op(5, i32_ty()), u128_ty(), false, "5_i32 as u128 (unsupported target → fail closed)"),
+            (
+                Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                u32_ty(),
+                false,
+                "copy _1:u64 as u32 (non-constant → fail closed)",
+            ),
+        ];
+        for (op, target_ty, accept, label) in cases {
+            let mut v = SubsetVisitor::new(&cfg);
+            let body = Body {
+                def_id: DefId(0),
+                arg_tys: vec![],
+                arg_names: vec![],
+                return_ty: target_ty.clone(),
+                is_unsafe: false,
+                is_async: false,
+                locals: vec![
+                    LocalDecl { ty: target_ty.clone(), span: Span::default(), mutability: Mutability::Not },
+                    LocalDecl { ty: u64_ty(), span: Span::default(), mutability: Mutability::Not },
+                ],
+                blocks: vec![BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::Cast(CastKind::IntToInt, op, target_ty.clone()),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator { kind: TerminatorKind::Return, span: Span::default() },
+                }],
+                span: Span::default(),
+            };
+            v.visit_body(&body, false);
+            let report = v.into_report();
+            let fired = report.errors.iter().any(|e| e.rule == rules::PB051);
+            if accept {
+                assert!(!fired, "PB051 must NOT fire on {label}; errors: {:?}", report.errors);
+                assert!(
+                    report.audit_notes.iter().any(|n| n.message.contains("value-preserving")),
+                    "{label} should carry a value-preserving transparency note; got: {:?}",
+                    report.audit_notes,
+                );
+            } else {
+                assert!(fired, "PB051 MUST fire (fail closed) on {label}; errors: {:?}", report.errors);
+            }
+        }
+    }
+    /// #31 (2026-06-13): the actual repro. A faithful shadow of rustc's
+    /// `fn f(x: u32) -> u32 { x << 4 }` MIR — the untyped `4` defaults to
+    /// i32 and is cast `const 4_i32 as u32` SOLELY for the shift-overflow
+    /// bounds check (`Lt(_, 32_u32)` guarding the `Shl`). Pre-fix PB051
+    /// fired on that cast and made all `x << N` code unverifiable. The
+    /// success criterion: ZERO subset errors on this valid shift.
+    #[test]
+    fn pb051_does_not_fire_on_real_shift_amount_cast() {
+        use crate::mir_api::{BinOp, CastKind, IntTy, UintTy};
+        let cfg = SubsetConfig::default_for_test();
+        let u32_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let i32_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Int(IntTy::I32)) };
+        let bool_ty = || Ty { kind: TyKind::RigidTy(RigidTy::Bool) };
+        let const_i32 = |v: i128| {
+            Operand::Constant(ConstOperand { ty: i32_ty(), def_id: None, path: None, value: Some(v) })
+        };
+        let const_u32 = |v: i128| {
+            Operand::Constant(ConstOperand { ty: u32_ty(), def_id: None, path: None, value: Some(v) })
+        };
+        let mut v = SubsetVisitor::new(&cfg);
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty()],
+            arg_names: vec!["x".into()],
+            return_ty: u32_ty(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                LocalDecl { ty: u32_ty(), span: Span::default(), mutability: Mutability::Not }, // _0 ret
+                LocalDecl { ty: u32_ty(), span: Span::default(), mutability: Mutability::Not }, // _1 x
+                LocalDecl { ty: u32_ty(), span: Span::default(), mutability: Mutability::Not }, // _2 cast result
+                LocalDecl { ty: bool_ty(), span: Span::default(), mutability: Mutability::Not }, // _3 cmp
+            ],
+            blocks: vec![
+                BasicBlockData {
+                    statements: vec![
+                        Statement {
+                            kind: StatementKind::Assign(
+                                Place { local: Local(2), projection: vec![] },
+                                Rvalue::Cast(CastKind::IntToInt, const_i32(4), u32_ty()),
+                            ),
+                            span: Span::default(),
+                        },
+                        Statement {
+                            kind: StatementKind::Assign(
+                                Place { local: Local(3), projection: vec![] },
+                                Rvalue::BinaryOp(
+                                    BinOp::Lt,
+                                    Operand::Move(Place { local: Local(2), projection: vec![] }),
+                                    const_u32(32),
+                                ),
+                            ),
+                            span: Span::default(),
+                        },
+                    ],
+                    terminator: Terminator {
+                        kind: TerminatorKind::Assert {
+                            cond: Operand::Move(Place { local: Local(3), projection: vec![] }),
+                            expected: true,
+                            msg: AssertMessage::Overflow,
+                            target: BasicBlock(1),
+                        },
+                        span: Span::default(),
+                    },
+                },
+                BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Shl,
+                                Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                                const_i32(4),
+                            ),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator { kind: TerminatorKind::Return, span: Span::default() },
+                },
+            ],
+            span: Span::default(),
+        };
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(
+            report.errors.len(),
+            0,
+            "#31: valid shift code `x << 4` must produce zero subset errors \
+             (PB051 must not fire on the shift-amount cast); got: {:?}",
+            report.errors,
+        );
+        assert!(
+            report.audit_notes.iter().any(|n| n.message.contains("value-preserving")),
+            "the accepted shift-amount cast should leave a transparency note; got: {:?}",
+            report.audit_notes,
+        );
     }
     /// Audit 2026-05-29 (CRITICAL fix): unary negation `-(a)` on a
     /// signed integer must emit a PB049 `ArithmeticOverflow` obligation

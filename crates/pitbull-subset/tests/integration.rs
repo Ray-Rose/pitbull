@@ -325,14 +325,15 @@ const KNOWN_UNDISCHARGED_ACCEPT: &[u16] = &[54];
 ///   unresolved type parameter trips PB039 (`unresolvable impl Trait`) —
 ///   fail-closed. Until the pipeline instantiates generics, this valid file
 ///   is conservatively rejected. Audit 2026-05-31 (corpus mislabel finding).
-/// - PB050 (fixed-point): `accept/PB050_fixed_point.rs` uses a bit shift
-///   (`>> 16`). Rust lowers EVERY shift's amount to an implicit
-///   `IntToInt` cast in MIR (`16_i32 as u32`), and PB051 conservatively
-///   rejects all `IntToInt` casts — so any shift-using body trips PB051.
-///   Sound over-rejection, but a real precision gap (shifts are common):
-///   PB051 should exempt the compiler-inserted shift-amount cast. Tracked
-///   as a follow-up; until then this valid file is conservatively rejected.
-const KNOWN_REJECTED_ACCEPT: &[u16] = &[31, 50];
+///
+/// PB050 (fixed-point, `>> 16`) was REMOVED from this list on 2026-06-13:
+/// the PB051-on-shift false positive is fixed. rustc lowers a shift's
+/// amount to an implicit `IntToInt` cast (the untyped `16` defaults to
+/// i32 → `16_i32 as u64` for the bounds check), and PB051 now exempts
+/// value-preserving constant casts, so `accept/PB050_fixed_point.rs`
+/// passes the strict zero-violations check end-to-end. See PSS-1.md
+/// §17.1 "PB051 value-preserving-constant cast exemption".
+const KNOWN_REJECTED_ACCEPT: &[u16] = &[31];
 /// Environment needed to drive the wrapper: paths to the built
 /// pitbull-rustc binary and the nightly sysroot.
 struct E2eEnv {

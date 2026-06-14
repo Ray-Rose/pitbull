@@ -618,6 +618,26 @@ fn legal_range_i128(signed: bool, bits: u32) -> Option<(i128, i128)> {
         }
     }
 }
+/// True iff the integer `value` is representable in the primitive
+/// integer type named `ty_name` (`"u32"`, `"i8"`, …) — i.e. casting
+/// `value` to that type preserves it exactly, with no truncation and
+/// no sign-change. Returns `false` for non-integer or unsupported type
+/// names (`u128`, `usize`/`isize`, suffixed forms), so a caller on the
+/// soundness path fails closed when the range can't be computed.
+///
+/// Used by the PB051 cast gate (`visitor::value_preserving_int_cast`):
+/// a constant `as` cast whose value fits its target cannot truncate, so
+/// it needs no obligation and is safe to accept.
+#[must_use]
+pub fn value_fits_in_int_ty(value: i128, ty_name: &str) -> bool {
+    let Some((signed, bits)) = int_type_info(ty_name) else {
+        return false;
+    };
+    match legal_range_i128(signed, bits) {
+        Some((min, max)) => value >= min && value <= max,
+        None => false,
+    }
+}
 /// Public helper (Q.4a): format an integer `value` as an SMT-LIB
 /// bit-vector literal sized for the primitive integer type `ty_name`
 /// (`"u32"`, `"i8"`, …). `None` for an unsupported type name.
@@ -676,6 +696,26 @@ mod tests {
             assert_eq!(p.op, expected_op, "op mismatch on {input:?}");
             assert_eq!(p.var, expected_var, "var mismatch on {input:?}");
             assert_eq!(p.lit, expected_lit, "lit mismatch on {input:?}");
+        }
+    }
+    /// #31 PB051 gate: `value_fits_in_int_ty` is the value-preservation
+    /// predicate behind the constant-cast exemption. It must answer YES
+    /// only when the value round-trips into the type, and fail CLOSED (NO)
+    /// on every unsupported width / non-int name so the caller rejects
+    /// rather than guesses.
+    #[test]
+    fn value_fits_in_int_ty_matches_two_complement_ranges() {
+        // Fits — value is representable, cast preserves it.
+        for (v, ty) in [(4, "u32"), (0, "u8"), (255, "u8"), (200, "u8"), (-128, "i8"), (127, "i8"), (-1, "i32")] {
+            assert!(value_fits_in_int_ty(v, ty), "{v} should fit {ty}");
+        }
+        // Does not fit — truncating or sign-flipping.
+        for (v, ty) in [(256, "u8"), (300, "u8"), (-1, "u32"), (128, "i8"), (-129, "i8")] {
+            assert!(!value_fits_in_int_ty(v, ty), "{v} must NOT fit {ty}");
+        }
+        // Fail closed — unsupported widths / non-int names never "fit".
+        for ty in ["u128", "usize", "isize", "bool", "f32", "u33"] {
+            assert!(!value_fits_in_int_ty(5, ty), "{ty} is unsupported → must fail closed");
         }
     }
     /// Reversed form (`100 > x`) normalizes to ident-first via
