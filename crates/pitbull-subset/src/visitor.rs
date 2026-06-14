@@ -786,20 +786,26 @@ impl<'cfg> SubsetVisitor<'cfg> {
             Some(p) if p == "std::thread::spawn" || p.starts_with("std::thread::Builder::spawn") => {
                 self.reject(rules::PB028, span, "thread spawn");
             }
-            Some(p) if is_panicking_library_call(p) => {
-                // Option/Result `unwrap`/`expect`/`unwrap_err`/`expect_err`
-                // PANIC on the wrong variant. The panic lives INSIDE the
-                // library fn (in `core`), which the v0.2 wrapper does NOT
-                // walk (only `all_local_items()`) and which has no prelude
-                // model yet — so without catching it HERE, the call would
-                // fall through the `Some(_)` "assume walked elsewhere" arm
-                // below and be SILENTLY ACCEPTED: a false "verified" on
-                // `x.unwrap()`, violating the README's "no reachable
-                // `unwrap`/`expect`" guarantee (audit 2026-06-14). Treat it
-                // exactly like a `panic!` call site (PB043): strict mode
-                // rejects; default mode emits a (pending) PanicReachability
-                // obligation — the honest "cannot prove this won't panic"
-                // verdict (undischarged → fail closed), never a silent pass.
+            Some(p) if is_panicking_library_call(p) || is_panicking_int_method(p) => {
+                // Two families of un-walked-`core` panics caught at the call
+                // site (the panic lives INSIDE a `core` fn the v0.2 wrapper
+                // does NOT walk, and there is no prelude model yet, so without
+                // catching it HERE the call falls through the `Some(_)`
+                // "assume walked elsewhere" arm and is SILENTLY ACCEPTED):
+                //   1. Option/Result `unwrap`/`expect`/`unwrap_err`/`expect_err`
+                //      — panic on the wrong variant (violating the README's
+                //      "no reachable `unwrap`/`expect`"); and
+                //   2. primitive-int inherent methods that panic on overflow
+                //      or a zero/`MIN` argument — `pow`/`abs`/`div_euclid`/
+                //      `rem_euclid`/`next_power_of_two`/`ilog*`. The OPERATOR
+                //      form (`x * y`, `x / y`) is caught by PB049, but the
+                //      METHOD form (`x.pow(y)`) was silently "verified"
+                //      despite the README's unqualified "no integer arithmetic
+                //      overflow" claim (deep-audit 2026-06-14).
+                // Both are treated exactly like a `panic!` call site (PB043):
+                // strict mode rejects; default mode emits a (pending)
+                // PanicReachability obligation — the honest "cannot prove this
+                // won't panic" (undischarged → fail closed), never a silent pass.
                 if self.config.verification.strict_panic_acceptance {
                     self.reject(
                         rules::PB043,
@@ -2892,6 +2898,46 @@ pub fn is_panicking_library_call(p: &str) -> bool {
         || p.ends_with("::unwrap_err")
         || p.ends_with("::expect_err")
 }
+/// Whether `p` names a primitive-integer inherent method that PANICS — on
+/// overflow or a zero/`MIN` argument: `pow`, `abs`, `div_euclid`,
+/// `rem_euclid`, `next_power_of_two`, `ilog`/`ilog2`/`ilog10`.
+///
+/// ## Why (deep-audit 2026-06-14)
+///
+/// Same un-walked-`core` mechanism as [`is_panicking_library_call`]: the
+/// panic lives inside the `core` method, which the wrapper never walks. The
+/// OPERATOR forms (`x * y`, `x / y`, `x % y`) are caught by PB049 in the MIR
+/// visitor, but the METHOD forms lower to a `Call(core::num::<impl T>::…)`
+/// whose overflow/zero `Assert` is inside the un-walked callee — so
+/// `fn f(x:u32,y:u32)->u32 { x.pow(y) }` was reported `verified` despite
+/// overflowing, contradicting the README's (formerly unqualified) "No
+/// integer arithmetic overflow" guarantee. Routed through the same
+/// fail-closed PB043 handling so it is honestly undischarged, not silently
+/// passed.
+///
+/// ## Matching
+///
+/// Anchored on the `num::<impl …>` inherent-impl rendering rustc produces
+/// for primitive-int methods (verified empirically: the path is
+/// `core::num::<impl u32>::pow`), so a user method merely *named* `pow` is
+/// not matched. The NON-panicking families end in different suffixes and are
+/// correctly excluded: `wrapping_*` / `overflowing_*` (`::wrapping_pow`,
+/// `::overflowing_pow` end `_pow`, not `::pow`), `checked_*`, `saturating_*`,
+/// `unsigned_abs` (`_abs`, not `::abs`), `abs_diff` (`_diff`), `isqrt`.
+#[must_use]
+pub fn is_panicking_int_method(p: &str) -> bool {
+    if !p.contains("num::<impl") {
+        return false;
+    }
+    p.ends_with("::pow")
+        || p.ends_with("::abs")
+        || p.ends_with("::div_euclid")
+        || p.ends_with("::rem_euclid")
+        || p.ends_with("::next_power_of_two")
+        || p.ends_with("::ilog")
+        || p.ends_with("::ilog2")
+        || p.ends_with("::ilog10")
+}
 /// Extract the canonical Rust type name (`"u32"`, `"i64"`, ...) from
 /// a shadow `Ty` when it represents a primitive integer; otherwise
 /// `None`. Free-standing because it's a pure type-shape inspection
@@ -4043,6 +4089,17 @@ mod tests {
             "exactly one PB049-skipped audit note expected; got {:?}",
             report.audit_notes,
         );
+        // M1 (deep-audit 2026-06-14): the skip note MUST be a CoverageGap so
+        // it folds into the fail-closed exit code — this is the exact
+        // `p.0 + p.1` fail-open M1 closes. Pinning the kind here catches a
+        // future refactor that flips this site to `audit_transparency`
+        // (which would silently re-open exit-0 on unmodelable arithmetic).
+        assert_eq!(
+            report.coverage_gap_count(),
+            1,
+            "the PB049 projected-operand skip must be a CoverageGap; got {:?}",
+            report.audit_notes,
+        );
     }
     /// Task N negative: a `BinaryOp` on a non-integer (`bool`)
     /// must NOT emit an overflow obligation — the SMT-LIB encoder
@@ -4524,6 +4581,84 @@ mod tests {
                 crate::vc::VcObligationKind::PanicReachability,
             )),
             "unwrap_or must not emit a PanicReachability obligation; got {:?}",
+            report.vc_obligations,
+        );
+    }
+    // ----- panicking primitive-int methods (pow/abs/div_euclid/...) -----
+    // Deep-audit 2026-06-14: same un-walked-core mechanism as unwrap/expect;
+    // the OPERATOR form is PB049 but the METHOD form was silently accepted.
+    /// `is_panicking_int_method` matches the panic-bearing inherent int
+    /// methods (in the `num::<impl …>` rendering) and excludes the
+    /// non-panicking `checked_/wrapping_/overflowing_/saturating_/unsigned_`
+    /// families.
+    #[test]
+    fn is_panicking_int_method_classification() {
+        let positive = [
+            "core::num::<impl u32>::pow",
+            "core::num::<impl i32>::abs",
+            "core::num::<impl i32>::div_euclid",
+            "core::num::<impl i64>::rem_euclid",
+            "core::num::<impl u32>::next_power_of_two",
+            "core::num::<impl u32>::ilog2",
+        ];
+        for p in positive {
+            assert!(is_panicking_int_method(p), "should be a panicking int method: {p}");
+        }
+        let negative = [
+            "core::num::<impl u32>::wrapping_add",
+            "core::num::<impl u32>::wrapping_pow",
+            "core::num::<impl u32>::checked_pow",
+            "core::num::<impl u32>::overflowing_pow",
+            "core::num::<impl u32>::saturating_pow",
+            "core::num::<impl i32>::unsigned_abs",
+            "core::num::<impl u32>::abs_diff",
+            "core::num::<impl u32>::isqrt",
+            "core::num::<impl u32>::count_ones",
+            "my_crate::Widget::pow", // a user method named pow, not num::<impl>
+        ];
+        for p in negative {
+            assert!(!is_panicking_int_method(p), "should NOT be a panicking int method: {p}");
+        }
+    }
+    /// Default mode: `x.pow(y)` / `x.abs()` / `x.div_euclid(y)` emit a
+    /// PanicReachability obligation (honest "cannot prove no overflow"), so
+    /// the method-form overflow is no longer silently "verified".
+    #[test]
+    fn panicking_int_methods_emit_obligation_method_form_not_silent() {
+        let cfg = SubsetConfig::default_for_test();
+        for path in [
+            "core::num::<impl u32>::pow",
+            "core::num::<impl i32>::abs",
+            "core::num::<impl i32>::div_euclid",
+        ] {
+            let mut v = SubsetVisitor::new(&cfg);
+            v.visit_body(&body_calling(path), false);
+            let report = v.into_report();
+            assert!(
+                report.vc_obligations.iter().any(|o| matches!(
+                    o.kind,
+                    crate::vc::VcObligationKind::PanicReachability,
+                )),
+                "{path}: must emit a PanicReachability obligation; got {:?}",
+                report.vc_obligations,
+            );
+        }
+    }
+    /// Negative: the non-panicking `wrapping_add` must NOT be flagged (it
+    /// cannot panic) — guards against over-reach onto the safe families.
+    #[test]
+    fn wrapping_int_method_is_not_flagged() {
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&body_calling("core::num::<impl u32>::wrapping_add"), false);
+        let report = v.into_report();
+        assert!(
+            !report.vc_obligations.iter().any(|o| matches!(
+                o.kind,
+                crate::vc::VcObligationKind::PanicReachability,
+            )) && !report.errors.iter().any(|e| e.rule == rules::PB043),
+            "wrapping_add must not be flagged; got errors {:?}, obligations {:?}",
+            report.errors,
             report.vc_obligations,
         );
     }

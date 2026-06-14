@@ -42,8 +42,15 @@ fn-pointers / closures, floats, `as` casts, slice bounds, and overflow. A
 few constructs are specified but **not yet fully enforced** by the v0.2
 scaffold — loop/recursion termination (PB041/PB042) and implicit drop-glue
 under `verify_roots` narrowing — each tracked per-rule in `docs/PSS-1.md`
-§17.1. Pitbull will not claim to have proven what it has not: an
-unimplemented rule is a documented gap, never a silent pass.
+§17.1. One residual is worth calling out for the AoRTE claim specifically:
+the panic of a *library method* lives inside un-walked `core`, so it is
+caught only for the enumerated families (`Option`/`Result::unwrap`/`expect`
+and the panicking int methods `pow`/`abs`/`div_euclid`/…); a few others
+(`str` range/byte indexing, `<[T]>::split_at`) remain trusted pending the
+prelude — see `docs/SAFETY-MANUAL.md` §3.6. Operator-form arithmetic and
+projection indexing are fully covered. Pitbull will not claim to have
+proven what it has not: an unimplemented rule is a documented gap, never a
+silent pass.
 ## Why this list looks brutal
 It is the same list SPARK started with. The deal SPARK has kept with its users
 for forty years is: tell us what we are not allowed to do, and in exchange we

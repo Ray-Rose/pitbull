@@ -1743,6 +1743,37 @@ the std form and now also matches. No shadow type changes.
   divergent-ensures tagged Transparency, clean-body zero gaps) and +2
   exit-code tests (gap fails closed by default; opt-out doesn't fail);
   corpus accept files still pass under the fail-closed default.
+- ✅ Deep-audit self-review fixes (2026-06-14) — a 3-agent adversarial review
+  of this session's own commits, each finding verified against the source
+  before acting. Two issues fixed:
+  (1) **Cross-crate gate false-positive (a regression in 85900e7)** — the
+  aggregation keyed on rendered path STRINGS, but `item.name()` renders a
+  trait-impl method as `<crate::S as crate::T>::m` (walked) while the CALL
+  references the trait path `crate::T::m` (referenced) — verified empirically
+  against real MIR. So ANY crate using trait methods would have its trait
+  call false-flagged as an unverified workspace callee → spurious exit 1
+  breaking clean builds. Fixed by mirroring the proven `#27` gate: the
+  manifest now carries `universe` (the in-crate fn items), and a callee is
+  hard-flagged only if it is a member of SOME crate's universe (an actual
+  walkable item) — a trait-path call, never a walkable item, is correctly
+  ignored. `crate_of_path` is now robust to the `<.. as ..>` form (a naive
+  first-`::` split yielded `<crate`, a separate fail-open the agent found).
+  Pinned by a `cross_crate_unverified_ignores_trait_method_call_path`
+  regression test built from the empirically-observed manifest shape, and
+  e2e-reconfirmed.
+  (2) **Method-form integer overflow silently accepted** — the agent noted
+  the unwrap fix's same un-walked-`core` mechanism left `x.pow(y)` (and
+  `abs`/`div_euclid`/…) reporting `verified` with NO obligation, while the
+  operator form `x * y` is PB049 and the README claimed "no overflow"
+  unconditionally. `is_panicking_int_method` now catches the panicking
+  primitive-int inherent methods (`pow`/`abs`/`div_euclid`/`rem_euclid`/
+  `next_power_of_two`/`ilog*`, excluding the `checked_/wrapping_/
+  overflowing_/saturating_/unsigned_` families) and routes them through the
+  same fail-closed PB043 handling; verified e2e (`x.pow(y)` now emits
+  `pb043-panic-0 (PB043): pending` → exit 1). README + SAFETY-MANUAL §3.6
+  updated to scope the AoRTE claim honestly and list the remaining trusted
+  library-panic residual (`str` range/byte index, `<[T]>::split_at`) as a
+  documented gap, not a silent pass.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1750,7 +1781,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  301 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  305 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1763,7 +1794,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 301 passing, 0 warnings, clippy clean
+# Stable: 305 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

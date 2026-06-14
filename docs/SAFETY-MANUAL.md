@@ -117,15 +117,29 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
   not registry deps). These are assumed **total** (panic-free, AoRTE-safe)
   exactly as SPARK trusts its runtime. Precisely modelling the standard
   library is the **prelude's** job (§3.4), which is future work.
-  - **Exception — panic-bearing stdlib calls are caught, not trusted.**
-    The common combinators whose panic is invisible at the call site —
-    `Option`/`Result::{unwrap, expect, unwrap_err, expect_err}` — are
-    recognized by the visitor and produce a PB043 obligation (or a hard
-    reject under `strict_panic_acceptance`), so `x.unwrap()` is reported as
-    an unproven panic, never silently "verified" (reachability-integrity
-    audit, 2026-06-14). This list is the known-dangerous subset; other
-    panicking library functions remain on the trusted side until the
-    prelude models them.
+  - **Exception — common panic-bearing stdlib calls are caught, not
+    trusted.** Calls whose panic is invisible at the call site (the panic
+    lives in un-walked `core`) are recognized by the visitor and produce a
+    PB043 obligation (or a hard reject under `strict_panic_acceptance`), so
+    they are reported as an unproven panic, never silently "verified"
+    (reachability-integrity audit, 2026-06-14). Caught today:
+    `Option`/`Result::{unwrap, expect, unwrap_err, expect_err}`, and the
+    panicking primitive-int inherent methods `pow` / `abs` / `div_euclid` /
+    `rem_euclid` / `next_power_of_two` / `ilog`/`ilog2`/`ilog10` (the METHOD
+    form of overflow — the OPERATOR form `x * y` is already PB049).
+  - **Documented residual — some library panics remain trusted (a known
+    gap, NOT a silent pass).** The catch-list above is the common-and-
+    dangerous subset, not exhaustive. Library functions whose panic is in
+    un-walked `core` and that are NOT yet on the list — notably `str` range/
+    byte indexing (`&s[a..b]` via the `Index` trait, which is a library
+    `Call`, not a `ProjectionElem::Index`, so PB054 does not see it),
+    `<[T]>::split_at`, `slice::chunks(0)`/`windows(0)` — are still on the
+    trusted side until the prelude models them. **Operator-form arithmetic
+    (`+ - * / % << >>`) and projection-form indexing (`a[i]`) ARE fully
+    covered** (PB049 / PB054); the gap is specifically the library-method
+    panic forms not yet enumerated. Until the prelude lands, treat a
+    `verified` function that uses those constructs as covering everything
+    EXCEPT those specific library panics, and prefer the caught forms.
 - **Cross-crate aggregation (whole-workspace gate).** Each crate's
   per-crate `#27` gate only sees its own items, so on its own it cannot
   tell whether a callee in *another* workspace crate was verified. To close

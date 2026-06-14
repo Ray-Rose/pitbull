@@ -319,17 +319,40 @@ pub struct ReachManifest {
     /// Paths the user marked `#[pitbull::trusted]` (the user takes
     /// responsibility for these and their callees).
     pub trusted: Vec<String>,
+    /// Every in-crate fn-with-body the wrapper enumerated this run (the
+    /// `#27` `local_universe`), BEFORE `verify_roots` narrowing. A
+    /// referenced callee is only hard-flagged cross-crate if it is a member
+    /// of SOME crate's universe — i.e. an actual walkable item — exactly as
+    /// the local `#27` gate filters `referenced ∩ local_universe`. This is
+    /// what keeps a trait-method CALL from being false-flagged: rustc
+    /// renders such a call's callee as the TRAIT path `crate::Tr::m`, which
+    /// is never a walkable item (the item is the impl, rendered
+    /// `<crate::Type as crate::Tr>::m`), so it is absent from every
+    /// universe and correctly ignored (verified empirically 2026-06-14).
+    #[serde(default)]
+    pub universe: Vec<String>,
 }
-/// The crate segment of a fully-qualified item path — the text before the
-/// first `::`. `"crate_b::module::foo"` → `"crate_b"`; a bare `"foo"` →
-/// `"foo"`. Used to decide whether a referenced callee belongs to a
-/// workspace member (and so MUST be covered by some crate's run) versus an
-/// external crate (std/registry dep — trusted, see SAFETY-MANUAL §3.6).
+/// The crate segment of a fully-qualified item path. Handles both the plain
+/// form (`crate_b::module::foo` → `crate_b`) and rustc's trait-impl
+/// rendering (`<crate_b::Foo as some::Trait>::method` → `crate_b`, the crate
+/// of the `Self` type inside the angle brackets); a bare segment (`foo`)
+/// returns itself. Used to decide whether a callee belongs to a workspace
+/// member (must be covered by some crate's run) vs an external crate
+/// (std/registry dep — trusted, SAFETY-MANUAL §3.6).
+///
+/// The `<.. as ..>` handling is load-bearing: `item.name()` renders
+/// trait-impl methods that way (verified empirically 2026-06-14), and a
+/// naive split on the first `::` would yield `<crate_b` and mis-classify a
+/// member as external — a fail-open.
 #[must_use]
 pub fn crate_of_path(path: &str) -> &str {
-    match path.split_once("::") {
+    // Trait-impl rendering `<Type as Trait>::method`: the owning crate is
+    // the crate of `Type` (the Self type), inside the angle brackets.
+    let inner = path.strip_prefix('<').unwrap_or(path);
+    let self_ty = inner.split(" as ").next().unwrap_or(inner);
+    match self_ty.split_once("::") {
         Some((krate, _)) => krate,
-        None => path,
+        None => self_ty,
     }
 }
 /// Cross-crate reachability gate — [`unverified_reachable_callees`] lifted
@@ -368,7 +391,7 @@ pub fn cross_crate_unverified(
     manifests: &[ReachManifest],
     workspace_crates: &HashSet<String>,
 ) -> Vec<String> {
-    let (covered, analyzed) = covered_and_analyzed(manifests);
+    let sets = covered_analyzed_universe(manifests);
     let mut bad: Vec<String> = Vec::new();
     for m in manifests {
         for r in &m.referenced {
@@ -378,12 +401,23 @@ pub fn cross_crate_unverified(
                 continue;
             }
             // Verified (walked/trusted) by some crate's run → fine.
-            if covered.contains(r.as_str()) {
+            if sets.covered.contains(r.as_str()) {
                 continue;
             }
             // Owner not analyzed this run (warm cache) → indeterminate, not
             // a hard fail (avoids false positives on incremental builds).
-            if !analyzed.contains(owner) {
+            if !sets.analyzed.contains(owner) {
+                continue;
+            }
+            // Only an actual WALKABLE ITEM (a member of some crate's
+            // universe) can be a real missed walk — mirrors the `#27` gate's
+            // `referenced ∩ local_universe` filter, lifted to the workspace.
+            // A referenced path that is NO crate's item (a trait-method
+            // call's trait path `crate::Tr::m`, an intrinsic, an unresolved
+            // form) is not a missed walk and MUST NOT be flagged, else any
+            // crate using trait methods would false-fail. (The corresponding
+            // impl, if any, is matched separately as `<.. as ..>::m`.)
+            if !sets.universe.contains(r.as_str()) {
                 continue;
             }
             bad.push(r.clone());
@@ -395,22 +429,22 @@ pub fn cross_crate_unverified(
 }
 /// Companion to [`cross_crate_unverified`]: the workspace-member callees
 /// whose coverage is INDETERMINATE because their owning crate was not
-/// analyzed this run (cargo served it from a warm cache, so no manifest).
-/// These are not failures, but they mean the cross-crate verdict is
-/// incomplete — surface them as a "run a clean build" note. Sorted+deduped.
+/// analyzed this run (cargo served it from a warm cache, so no manifest, so
+/// we don't even have that crate's universe to check). These are not
+/// failures — surface them as a "run a clean build" note. Sorted+deduped.
 #[must_use]
 pub fn cross_crate_indeterminate(
     manifests: &[ReachManifest],
     workspace_crates: &HashSet<String>,
 ) -> Vec<String> {
-    let (covered, analyzed) = covered_and_analyzed(manifests);
+    let sets = covered_analyzed_universe(manifests);
     let mut out: Vec<String> = Vec::new();
     for m in manifests {
         for r in &m.referenced {
             let owner = crate_of_path(r);
             if workspace_crates.contains(owner)
-                && !covered.contains(r.as_str())
-                && !analyzed.contains(owner)
+                && !sets.covered.contains(r.as_str())
+                && !sets.analyzed.contains(owner)
             {
                 out.push(r.clone());
             }
@@ -420,13 +454,23 @@ pub fn cross_crate_indeterminate(
     out.dedup();
     out
 }
-/// Shared pass over the manifests: `covered` = every path walked or trusted
-/// by any crate's run; `analyzed` = every crate that produced a manifest
-/// this run (by its declared name AND the crate segment of every path it
-/// walked, so a crate is "analyzed" even if it walked zero of its own fns).
-fn covered_and_analyzed(manifests: &[ReachManifest]) -> (HashSet<&str>, HashSet<&str>) {
+/// The three sets the cross-crate gate needs, in one pass:
+/// - `covered`: every path walked or trusted by any crate's run.
+/// - `analyzed`: every crate that produced a manifest this run (by its
+///   declared name AND the crate segment of every path it walked or listed
+///   in its universe, so a crate counts as analyzed even if it walked zero
+///   of its own fns).
+/// - `universe`: every in-crate fn-with-body any crate enumerated — the
+///   "is this a walkable item?" set that filters out trait-paths / non-items.
+struct CrossCrateSets<'a> {
+    covered: HashSet<&'a str>,
+    analyzed: HashSet<&'a str>,
+    universe: HashSet<&'a str>,
+}
+fn covered_analyzed_universe(manifests: &[ReachManifest]) -> CrossCrateSets<'_> {
     let mut covered: HashSet<&str> = HashSet::new();
     let mut analyzed: HashSet<&str> = HashSet::new();
+    let mut universe: HashSet<&str> = HashSet::new();
     for m in manifests {
         analyzed.insert(m.crate_name.as_str());
         for w in &m.walked {
@@ -436,8 +480,12 @@ fn covered_and_analyzed(manifests: &[ReachManifest]) -> (HashSet<&str>, HashSet<
         for t in &m.trusted {
             covered.insert(t.as_str());
         }
+        for u in &m.universe {
+            universe.insert(u.as_str());
+            analyzed.insert(crate_of_path(u));
+        }
     }
-    (covered, analyzed)
+    CrossCrateSets { covered, analyzed, universe }
 }
 #[cfg(test)]
 mod tests {
@@ -740,13 +788,24 @@ mod tests {
         );
     }
     // ----- cross-crate aggregation (whole-workspace gate) --------------
-    fn manifest(name: &str, walked: &[&str], referenced: &[&str], trusted: &[&str]) -> ReachManifest {
+    // Args: (crate_name, walked, referenced, trusted, universe). `universe`
+    // is every in-crate fn-with-body (⊇ walked); a narrowed crate has
+    // universe ⊋ walked. A callee is only hard-flagged if it is in SOME
+    // crate's universe (a real walkable item) — mirroring the #27 gate.
+    fn manifest(
+        name: &str,
+        walked: &[&str],
+        referenced: &[&str],
+        trusted: &[&str],
+        universe: &[&str],
+    ) -> ReachManifest {
         let v = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         ReachManifest {
             crate_name: name.into(),
             walked: v(walked),
             referenced: v(referenced),
             trusted: v(trusted),
+            universe: v(universe),
         }
     }
     fn ws(names: &[&str]) -> HashSet<String> {
@@ -754,13 +813,13 @@ mod tests {
     }
     /// Flags a workspace-member callee that NO crate's run verified — the
     /// cross-crate hole. crate_a's walked root calls crate_b::foo + std;
-    /// crate_b narrowed and walked nothing, so neither crate's local gate
-    /// catches foo.
+    /// crate_b narrowed and walked nothing (but foo IS in crate_b's
+    /// universe), so neither crate's local gate catches foo.
     #[test]
     fn cross_crate_unverified_flags_member_callee_no_one_walked() {
         let manifests = vec![
-            manifest("crate_a", &["crate_a::root"], &["crate_b::foo", "std::vec::Vec::new"], &[]),
-            manifest("crate_b", &[], &[], &[]),
+            manifest("crate_a", &["crate_a::root"], &["crate_b::foo", "std::vec::Vec::new"], &[], &["crate_a::root"]),
+            manifest("crate_b", &[], &[], &[], &["crate_b::foo"]),
         ];
         assert_eq!(
             cross_crate_unverified(&manifests, &ws(&["crate_a", "crate_b"])),
@@ -773,8 +832,8 @@ mod tests {
     #[test]
     fn cross_crate_unverified_clean_when_member_walked_elsewhere() {
         let manifests = vec![
-            manifest("crate_a", &["crate_a::root"], &["crate_b::foo"], &[]),
-            manifest("crate_b", &["crate_b::foo"], &[], &[]),
+            manifest("crate_a", &["crate_a::root"], &["crate_b::foo"], &[], &["crate_a::root"]),
+            manifest("crate_b", &["crate_b::foo"], &[], &[], &["crate_b::foo"]),
         ];
         assert!(
             cross_crate_unverified(&manifests, &ws(&["crate_a", "crate_b"])).is_empty(),
@@ -785,8 +844,8 @@ mod tests {
     #[test]
     fn cross_crate_unverified_respects_trusted() {
         let manifests = vec![
-            manifest("crate_a", &["crate_a::root"], &["crate_b::foo"], &[]),
-            manifest("crate_b", &[], &[], &["crate_b::foo"]),
+            manifest("crate_a", &["crate_a::root"], &["crate_b::foo"], &[], &["crate_a::root"]),
+            manifest("crate_b", &[], &[], &["crate_b::foo"], &["crate_b::foo"]),
         ];
         assert!(
             cross_crate_unverified(&manifests, &ws(&["crate_a", "crate_b"])).is_empty(),
@@ -802,10 +861,36 @@ mod tests {
             &["crate_a::root"],
             &["core::option::Option::<u32>::unwrap", "some_dep::helper", "std::mem::swap"],
             &[],
+            &["crate_a::root"],
         )];
         assert!(
             cross_crate_unverified(&manifests, &ws(&["crate_a"])).is_empty(),
             "callees from non-workspace crates (std/deps) are trusted, never flagged",
+        );
+    }
+    /// REGRESSION (deep-audit 2026-06-14): a TRAIT-METHOD call must NOT be
+    /// false-flagged. rustc renders the call's callee as the trait path
+    /// `crate_a::T::m`, but the walkable item is the impl
+    /// `<crate_a::S as crate_a::T>::m` (which IS walked). The trait path is
+    /// in no crate's universe, so the gate must ignore it — else every crate
+    /// using trait methods would spuriously fail. Verified empirically
+    /// against real rustc MIR (the manifest had exactly this shape).
+    #[test]
+    fn cross_crate_unverified_ignores_trait_method_call_path() {
+        let manifests = vec![manifest(
+            "crate_a",
+            &["<crate_a::S as crate_a::T>::m", "crate_a::root"], // impl IS walked
+            &["crate_a::T::m"],                                  // call references the TRAIT path
+            &[],
+            &["<crate_a::S as crate_a::T>::m", "crate_a::root"],
+        )];
+        assert!(
+            cross_crate_unverified(&manifests, &ws(&["crate_a"])).is_empty(),
+            "a trait-method call path (no crate's walkable item) must not be flagged",
+        );
+        assert!(
+            cross_crate_indeterminate(&manifests, &ws(&["crate_a"])).is_empty(),
+            "...and it is not indeterminate either (the crate WAS analyzed)",
         );
     }
     /// Warm-cache safety: when the OWNING crate emitted no manifest (cargo
@@ -815,7 +900,13 @@ mod tests {
     /// analyzed this run.
     #[test]
     fn cross_crate_unverified_indeterminate_when_owner_not_analyzed() {
-        let manifests = vec![manifest("crate_a", &["crate_a::root"], &["crate_b::foo"], &[])];
+        let manifests = vec![manifest(
+            "crate_a",
+            &["crate_a::root"],
+            &["crate_b::foo"],
+            &[],
+            &["crate_a::root"],
+        )];
         let workspace = ws(&["crate_a", "crate_b"]);
         assert!(
             cross_crate_unverified(&manifests, &workspace).is_empty(),
@@ -827,11 +918,16 @@ mod tests {
             "it must instead be reported as indeterminate (clean build needed)",
         );
     }
-    /// `crate_of_path` extracts the leading crate segment.
+    /// `crate_of_path` extracts the crate segment from plain AND trait-impl
+    /// `<Type as Trait>::method` renderings (the latter is what `item.name()`
+    /// produces — a naive first-`::` split would yield `<crate_b`, a
+    /// fail-open in the workspace-membership check).
     #[test]
     fn crate_of_path_extracts_leading_segment() {
         assert_eq!(crate_of_path("crate_b::module::foo"), "crate_b");
         assert_eq!(crate_of_path("crate_b::<impl X>::foo"), "crate_b");
+        assert_eq!(crate_of_path("<crate_b::Foo as some::Trait>::method"), "crate_b");
+        assert_eq!(crate_of_path("<crate_b::Foo<u32> as core::ops::Add>::add"), "crate_b");
         assert_eq!(crate_of_path("bare"), "bare");
         assert_eq!(crate_of_path(""), "");
     }

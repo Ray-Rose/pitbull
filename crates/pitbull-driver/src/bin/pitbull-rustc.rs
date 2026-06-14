@@ -775,6 +775,12 @@ impl PitbullCallbacks {
                 walked: sorted(&walked_fn_paths),
                 referenced: sorted(&referenced_callees),
                 trusted: sorted(&hir_trusted),
+                // The #27 `local_universe` (every in-crate fn-with-body,
+                // pre-narrowing) — the cross-crate gate only hard-flags a
+                // callee that is a member of SOME crate's universe (an actual
+                // walkable item), which keeps trait-method call paths (never
+                // a walkable item) from false-flagging.
+                universe: sorted(&local_fn_universe),
             };
             match serde_json::to_string(&manifest) {
                 Ok(json) => {
