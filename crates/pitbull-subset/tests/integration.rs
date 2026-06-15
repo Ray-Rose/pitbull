@@ -3348,3 +3348,63 @@ fn prelude_flip_fails_closed_on_untrusted_stdlib_e2e() {
         "allow-listed `wrapping_add` must still verify; got exit {code2:?}, stderr:\n{stderr2}",
     );
 }
+
+/// Regression guard for the 2026-06-14 RED-TEAM of the prelude flip. The
+/// red-team inferred — from the rustc-INTERNAL `tcx.def_path_str` — that
+/// operator / index / iterator trait methods render `<u32 as Trait>::m` with a
+/// leading `<`, so they would escape the `core::`/`std::`/`alloc::` namespace
+/// gate and be silently trusted (a claimed false discharge / the cardinal
+/// sin). Running the REAL wrapper REFUTED that: `rustc_public::name()` renders
+/// them PREFIXED — `std::ops::Div::div`, `std::ops::Index::index`,
+/// `std::iter::Iterator::sum` — so each is gapped / denied / obligated and the
+/// wrapper fails closed. Each snippet below panics at runtime (div-by-zero /
+/// range OOB / `sum` overflow) and MUST NOT verify. This PINS the rendering
+/// assumption end to end: if a toolchain update ever changed it to the
+/// leading-`<` form the red-team feared, these would start verifying (exit 0)
+/// and fail this test loudly — turning a refuted finding into standing
+/// protection.
+#[test]
+fn prelude_namespace_covers_trait_dispatched_stdlib() {
+    let Some(env) = E2eEnv::probe() else {
+        skip_or_require("trait_dispatched_stdlib");
+        return;
+    };
+    let cases: &[(&str, &str)] = &[
+        // Operator trait via a generic bound — the monomorphized body holds a
+        // Call to `std::ops::Div::div`, NOT a `BinaryOp` (so PB049 doesn't see
+        // it); it is caught by the namespace gap (and PB039 for the unresolved
+        // type param). `ratio(_, 0)` panics "attempt to divide by zero".
+        (
+            "generic_div_by_zero",
+            "use core::ops::Div;\n#[inline(never)]\nfn divide<T: Div<Output = T>>(a: T, b: T) -> T { a / b }\npub fn ratio(n: u32, d: u32) -> u32 { divide(n, d) }\n",
+        ),
+        // Range indexing lowers to `std::ops::Index::index` (a Call, not a
+        // PB054 projection). `s[a..b]` with a>len panics.
+        (
+            "range_index",
+            "pub fn window_first(s: &[u32], a: usize, b: usize) -> u32 { (&s[a..b])[0] }\n",
+        ),
+        // `Iterator::sum` over `&[u32]` — `sum()` overflow panics under
+        // overflow-checks (PB049 profile).
+        (
+            "iter_sum",
+            "pub fn total(s: &[u32]) -> u32 { s.iter().copied().sum() }\n",
+        ),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (label, src) in cases {
+        let (stderr, code) = run_wrapper_on_source(&env, src, &[]).expect("wrapper run");
+        if wrapper_verified(code) {
+            failures.push(format!(
+                "FALSE DISCHARGE: trait-dispatched stdlib `{label}` was VERIFIED (exit 0) — \
+                 the leading-`<` rendering the red-team feared may now be real.\n  src: {src}\n  \
+                 stderr:\n{stderr}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "prelude namespace gate missed a trait-dispatched stdlib call:\n\n{}",
+        failures.join("\n\n"),
+    );
+}

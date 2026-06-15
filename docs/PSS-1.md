@@ -1963,6 +1963,29 @@ the std form and now also matches. No shadow type changes.
   oversized and PB020 fires (the `Repeat`/array-literal count at adapter.rs is
   unused by any rule and left as-is). Verified e2e: `unsafe fn` → PB002,
   `[u8; 100_000_000]` → PB020, safe fn → exit 0; no corpus regression.
+- ✅ Prelude flip RED-TEAM — adversarially audited, findings empirically
+  REFUTED (2026-06-14). A fresh adversarial pass on the prelude flip claimed
+  three HIGH false discharges: operator-trait arithmetic via a generic bound
+  (`<u32 as ops::Div>::div`), range indexing (`<[u32] as
+  ops::Index<Range>>::index`), and `Iterator::sum`/`step_by` — all asserted to
+  escape the namespace gate via a leading `<` / a generic-arg-bearing suffix.
+  The claim rested on path renderings INFERRED from the rustc-INTERNAL
+  `tcx.def_path_str` (which does produce `<Self as Trait>::m`). Pitbull uses
+  `rustc_public::CrateDef::name()`, which canonicalizes differently — running
+  the REAL wrapper on the exact reproducers showed the renderings are PREFIXED
+  (`std::ops::Div::div`, `std::ops::Index::index`, `std::iter::Iterator::sum`)
+  and every case fails closed (exit 1: the gap, the deny matchers, plus PB039
+  on the generic param). The leading-`<` form occurs ONLY for user-type trait
+  impls (`<mycrate::T as …>`), which are in-crate and owned by the
+  reachability gates. Two of the three were already pinned by the completeness
+  net (`range_index`, `iter_sum`); the verification is now locked in by the
+  e2e `prelude_namespace_covers_trait_dispatched_stdlib` (all three
+  reproducers) + unit coverage of the operator-trait paths in
+  `is_stdlib_namespace_path` / `is_trusted_total_library_call`. Lesson
+  reaffirmed: a cardinal-sin claim is verified against the real toolchain, not
+  acted on from inference — and the refuted finding becomes a standing
+  regression guard (if a toolchain bump ever changes the rendering to the
+  leading-`<` form, that test fails loudly).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1970,7 +1993,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  329 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  330 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1983,7 +2006,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 329 passing, 0 warnings, clippy clean
+# Stable: 330 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

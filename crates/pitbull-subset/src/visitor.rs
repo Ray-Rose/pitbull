@@ -3147,19 +3147,30 @@ pub fn is_panicking_index_or_slice_call(p: &str) -> bool {
 /// Whether `p` is a call INTO the standard library (`core` / `std` / `alloc`)
 /// — the surface the prelude fail-closed default governs.
 ///
-/// Stdlib calls render with a `core::` / `std::` / `alloc::` PREFIX: inherent
-/// methods (`core::num::<impl u32>::wrapping_add`), free fns
-/// (`core::char::from_u32`), and trait methods whose receiver is a primitive
-/// (`std::cmp::Ord::min`, `std::convert::From::from` — empirically the trait
-/// path, not a `<u32 as …>` form). In-crate calls render `crate::…` /
-/// `mycrate::…`, and a USER type's impl of a stdlib trait renders
-/// `<mycrate::T as std::cmp::Ord>::cmp` (leading `<` + the user crate) — so a
-/// plain prefix test cleanly separates "stdlib call" from "in-crate call",
-/// WITHOUT the visitor needing to know the local crate name. (Residual: a
-/// `<primitive as core_trait>::m` rendering would start `<` and escape this
-/// test — but such methods are conversions/comparisons that are total, and
-/// the panicking primitive methods are INHERENT, so they render with the
-/// prefix and are covered.)
+/// `rustc_public::CrateDef::name()` (what the adapter feeds the classifier)
+/// renders stdlib calls with a `core::` / `std::` / `alloc::` PREFIX for EVERY
+/// shape that can reach a verified body — confirmed empirically via the
+/// reachability manifest on the pinned toolchain:
+///   - inherent methods: `core::num::<impl u32>::wrapping_add`,
+///     `core::slice::<impl [T]>::swap`;
+///   - free fns: `core::char::from_u32`;
+///   - trait methods on a PRIMITIVE receiver, INCLUDING operator / index /
+///     iterator traits: `std::cmp::Ord::min`, `std::convert::From::from`,
+///     `std::ops::Div::div`, `std::ops::Index::index`,
+///     `std::iter::Iterator::sum`.
+///
+/// `name()` canonicalizes these to the clean `path::Trait::method` form — it
+/// does NOT emit the rustc-INTERNAL `tcx.def_path_str` rendering
+/// `<u32 as std::ops::Div>::div`. (A 2026-06-14 red-team inferred the internal
+/// rendering and concluded operator/index/iterator trait calls escape the gap
+/// via a leading `<`; running the real wrapper REFUTED that — they render
+/// prefixed and ARE gapped / denied. See the e2e
+/// `prelude_namespace_covers_trait_dispatched_stdlib`.) The ONLY leading-`<`
+/// shape is a USER type's impl of a stdlib trait — `<mycrate::T as
+/// std::cmp::Ord>::cmp` — which is IN-CRATE (walked as its own subject, owned
+/// by the #27 / cross-crate gates), so a plain prefix test cleanly separates
+/// "stdlib call" (gapped if untrusted) from "in-crate call" (untouched),
+/// WITHOUT the visitor needing the local crate name.
 #[must_use]
 pub fn is_stdlib_namespace_path(p: &str) -> bool {
     p.starts_with("core::") || p.starts_with("std::") || p.starts_with("alloc::")
@@ -5154,6 +5165,15 @@ mod tests {
             "core::slice::<impl [T]>::swap",           // panicking slice method
             "std::char::methods::<impl char>::to_digit", // panicking
             "std::iter::Iterator::sum",                  // panicking
+            // Operator-trait methods (real rustc_public renderings, red-team
+            // 2026-06-14): NOT total — `Div`/`Rem` by zero, `Neg` of MIN,
+            // `Add`/`Sub`/`Mul` overflow all panic. Not on the allow-list, so
+            // they fail closed via the namespace gap.
+            "std::ops::Div::div",
+            "std::ops::Rem::rem",
+            "std::ops::Neg::neg",
+            "std::ops::Add::add",
+            "std::ops::Index::index", // panicking (caught by the slice/index matcher too)
         ];
         for p in denied {
             assert!(!is_trusted_total_library_call(p), "should NOT be allow-listed: {p}");
@@ -5164,7 +5184,17 @@ mod tests {
     /// reachability gates) — purely by the leading path segment.
     #[test]
     fn is_stdlib_namespace_path_classification() {
-        for p in ["core::mem::swap", "std::cmp::Ord::min", "alloc::vec::Vec::<T>::new"] {
+        for p in [
+            "core::mem::swap",
+            "std::cmp::Ord::min",
+            "alloc::vec::Vec::<T>::new",
+            // Trait-dispatched stdlib (real rustc_public renderings, red-team
+            // 2026-06-14): operator / index / iterator traits render PREFIXED
+            // (not `<u32 as …>`), so the namespace gate covers them.
+            "std::ops::Div::div",
+            "std::ops::Index::index",
+            "std::iter::Iterator::sum",
+        ] {
             assert!(is_stdlib_namespace_path(p), "should be a stdlib path: {p}");
         }
         for p in [
