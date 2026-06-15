@@ -1986,6 +1986,31 @@ the std form and now also matches. No shadow type changes.
   acted on from inference — and the refuted finding becomes a standing
   regression guard (if a toolchain bump ever changes the rendering to the
   leading-`<` form, that test fails loudly).
+- ✅ Whole-codebase deep audit — FOUR adversarial fronts, no false-discharge
+  path found (2026-06-14). Independent red-teams of (1) the VC→SMT *encoding*
+  (is a discharge a proof?), (2) precondition/`ensures` *assumptions* (vacuous
+  / injected discharge?), (3) *security & supply-chain* (verdict subversion /
+  code-exec / cert forgery), and (4) the core operator/cast/shift/index
+  *rule-obligations* each returned SOUND with zero HIGH findings. Highlights:
+  the SMT encoding is bitwidth/sign/polarity-exact and the multi-solver vote
+  dedups by name; assumptions are caught by a fail-closed consistency check
+  (positive-SAT-required) and never assumed at call sites; the security surface
+  is "unusually well-hardened" (no shell, allowlisted solvers, constant-time
+  HMAC, fail-closed config, `validate_assertion_form` at every splice); and the
+  adapter's MIR exhaustiveness was *empirically* confirmed by building the real
+  `rustc_public` path (Rust's exhaustive-match enforcement then proves no
+  dangerous variant is dropped). Three soundness-ADJACENT caveats (none a false
+  discharge) were disclosed rather than left silent — see SAFETY-MANUAL §3.7:
+  the PB054 index-bound SMT models 64-bit regardless of `target_pointer_width`
+  (sound over-approximation; native per-width modeling is tracked completeness
+  work); `#[requires("i < len")]` trusts `len` to equal the slice length (a
+  v0.2 spec-language limit — garbage-precondition-in, garbage-proof-out, stated
+  explicitly); and the two `=false` config flags widen the TCB by operator
+  choice. Hardening landed: config `#[serde(deny_unknown_fields)]` so a
+  typo'd/unsupported key (e.g. config-side `[verification.ensures]`, which is
+  not wired) fails LOUD instead of being silently defaulted (assumption-audit
+  L2) — pinned by `shipped_example_config_parses` + `unknown_config_field_is_
+  rejected`.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1993,7 +2018,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  330 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  332 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -2006,7 +2031,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 330 passing, 0 warnings, clippy clean
+# Stable: 332 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

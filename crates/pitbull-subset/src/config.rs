@@ -37,6 +37,7 @@ use std::path::PathBuf;
 /// Adding a field here without updating `pitbull.toml.example` is a
 /// documentation regression that CI catches.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubsetConfig {
     /// `[project]` section.
     pub project: ProjectSection,
@@ -58,6 +59,7 @@ pub struct SubsetConfig {
 }
 /// `[project]` — identity and toolchain pinning.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectSection {
     /// Crate name. Must match the verified `Cargo.toml`.
     pub name: String,
@@ -66,6 +68,7 @@ pub struct ProjectSection {
 }
 /// `[verification]` — solver policy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationSection {
     /// Per-VC timeout, seconds.
     #[serde(default = "default_vc_timeout")]
@@ -176,11 +179,22 @@ fn default_solvers() -> Vec<String> {
 }
 /// `[subset]` — PSS-1 enforcement knobs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubsetSection {
     /// PSS-1 PB020: per-local stack allocation limit, bytes.
     #[serde(default = "default_stack_limit")]
     pub stack_allocation_limit_bytes: u64,
     /// PSS-1 PB052: target pointer width, bits. Must be 16, 32, or 64.
+    ///
+    /// SCOPE (audit M, 2026-06-14): this width drives PB020 stack-size
+    /// estimation. The PB054 **index-bound** SMT encoding, however, currently
+    /// models indices/lengths at a fixed 64-bit width regardless of this
+    /// setting — a SOUND over-approximation (a 64-bit `unsat` implies `unsat`
+    /// at any narrower true width, since the narrower domain is a subset), so
+    /// no false discharge, but on a 16/32-bit target it may fail to discharge
+    /// a bound that is only provable using the narrower `usize` range. Native
+    /// per-width index modeling is tracked completeness work; see
+    /// `pitbull-vc/src/smt.rs::INDEX_SMT_BITS` and `docs/SAFETY-MANUAL.md` §3.
     #[serde(default = "default_pointer_width")]
     pub target_pointer_width: u8,
     /// PSS-1 PB048: panic strategy, must be `"abort"` in v0.1.
@@ -259,6 +273,7 @@ pub fn pb059_proc_macro_rejected(macro_crate: &str, is_local: bool, allowed: &[S
 }
 /// An explicitly trusted `build.rs` entry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedBuildScript {
     /// Crate that owns the `build.rs`.
     #[serde(rename = "crate")]
@@ -270,6 +285,7 @@ pub struct TrustedBuildScript {
 }
 /// `[reachability]` — call-graph roots and exclusions.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReachabilitySection {
     /// Item paths designated as verification roots. Glob-style with `*`
     /// trailing segment for "every item in this module."
@@ -281,6 +297,7 @@ pub struct ReachabilitySection {
 }
 /// `[reporting]` — where and how to emit results.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportingSection {
     /// Path for the SARIF report.
     #[serde(default = "default_sarif_path")]
@@ -306,6 +323,7 @@ fn default_certificate_dir() -> PathBuf { ".pitbull-cache/certs".into() }
 fn default_strict_replay() -> bool { true }
 /// `[cache]` — proof cache settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheSection {
     /// Whether the content-addressed proof cache is in use.
     #[serde(default = "default_cache_enabled")]
@@ -574,6 +592,54 @@ toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
         assert!(
             cfg.verification.preconditions.is_empty(),
             "missing table should default to empty map",
+        );
+    }
+    /// The shipped `pitbull.toml.example` must parse under the real loader —
+    /// pins the "every documented field maps one-to-one to a struct field"
+    /// invariant (the doc comment claims CI catches drift; this is that CI),
+    /// and guards the `deny_unknown_fields` hardening: a field documented in
+    /// the example but absent from the structs would now fail loudly.
+    #[test]
+    fn shipped_example_config_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("pitbull.toml.example");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let parsed: Result<SubsetConfig, _> = toml::from_str(&raw);
+        assert!(
+            parsed.is_ok(),
+            "pitbull.toml.example must parse under deny_unknown_fields; got {:?}",
+            parsed.err(),
+        );
+    }
+    /// `deny_unknown_fields` (assumption-audit L2, 2026-06-14): an unknown /
+    /// typo'd config key — or an unsupported section like
+    /// `[verification.ensures]` — must FAIL LOUD (a parse error), never be
+    /// silently ignored with the default (a "no silent skips" gap, since the
+    /// cert structs already deny unknown fields).
+    #[test]
+    fn unknown_config_field_is_rejected() {
+        // Typo'd safety flag.
+        let typo = "[project]\nname=\"d\"\ntoolchain=\"t\"\n\
+                    [verification]\nstrict_library_acceptanse = false\n";
+        assert!(
+            toml::from_str::<SubsetConfig>(typo).is_err(),
+            "a typo'd verification key must be rejected, not silently defaulted",
+        );
+        // Unsupported config-side ensures (only #[pitbull::ensures] attrs are wired).
+        let ensures = "[project]\nname=\"d\"\ntoolchain=\"t\"\n\
+                       [verification.ensures]\n\"demo::f\" = [\"x\"]\n";
+        assert!(
+            toml::from_str::<SubsetConfig>(ensures).is_err(),
+            "config-side [verification.ensures] is not wired; it must fail loud, not be ignored",
+        );
+        // An unknown top-level section.
+        let section = "[project]\nname=\"d\"\ntoolchain=\"t\"\n[bogus]\nx = 1\n";
+        assert!(
+            toml::from_str::<SubsetConfig>(section).is_err(),
+            "an unknown top-level section must be rejected",
         );
     }
     #[test]

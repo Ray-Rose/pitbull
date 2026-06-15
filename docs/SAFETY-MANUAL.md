@@ -211,6 +211,39 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
   cross-crate verdict. Registry/non-workspace deps stay on the trusted side
   (they are not workspace members, so the gate never demands their
   coverage).
+### 3.7 Soundness-adjacent caveats (2026-06-14 deep audit)
+A four-front adversarial audit (VC→SMT encoding, precondition/ensures
+assumptions, security/supply-chain, and core operator-rule obligations) found
+**no false-discharge path** anywhere in the TCB. It surfaced three things you
+should nonetheless know — none is a false discharge, each is disclosed here so
+the boundary is never *silent*:
+- **Index bounds are modeled at 64-bit regardless of `target_pointer_width`.**
+  The PB054 index-bound SMT encoding fixes index/length bit-vectors at 64 bits
+  (`pitbull-vc/src/smt.rs::INDEX_SMT_BITS`). This is a SOUND over-approximation
+  — a 64-bit `unsat` implies `unsat` at any narrower true width — so it never
+  yields a false `verified`; but on a 16/32-bit target it may *fail to
+  discharge* a bound that is only provable using the narrower `usize` range
+  (it errs toward rejection). `target_pointer_width` still drives PB020
+  stack-sizing. Native per-width index modeling is tracked completeness work.
+- **`#[requires("i < len")]` trusts `len` to be the slice's true length.** A
+  precondition that bounds an index — e.g. `i < len` discharging `s[i]` —
+  constrains a *free* length symbol; the v0.2 spec language cannot yet bind it
+  to `s.len()` for a specific slice (the visitor lacks the dataflow). So the
+  discharge is only as sound as the precondition: if you assert `i < len` but
+  `len` does not equal the indexed slice's actual length, you have authored a
+  false premise and Pitbull will (correctly, under that premise) discharge it.
+  Prefer indexing whose bound the verifier derives, or ensure your `len`
+  genuinely equals the slice length. This is the standard SPARK contract —
+  *garbage precondition in, garbage proof out* — stated explicitly.
+- **Two config flags widen the TCB by design.** `strict_library_acceptance =
+  false` reverts the prelude allow-list to trust-all-stdlib, and
+  `fail_on_coverage_gaps = false` downgrades coverage gaps to non-blocking
+  notes. Both are legitimate, version-controlled, *operator-authored* escape
+  hatches (they require write access to `pitbull.toml`, a reviewable file),
+  but a crate verified with either set to `false` carries a wider trusted base
+  than the defaults — treat such a verdict accordingly. The defaults are
+  fail-closed, and a typo'd or unsupported config key now fails LOUD
+  (`deny_unknown_fields`) rather than being silently ignored.
 ## 4. User obligations
 For the guarantee to hold:
 1. **Pin the toolchain** to one of `SUPPORTED_TOOLCHAINS`.
