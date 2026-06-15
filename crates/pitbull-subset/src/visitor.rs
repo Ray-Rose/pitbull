@@ -4663,6 +4663,58 @@ mod tests {
             span: Span::default(),
         }
     }
+    /// M1 fail-closed default (audit 2026-06-14): the visitor REJECTS on the
+    /// body's `is_unsafe` / `is_async` flags (PB002 / PB026). So the adapter
+    /// defaulting BOTH to `true` when a caller forgets to overwrite them from
+    /// `tcx` (`mir_api/adapter.rs::body`) yields a conservative reject, never
+    /// a silent accept of an `unsafe`/`async fn` — this is the stable-testable
+    /// proxy for that fail-closed net (the adapter itself is nightly-only).
+    #[test]
+    fn unsafe_async_body_flags_reject_fail_closed() {
+        use crate::mir_api::*;
+        let mk = |is_unsafe: bool, is_async: bool| Body {
+            def_id: DefId(0),
+            arg_tys: vec![],
+            arg_names: vec![],
+            return_ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
+            is_unsafe,
+            is_async,
+            locals: vec![],
+            blocks: vec![BasicBlockData {
+                statements: vec![],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        // is_unsafe = true (the adapter's fail-closed default) → PB002.
+        let mut v = SubsetVisitor::new(&cfg);
+        v.visit_body(&mk(true, false), false);
+        assert!(
+            v.into_report().errors.iter().any(|e| e.rule == rules::PB002),
+            "an is_unsafe body must reject PB002 (the M1 fail-closed default's effect)",
+        );
+        // is_async = true → PB026.
+        let mut v2 = SubsetVisitor::new(&cfg);
+        v2.visit_body(&mk(false, true), false);
+        assert!(
+            v2.into_report().errors.iter().any(|e| e.rule == rules::PB026),
+            "an is_async body must reject PB026",
+        );
+        // Both false (a safe, sync fn the wrapper has overwritten correctly) →
+        // neither rule fires.
+        let mut v3 = SubsetVisitor::new(&cfg);
+        v3.visit_body(&mk(false, false), false);
+        let r3 = v3.into_report();
+        assert!(
+            !r3.errors.iter().any(|e| e.rule == rules::PB002 || e.rule == rules::PB026),
+            "a safe sync body must not trip PB002/PB026; got {:?}",
+            r3.errors,
+        );
+    }
     /// PSS-1 PB043 default: a reachable call to
     /// `core::panicking::panic_fmt` is NOT rejected at the subset
     /// level; instead the visitor emits a `PanicReachability` VC

@@ -1941,6 +1941,28 @@ the std form and now also matches. No shadow type changes.
   `prelude_arm_fails_closed_on_untrusted_stdlib` unit tests, the e2e
   `prelude_flip_fails_closed_on_untrusted_stdlib_e2e`, and a prelude-gap guard
   added to the accept-corpus harness.
+- ✅ Adapter-boundary fail-closed defaults (TCB audit follow-ups M1 + M2,
+  2026-06-14). The 2026-06-14 TCB audit confirmed the trusted computing base
+  is solidly fail-closed except two MEDIUM, NON-AoRTE-class items at the
+  `rustc_public → shadow` adapter boundary, both now flipped fail-OPEN →
+  fail-CLOSED: **M1** — `adapter::body()` hardcoded `is_unsafe: false` /
+  `is_async: false` (the rustc_public MIR surface doesn't expose them); the
+  production wrapper overwrites both from `tcx` *immediately* after the call,
+  so PB002/PB026 fire correctly today, but the boundary DEFAULT was fail-open
+  (an alternate driver feeding `body()` straight to `visit_body` would miss an
+  `unsafe`/`async fn`). Defaulted to `true` ("assume unsafe/async until told
+  otherwise") so an un-overwritten body conservatively REJECTS (PB002/PB026)
+  instead of silently passing; pinned by the stable
+  `unsafe_async_body_flags_reject_fail_closed` visitor test (the adapter is
+  nightly-only). **M2** — the `[T; N]` array-count fallback
+  `eval_target_usize().unwrap_or(0)` fed an un-evaluable count as `0`, which
+  silently under-detected the PB020 stack-size limit. Confirmed the count
+  feeds ONLY `estimate_min_size` (PB020) — NOT indexing bounds, which use the
+  runtime length / a PB054 projection — so the change has ZERO AoRTE impact;
+  flipped to `unwrap_or(u64::MAX)` so an un-evaluable array is treated as
+  oversized and PB020 fires (the `Repeat`/array-literal count at adapter.rs is
+  unused by any rule and left as-is). Verified e2e: `unsafe fn` → PB002,
+  `[u8; 100_000_000]` → PB020, safe fn → exit 0; no corpus regression.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -1948,7 +1970,7 @@ the std form and now also matches. No shadow type changes.
   Creusot solve it by running tests inside `rustc_driver` callbacks
   rather than as standalone test binaries. The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
-  328 passing, 0 ignored — was 49 + 1 ignored in the v0.1
+  329 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR
   pre-pass, PB054 P / P.1 / P.2 work, the N3 + H-RT post-interruption
   red-team cleanup, the Q-series Option C expansion (Phase B
@@ -1961,7 +1983,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 328 passing, 0 warnings, clippy clean
+# Stable: 329 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

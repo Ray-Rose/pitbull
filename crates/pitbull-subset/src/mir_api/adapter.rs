@@ -215,12 +215,16 @@ fn rigid_ty(r: &rp::ty::RigidTy) -> shadow::RigidTy {
             path: "core::str".into(),
             is_union: false,
         }),
-        // Array: extract the count from the TyConst. If the count
-        // can't be evaluated (e.g., it's still symbolic), fall back to
-        // 0 — which means PB020 won't fire on it but no incorrect
-        // detection happens either.
+        // Array `[T; N]`: extract the count. It feeds ONLY `estimate_min_size`
+        // (PB020 stack-size; visitor.rs) — NOT indexing bounds, which use the
+        // runtime length / a PB054 projection — so the fallback cannot affect
+        // AoRTE soundness either way. If `N` can't be evaluated (e.g. still
+        // symbolic — rare post-mono), fall back to `u64::MAX` (audit M2,
+        // 2026-06-14): a FAIL-CLOSED default, so an un-evaluable array is
+        // treated as oversized and PB020 fires, rather than `0` (which
+        // silently under-detected the stack limit).
         rp::ty::RigidTy::Array(elem, count_const) => {
-            let count = count_const.eval_target_usize().unwrap_or(0);
+            let count = count_const.eval_target_usize().unwrap_or(u64::MAX);
             shadow::RigidTy::Array(Box::new(ty(*elem)), count)
         }
         // `Pat<T, P>` is a refinement of `T` for pattern types; treat
@@ -848,8 +852,18 @@ pub fn body(b: &rp::mir::Body) -> shadow::Body {
         arg_tys: b.arg_locals().iter().map(|ld| ty(ld.ty)).collect(),
         arg_names: extract_arg_names(b),
         return_ty: ty(b.ret_local().ty),
-        is_unsafe: false,
-        is_async: false,
+        // FAIL-CLOSED defaults (audit M1, 2026-06-14). The rustc_public MIR
+        // surface does not expose fn safety/asyncness, so the adapter cannot
+        // derive them here — the CALLER must overwrite BOTH with the values
+        // read from `tcx` (the production wrapper does so immediately after
+        // this call; see pitbull-rustc.rs). We default to `true` ("assume
+        // unsafe / async until told otherwise") so a caller that forgets the
+        // overwrite gets a conservative PB002/PB026 REJECT, never a silent
+        // accept of an `unsafe`/`async fn` — which would be a false discharge.
+        // (Previously `false`, a fail-OPEN whose soundness lived entirely in
+        // the caller remembering to patch it.)
+        is_unsafe: true,
+        is_async: true,
         locals: b
             .locals()
             .iter()
