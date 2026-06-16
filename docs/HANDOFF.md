@@ -365,7 +365,7 @@ constant-mask pin test; intermediate-symlink / Windows-junction path notes.
 |---|---|---|
 | Stable Rust | 1.78+ | For the shadow build and tests. `rustup toolchain install stable`. |
 | Nightly Rust | **`nightly-2026-01-29`** exactly | Required for the rustc-replacement wrapper. `rustup toolchain install nightly-2026-01-29 --component rustc-dev rust-src`. |
-| Z3 SMT solver | Any 4.x | Optional but recommended. Used by the VC dispatch loop. Without it, the wrapper reports VC obligations as "undischarged (no solver)" — pipeline still works. Install: `winget install Microsoft.Z3` on Windows, `apt install z3` on Debian/Ubuntu. |
+| Z3 + CVC5 SMT solvers | Z3 4.x, CVC5 1.x | Needed for discharge — the default gate is 2-of-2 over `[z3, cvc5]`. Without them, obligations report "undischarged (no solver)" (still sound, fail closed). **Installed on this machine 2026-06-15** (Z3 4.16.0 + CVC5 1.3.4 under `%USERPROFILE%\smt-tools`, on user PATH). Install via the official GitHub release zips (`Z3Prover/z3`, `cvc5/cvc5`) — NOTE `winget install Microsoft.Z3` does NOT exist; macOS `brew install z3 cvc5`; Debian `apt install z3` (+cvc5 from releases). See §5.1. |
 | Git Bash | Bundled with Git for Windows | All shell commands assume Git Bash on Windows; equivalent on Linux/macOS. |
 | Python 3 | Any 3.x | Used by one smoke-test script (inspecting SARIF JSON). Not required for the regular test suite. |
 
@@ -493,26 +493,36 @@ The v0.2 spec-context-narrowing arc — O.1 (raw SMT) → O.2
 first thing a fresh session should do is **verify the demo
 works end-to-end**, then choose from a menu of follow-ups.
 
-### Step 5.1 — Install Z3 (5 minutes)
+### Step 5.1 — Install Z3 + CVC5
 
-Z3 isn't required to build/test, but it IS required to
-observe the actual `unsat` discharge verdict on the headline
-demo. Without it, the wrapper reports "undischarged (no
-solver)" everywhere.
+The default agreement gate is **2-of-2 over `[z3, cvc5]`**, so BOTH are needed
+to observe an actual `unsat`→discharged verdict (without them the wrapper
+reports "undischarged (no solver)" everywhere — still sound, fail closed).
 
-```bash
-# Windows
-winget install Microsoft.Z3
+**Already installed on this machine (2026-06-15):** Z3 **4.16.0** + CVC5
+**1.3.4**, unzipped under `%USERPROFILE%\smt-tools\` and added to the user
+PATH — new shells get `z3` / `cvc5` directly.
 
-# macOS
-brew install z3
+Reinstall (Windows): **`winget install Microsoft.Z3` does NOT work** (no such
+winget package as of 2026-06). Use the official GitHub release zips —
+`z3-<ver>-x64-win.zip` from `Z3Prover/z3/releases` and
+`cvc5-Win64-x86_64-static.zip` from `cvc5/cvc5/releases` — unzip each and put
+its `bin/` on PATH (the release-asset URLs are resolvable via
+`https://api.github.com/repos/{Z3Prover/z3,cvc5/cvc5}/releases/latest`).
+macOS: `brew install z3 cvc5`. Debian/Ubuntu: `apt install z3` (+ cvc5 from
+the cvc5 releases). Verify: `z3 --version && cvc5 --version`.
 
-# Debian/Ubuntu
-sudo apt install z3
-
-# Verify
-z3 --version  # any 4.x version is fine
-```
+**VERIFIED 2026-06-15 (Track B — first real discharge on this machine):** with
+both solvers on PATH the headline demo discharges for real — `add_one` under
+`#[pitbull::requires("x < 100")]` →
+`discharged (unsat — safety property holds; 2-solver agreement) [z3=unsat
+cvc5=unsat]`, exit 0; the SAME fn with NO precondition is correctly REFUSED
+(`NOT DISCHARGED (sat — counterexample exists)`, exit 1). The full e2e + aorte
+suite passes WITH solvers under `PITBULL_REQUIRE_E2E=1` (so nothing skips). One
+test was fixed in the process — `mixed_width_const_shift_emits_obligation_not_silent_pass`:
+its exit-code guard matched the substring `"undischarged"` inside the
+`"0 undischarged"` summary and wrongly demanded exit 1 when the safe `x << 4`
+(4 < 32) legitimately discharges; it now branches on the per-obligation verdict.
 
 ### Step 5.2 — Run the headline demo end-to-end
 

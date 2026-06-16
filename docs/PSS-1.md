@@ -2063,6 +2063,20 @@ the std form and now also matches. No shadow type changes.
   (`PITBULL_TOML`/`PITBULL_CERT_KEY` env injection — the key path is
   read-amplification not a leak) are covered by the PB073 hermetic-build
   obligation. Pinned by `attests_full_verification_false_for_empty_bundle`.
+- ✅ Track B — first real discharge on this machine (2026-06-15). Installed Z3
+  4.16.0 + CVC5 1.3.4 (official GitHub release zips — `winget install
+  Microsoft.Z3` does NOT exist) and drove the full pipeline to a genuine
+  `unsat`→discharged: `add_one` under `#[pitbull::requires("x < 100")]` →
+  `discharged (2-solver agreement) [z3=unsat cvc5=unsat]`, exit 0; the same fn
+  with NO precondition is correctly REFUSED (`NOT DISCHARGED (sat)`, exit 1) —
+  the live gate discharges the provable and fails closed on the unprovable. The
+  full e2e + aorte suite passes WITH solvers under `PITBULL_REQUIRE_E2E=1` (the
+  differential AoRTE net and the 2-of-N capstone exercised for real, not
+  skipped). Fixed `mixed_width_const_shift_emits_obligation_not_silent_pass`:
+  its exit-code guard matched the substring `"undischarged"` inside the
+  `"0 undischarged"` VC summary and wrongly demanded exit 1 once the safe
+  `x << 4` (4 < 32) legitimately discharges — it now branches on the
+  per-obligation verdict, correct in both the solver and no-solver lanes.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is

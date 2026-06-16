@@ -2780,18 +2780,23 @@ fn mixed_width_const_shift_emits_obligation_not_silent_pass() {
         !stderr.to_lowercase().contains("mixed-width shift"),
         "the old mixed-width-skip audit note must be gone; stderr:\n{stderr}",
     );
-    // Fail-closed without a solver: an undischarged obligation must drive a
-    // nonzero exit — the OLD behavior was a silent exit 0 with only a note.
-    // (With z3+cvc5 installed it discharges and exits 0; both are correct —
-    // the regression being pinned is "no longer a silent exit-0 pass".)
-    if stderr.contains("undischarged") {
-        assert_eq!(
-            code,
-            Some(1),
-            "x << 4 with no solver must FAIL CLOSED (exit 1), not silently \
-             exit 0; stderr:\n{stderr}",
-        );
-    }
+    // The exit code must be CONSISTENT with the shl obligation's own verdict —
+    // the regression pinned is "no more silent exit-0 with the obligation
+    // skipped". With z3+cvc5 the safe `x << 4` (4 < 32, cannot over-shift)
+    // DISCHARGES → exit 0; without a solver it is undischarged and must FAIL
+    // CLOSED → exit 1. We branch on the PER-OBLIGATION verdict, NOT on the
+    // substring "undischarged" — the VC summary always contains "N
+    // undischarged" (e.g. "0 undischarged"), so the old guard wrongly demanded
+    // exit 1 even when everything discharged (caught 2026-06-15 once z3+cvc5
+    // were installed).
+    let shl_discharged = stderr.contains("(PB049): discharged");
+    assert_eq!(
+        code,
+        Some(if shl_discharged { 0 } else { 1 }),
+        "x << 4 exit must match its obligation verdict (discharged → 0, \
+         undischarged → 1) — never a silent exit-0 with the obligation \
+         unproven; stderr:\n{stderr}",
+    );
 }
 /// Variable mixed-width discharge (safe subset, 2026-06-14): `u32 << y:u8`
 /// with `requires(y < 32)` now BINDS the precondition to the amount (it was
