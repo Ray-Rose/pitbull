@@ -2011,6 +2011,40 @@ the std form and now also matches. No shadow type changes.
   not wired) fails LOUD instead of being silently defaulted (assumption-audit
   L2) — pinned by `shipped_example_config_parses` + `unknown_config_field_is_
   rejected`.
+- ✅ Deep re-audit + Track A packaging-layer hardening (2026-06-15). A fresh
+  five-front audit (a line-by-line read of the VC→SMT→`vote`→exit-code path plus
+  four parallel agents over visitor / adapter+reachability / predicate+config /
+  cert+subcommand) RE-CONFIRMED no false-discharge path in the proof core (SMT
+  polarity exact; `vote` / consistency-gate / exit-code fail-closed), but found a
+  real cluster of gaps in the ARTIFACT / AGGREGATION / PROVENANCE layer — where
+  the verdict is packaged for a third party — and closed them, all fail-closed:
+  (1) **Cert completeness (the keystone).** The bundle silently listed only
+  gate-reaching obligations with no denominator, so a clean replay of a PARTIAL
+  bundle read as "crate verified" (exit-0 outrunning proof at the artifact
+  level). `CertificateBundle` now carries `total_obligations` + `uncertified[]`
+  (`CERT_FORMAT_VERSION` → 2); the wrapper records every pending /
+  consistency-refused / consistency-unconfirmed obligation; `from_json` rejects a
+  ledger that doesn't add up; `cargo pitbull replay` exit-0 now requires
+  `attests_full_verification` (ledger consistent + nothing uncertified + all
+  discharged) AND zero reproduction mismatches. Pinned by 6 cert unit tests + a
+  pure `replay_exit_code`.
+  (2) **`ReachabilityDriver` de-trapped.** Its `None`-body arm did a silent
+  `continue` (a latent false discharge had the test-only reference driver ever
+  been wired to production) and the doc mis-advertised it "COMPLETE". Now records
+  a CoverageGap; the doc states it is a test-only reference still missing the
+  drop-glue + cross-crate gates the wrapper has. Pinned by
+  `unavailable_body_is_coverage_gap_not_silent_skip`.
+  (3) **Provenance/aggregation:** strict signing `PITBULL_REQUIRE_SIGNED` (pure
+  `signing_policy_ok`); `cargo pitbull check --strict` fails closed on warm-cache
+  INDETERMINATE cross-crate coverage; exit-2 fidelity (`check_exit_code`)
+  separates "could-not-run" from "not-verified".
+  (4) **F7 (a build.rs setting `PITBULL_TOML`) was already mitigated** —
+  `load_config` applies `check_env_path`; the residual (a well-formed absolute
+  `.toml`) is inherent to env-config and covered by the PB073 hermetic-build
+  obligation (the audit agent overstated this; verified against source). No code
+  change; disclosed in SAFETY-MANUAL §3.8. +10 tests (332→342). REMAINING (P2,
+  LOW): `Rvalue::Repeat` inert-count comment; `capture_shift_amount`
+  constant-mask pin test; intermediate-symlink / Windows-junction path notes.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -2031,7 +2065,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 332 passing, 0 warnings, clippy clean
+# Stable: 342 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

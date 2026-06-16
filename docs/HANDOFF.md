@@ -23,7 +23,7 @@ repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 332 tests passing (189 subset-lib + 70 vc + 54 integration + 11 aorte_proofs + 8 driver-bin),
+- **State:** 342 tests passing (190 subset-lib + 76 vc + 54 integration + 11 aorte_proofs + 11 driver-bin),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -158,14 +158,16 @@ d3682f6 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **332 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **342 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The **332** breaks down: 1 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 189
-(subset lib) + 54 (integration) + 11 (aorte_proofs) + 70 (vc) = 332. This supersedes the long
+The **342** breaks down: 4 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 190
+(subset lib) + 54 (integration) + 11 (aorte_proofs) + 76 (vc) = 342 (the
+2026-06-15 re-audit added +10 over the prior 332; see the dated subsection at
+the end of §1). This supersedes the long
 Task-S-era narration that previously lived here (which still said "226" while
 the table said 277 — a drift caught and corrected in the 2026-06-14 deep
 audit). The lineage to today's number: the multi-solver agreement gate (Task
@@ -205,6 +207,46 @@ could not run with no compensating obligation now folds into the exit code
 (fail closed, gated on `verification.fail_on_coverage_gaps`, default true), so
 exit 0 can't mean "verified except the parts I couldn't model". See
 `docs/PSS-1.md` §17.1 for the per-fix detail.
+
+### 2026-06-15 deep re-audit + Track A hardening (this session)
+
+A fresh whole-codebase audit (five independent fronts: a line-by-line read of
+the VC→SMT→`vote`→exit-code path plus four parallel agents over visitor,
+adapter+reachability, predicate+config, and cert+subcommand) **re-confirmed the
+core soundness claim** — no false-discharge path in the proof core; SMT polarity
+exact; `vote` / consistency-gate / wrapper exit-code all fail-closed. The prior
+capstone's "zero findings" framing did NOT survive, though: a real cluster of
+gaps sat in the **artifact + aggregation + provenance layer** (not the proof
+core). Fixed this session, all fail-closed, none changing what discharges:
+
+- **Certificate is now a COMPLETE coverage ledger** (was: silently only the
+  discharged subset — the F3 finding, the one place exit-0 could outrun proof at
+  the artifact level). `CertificateBundle` gained `total_obligations` +
+  `uncertified[]` (`CERT_FORMAT_VERSION` → **2**); the wrapper records every
+  pending / consistency-refused / consistency-unconfirmed obligation;
+  `from_json` rejects a ledger that doesn't add up; `cargo pitbull replay`
+  exit-0 now requires `attests_full_verification`, so a clean replay of a
+  partial bundle no longer implies "crate verified".
+- **`ReachabilityDriver` de-trapped.** Its `None`-body arm records a CoverageGap
+  (was a silent `continue`); the doc no longer mis-advertises it as a
+  production-ready "COMPLETE" walk (it is a test-only reference still missing the
+  drop-glue + cross-crate gates the wrapper has).
+- **`cargo pitbull replay` strict signing** (`PITBULL_REQUIRE_SIGNED`): an
+  unsigned / unverifiable certificate fails closed (exit 2).
+- **`cargo pitbull check --strict`** fails closed on warm-cache INDETERMINATE
+  cross-crate coverage (was a note); **exit-2 fidelity** now distinguishes
+  "could-not-run" (exit 2) from "found problems" (exit 1).
+- **F7 (a build.rs overriding `PITBULL_TOML`) was already mitigated** —
+  `load_config` applies `check_env_path` (traversal/extension/symlink) to the
+  env value; the residual (a well-formed absolute permissive `.toml`) is
+  inherent to env-config and is covered by the PB073 hermetic-build obligation.
+  No code change (the audit agent overstated this one — verified against source).
+
+Pure soundness-decision helpers added (mirroring `decide_pitbull_exit_code`):
+`replay_exit_code`, `signing_policy_ok`, `check_exit_code` — all unit-tested.
+Remaining (P2, LOW, deferred): `Rvalue::Repeat` inert-count comment;
+`capture_shift_amount` constant-mask pin test; intermediate-symlink /
+Windows-junction path notes.
 
 ---
 

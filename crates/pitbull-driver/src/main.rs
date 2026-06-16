@@ -61,7 +61,15 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Run PSS-1 subset enforcement.
-    Check,
+    Check {
+        /// Fail closed if any workspace crate was served from a warm cargo
+        /// cache and not re-analyzed this run (its cross-crate coverage would
+        /// otherwise be reported INDETERMINATE rather than failing). Use in
+        /// CI / qualification — after `cargo clean` — for a complete
+        /// whole-workspace verdict (2026-06-15 deep audit, F4).
+        #[arg(long)]
+        strict: bool,
+    },
     /// Run the full pipeline (subset + translation + SMT). Stub in v0.1.
     Verify,
     /// Re-execute a committed proof certificate: re-run each recorded
@@ -90,13 +98,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
     // path without partially moving `cli` (the run_* helpers take
     // `&cli`).
     match &cli.cmd {
-        Cmd::Check => run_check(&cli),
+        Cmd::Check { strict } => run_check(&cli, *strict),
         Cmd::Verify => run_verify_stub(&cli),
         Cmd::Replay { cert } => run_replay(&cli, cert),
         Cmd::Rules => run_rules(&cli),
     }
 }
-fn run_check(cli: &Cli) -> Result<ExitCode> {
+fn run_check(cli: &Cli, strict: bool) -> Result<ExitCode> {
     let cfg_path = cli.config.clone().unwrap_or_else(|| PathBuf::from("pitbull.toml"));
     let outcome = pitbull_subset::SubsetConfig::load_and_validate(&cfg_path)
         .with_context(|| format!("loading {}", cfg_path.display()))?;
@@ -159,17 +167,48 @@ fn run_check(cli: &Cli) -> Result<ExitCode> {
     // is best-effort: if cargo metadata or the manifests can't be read we
     // warn and fall back to the per-crate verdict (cargo's exit status),
     // never silently claiming a stronger guarantee than we verified.
-    let cross_crate_failed = run_cross_crate_gate(&manifest_dir);
+    // Read the manifests ONCE (before the dir is removed): their presence is
+    // also the signal for "did analysis actually run this invocation?" (F5).
+    let manifests = read_manifests(&manifest_dir);
+    let manifests_present = !manifests.is_empty();
+    let cross_crate_failed = run_cross_crate_gate(&manifests, strict);
     let _ = std::fs::remove_dir_all(&manifest_dir);
-    if status.success() && !cross_crate_failed {
-        eprintln!("pitbull check: configuration OK; analysis pass exited cleanly");
-        Ok(ExitCode::from(0))
+    // Exit-code fidelity (2026-06-15 deep audit, F5): distinguish
+    // "could-not-run" (exit 2) from "found problems" (exit 1). The historic
+    // code collapsed every non-success to 1, so a stable build with no
+    // nightly wrapper (analysis never ran) looked identical to "violations
+    // found". If cargo failed AND no crate emitted a reachability manifest,
+    // the analysis pass did not run — surface that as exit 2.
+    let code = check_exit_code(status.success(), cross_crate_failed, manifests_present);
+    match code {
+        0 => eprintln!("pitbull check: configuration OK; analysis pass exited cleanly"),
+        2 => eprintln!(
+            "pitbull check: COULD NOT RUN (exit 2) — cargo failed and no crate emitted a \
+             reachability manifest, so the Pitbull analysis pass did not run. The nightly \
+             `pitbull-rustc` wrapper is probably not active (stable build = stub) or it \
+             failed before analysis. This is NOT a clean verification; see HANDOFF §3-4 to \
+             enable the wrapper.",
+        ),
+        _ => eprintln!(
+            "pitbull check: NOT VERIFIED (exit 1) — subset violations, undischarged \
+             obligations, or a cross-crate reachability gap.",
+        ),
+    }
+    Ok(ExitCode::from(code))
+}
+/// Pure exit decision for `cargo pitbull check` (2026-06-15 deep audit, F5).
+/// Distinguishes the three CI-relevant outcomes instead of collapsing every
+/// non-success to 1: `0` clean, `2` could-not-run (cargo failed AND no
+/// manifest was emitted — the analysis pass never ran), else `1` not-verified
+/// (violations / undischarged / a cross-crate gap, incl. `--strict`'s
+/// cache-incomplete coverage). Pure so the decision is unit-testable.
+fn check_exit_code(cargo_success: bool, cross_crate_failed: bool, manifests_present: bool) -> u8 {
+    if cargo_success && !cross_crate_failed {
+        0
+    } else if !cargo_success && !manifests_present {
+        2
     } else {
-        // Exit code 1 = subset violations / analysis failures / a
-        // cross-crate reachability gap. Exit code 2+ = wrapper not yet
-        // active (stub mode), or compile failure unrelated to Pitbull. We
-        // don't currently distinguish these at the subcommand boundary.
-        Ok(ExitCode::from(1))
+        1
     }
 }
 /// Read every per-crate reachability manifest, resolve the workspace member
@@ -182,7 +221,10 @@ fn run_check(cli: &Cli) -> Result<ExitCode> {
 /// and returns `false` — the per-crate gates already ran inside the wrapper
 /// and contribute to cargo's exit status; this layer only ADDS the
 /// cross-crate check on top.
-fn run_cross_crate_gate(manifest_dir: &Path) -> bool {
+fn run_cross_crate_gate(
+    manifests: &[pitbull_subset::reachability::ReachManifest],
+    strict: bool,
+) -> bool {
     let workspace = match workspace_crate_names() {
         Ok(w) => w,
         Err(e) => {
@@ -193,15 +235,14 @@ fn run_cross_crate_gate(manifest_dir: &Path) -> bool {
             return false;
         }
     };
-    let manifests = read_manifests(manifest_dir);
     if manifests.is_empty() {
         // No manifests: the nightly wrapper isn't active (stable stub), or
         // cargo served everything from cache. Nothing to aggregate.
         return false;
     }
-    let unverified = pitbull_subset::reachability::cross_crate_unverified(&manifests, &workspace);
+    let unverified = pitbull_subset::reachability::cross_crate_unverified(manifests, &workspace);
     let indeterminate =
-        pitbull_subset::reachability::cross_crate_indeterminate(&manifests, &workspace);
+        pitbull_subset::reachability::cross_crate_indeterminate(manifests, &workspace);
     for callee in &unverified {
         eprintln!(
             "pitbull check: CROSS-CRATE: workspace function `{callee}` is reachable from a \
@@ -212,15 +253,30 @@ fn run_cross_crate_gate(manifest_dir: &Path) -> bool {
         );
     }
     if !indeterminate.is_empty() {
-        eprintln!(
-            "pitbull check: note: {} cross-crate callee(s) had INDETERMINATE coverage — their \
-             crate was served from a warm cargo cache and not re-analyzed this run, so the \
-             cross-crate verdict is incomplete. Run a clean build (e.g. `cargo clean`) for a \
-             complete whole-workspace cross-crate check.",
-            indeterminate.len(),
-        );
+        if strict {
+            // F4: --strict turns warm-cache incompleteness into a hard failure.
+            // cargo's freshness fingerprint does NOT include pitbull.toml or the
+            // solver set, so a cached crate is silently NOT re-analyzed; a
+            // qualification run must reject that rather than note it.
+            eprintln!(
+                "pitbull check: STRICT FAIL: {} cross-crate callee(s) had INDETERMINATE \
+                 coverage — their crate was served from a warm cargo cache and not \
+                 re-analyzed this run, so the whole-workspace verdict is incomplete. \
+                 `--strict` requires a complete run: `cargo clean` then re-run. \
+                 Failing closed.",
+                indeterminate.len(),
+            );
+        } else {
+            eprintln!(
+                "pitbull check: note: {} cross-crate callee(s) had INDETERMINATE coverage — \
+                 their crate was served from a warm cargo cache and not re-analyzed this \
+                 run, so the cross-crate verdict is incomplete. Run a clean build (e.g. \
+                 `cargo clean`), or use `--strict` to fail closed on this.",
+                indeterminate.len(),
+            );
+        }
     }
-    !unverified.is_empty()
+    !unverified.is_empty() || (strict && !indeterminate.is_empty())
 }
 /// Resolve the set of workspace-member crate names (as they appear in
 /// fully-qualified item paths: the package/target name with `-` normalized
@@ -319,7 +375,7 @@ fn locate_wrapper() -> Result<PathBuf> {
 fn run_verify_stub(cli: &Cli) -> Result<ExitCode> {
     eprintln!("pitbull verify: v0.1 ships subset checking only; running `check` instead.");
     eprintln!("pitbull verify: translation + SMT dispatch land in v0.2.");
-    run_check(cli)
+    run_check(cli, false)
 }
 /// Re-execute a proof certificate. Reads the bundle, rebuilds the
 /// solver pool from the bundle's recorded solver names, re-runs each
@@ -364,52 +420,82 @@ fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
     // code cannot be fooled by a swapped-in empty (but well-formed)
     // certificate, or by a producer that emitted zero obligations
     // (audit 2026-05-29).
-    if bundle.obligations.is_empty() {
+    if bundle.obligations.is_empty() && bundle.uncertified.is_empty() {
         anyhow::bail!(
             "certificate contains 0 obligations — nothing to replay; refusing to report \
              success for an empty certificate",
         );
     }
-    // Integrity check (Task T.3). If PITBULL_CERT_KEY is set, verify the
-    // HMAC-SHA256 signature and REFUSE (fail closed, exit 2) on a
-    // tampered/invalid signature — before running any solver. If the
-    // key is set but the cert is unsigned, or a key is absent, warn:
-    // re-run still confirms reproduction, but tampering is undetectable
-    // without the key.
-    match std::env::var_os("PITBULL_CERT_KEY") {
-        Some(keypath) => {
-            let key = pitbull_vc::cert::read_key_file(std::path::Path::new(&keypath))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if key.len() < pitbull_vc::cert::MIN_RECOMMENDED_KEY_BYTES {
-                eprintln!(
-                    "pitbull replay: WARNING: PITBULL_CERT_KEY is short ({} bytes); a weak \
-                     key provides little tamper-resistance.",
-                    key.len(),
-                );
-            }
-            match bundle.verify_signature(&key) {
-                pitbull_vc::cert::SignatureStatus::Valid => {
-                    eprintln!("pitbull replay: signature OK (HMAC-SHA256 verified).");
-                }
-                pitbull_vc::cert::SignatureStatus::Unsigned => {
+    // Coverage ledger (2026-06-15 deep audit, F3): make partial coverage
+    // VISIBLE so a consumer can't mistake "the listed certs reproduced" for
+    // "the crate verified". `total_obligations` is the denominator;
+    // `uncertified` are obligations that never reached the gate (pending /
+    // consistency-refused / consistency-unconfirmed).
+    let certified_discharged = bundle
+        .obligations
+        .iter()
+        .filter(|o| o.is_discharged())
+        .count();
+    let certified_other = bundle.obligations.len() - certified_discharged;
+    eprintln!(
+        "pitbull replay: coverage — {} total obligation(s): {} discharged, {} \
+         certified-but-undischarged, {} uncertified.",
+        bundle.total_obligations,
+        certified_discharged,
+        certified_other,
+        bundle.uncertified.len(),
+    );
+    for u in &bundle.uncertified {
+        eprintln!("  UNCERTIFIED {} ({}): {}", u.id, u.rule, u.status);
+    }
+    // Integrity check (Task T.3) + strict-signing policy (2026-06-15 deep
+    // audit, F1/F2). If PITBULL_CERT_KEY is set, verify the HMAC-SHA256
+    // signature; an INVALID signature always fails closed (exit 2) before any
+    // solver runs. PITBULL_REQUIRE_SIGNED additionally makes a *verified*
+    // signature MANDATORY: an unsigned bundle, or a missing key, also fails
+    // closed — so a CI `replay` step that forgets the key cannot silently
+    // downgrade to unauthenticated replay. Without the strict flag the
+    // historic warn-and-continue behavior holds for the unsigned/no-key cases.
+    let require_signed = std::env::var_os("PITBULL_REQUIRE_SIGNED").is_some();
+    let sig_status: Option<pitbull_vc::cert::SignatureStatus> =
+        match std::env::var_os("PITBULL_CERT_KEY") {
+            Some(keypath) => {
+                let key = pitbull_vc::cert::read_key_file(std::path::Path::new(&keypath))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if key.len() < pitbull_vc::cert::MIN_RECOMMENDED_KEY_BYTES {
                     eprintln!(
-                        "pitbull replay: WARNING: certificate is UNSIGNED; re-run confirms \
-                         reproduction but tampering is not detectable.",
+                        "pitbull replay: WARNING: PITBULL_CERT_KEY is short ({} bytes); a weak \
+                         key provides little tamper-resistance.",
+                        key.len(),
                     );
                 }
-                pitbull_vc::cert::SignatureStatus::Invalid => {
-                    anyhow::bail!(
-                        "certificate signature is INVALID (tampered, or signed with a \
-                         different key) — refusing to replay",
-                    );
-                }
+                Some(bundle.verify_signature(&key))
             }
+            None => None,
+        };
+    match sig_status {
+        Some(pitbull_vc::cert::SignatureStatus::Valid) => {
+            eprintln!("pitbull replay: signature OK (HMAC-SHA256 verified).");
+        }
+        Some(pitbull_vc::cert::SignatureStatus::Unsigned) => {
+            eprintln!(
+                "pitbull replay: WARNING: certificate is UNSIGNED; re-run confirms \
+                 reproduction but tampering is not detectable.",
+            );
+        }
+        Some(pitbull_vc::cert::SignatureStatus::Invalid) => {
+            // A present-but-bad signature always fails closed, strict or not.
+            anyhow::bail!(
+                "certificate signature is INVALID (tampered, or signed with a \
+                 different key) — refusing to replay",
+            );
         }
         None => {
             if bundle.is_signed() {
                 eprintln!(
                     "pitbull replay: WARNING: certificate is SIGNED but no PITBULL_CERT_KEY \
-                     was provided — cannot verify integrity; re-running anyway.",
+                     was provided — cannot verify integrity{}.",
+                    if require_signed { "" } else { "; re-running anyway" },
                 );
             } else {
                 eprintln!(
@@ -419,6 +505,13 @@ fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
                 );
             }
         }
+    }
+    if !signing_policy_ok(require_signed, sig_status) {
+        anyhow::bail!(
+            "PITBULL_REQUIRE_SIGNED is set but this certificate is not backed by a \
+             verified signature (it needs PITBULL_CERT_KEY set AND a signature that \
+             verifies under it) — refusing to replay",
+        );
     }
     // Rebuild the solver pool from the bundle's recorded names. Replay
     // reproduces the ORIGINAL decision, so we use the recorded pool and
@@ -480,20 +573,85 @@ fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
          SMT matches its named obligation (that binding is signing, Task T.3); a clean \
          replay is not itself a safety claim.",
     );
-    if mismatches == 0 {
+    // Completeness gate (2026-06-15 deep audit, F3): a clean replay (exit 0)
+    // must imply the CRATE verified, not merely that the listed certs
+    // reproduce. So exit 0 requires BOTH zero mismatches AND that the bundle
+    // attests full verification — its ledger adds up, nothing was left
+    // uncertified, and every certificate discharged. A bundle that records
+    // pending / refused / non-discharged obligations represents a crate that
+    // did NOT fully verify; replay reports that and fails closed, even when
+    // every recorded verdict reproduced.
+    let fully = bundle.attests_full_verification();
+    let code = replay_exit_code(mismatches, fully);
+    if code == 0 {
         eprintln!(
-            "pitbull replay: OK — all {} obligation(s) reproduced their recorded verdict.",
+            "pitbull replay: OK — all {} obligation(s) reproduced their recorded verdict \
+             AND the bundle attests full verification ({} obligation(s), all discharged).",
             outcomes.len(),
+            bundle.total_obligations,
         );
-        Ok(ExitCode::from(0))
-    } else {
+    } else if mismatches > 0 {
         eprintln!(
             "pitbull replay: FAILED — {mismatches} of {} obligation(s) did NOT reproduce \
              (solver drift/version skew, a missing solver, a timeout-budget change, or a \
              tampered certificate). Treat the affected proofs as UNVERIFIED.",
             outcomes.len(),
         );
-        Ok(ExitCode::from(1))
+    } else {
+        // Every recorded verdict reproduced, but the bundle does NOT attest a
+        // fully-verified crate. Fail closed: reproduction is not a safety claim.
+        eprintln!(
+            "pitbull replay: INCOMPLETE — every recorded verdict reproduced, but this \
+             certificate does NOT attest a fully-verified crate: {certified_discharged} \
+             discharged, {certified_other} certified-but-undischarged, {} uncertified, of \
+             {} total obligation(s){}. A clean replay here is reproduction, not a safety \
+             claim — failing closed.",
+            bundle.uncertified.len(),
+            bundle.total_obligations,
+            if bundle.total_obligations == 0 {
+                " (legacy v1 certificate without a coverage ledger; re-run `cargo pitbull \
+                 check` with the current tool for a complete certificate)"
+            } else {
+                ""
+            },
+        );
+    }
+    Ok(ExitCode::from(code))
+}
+/// Pure replay exit decision (2026-06-15 deep audit, F3). A clean replay
+/// (exit 0) requires BOTH that every recorded verdict reproduced
+/// (`mismatches == 0`) AND that the bundle attests full verification
+/// (`attests_full`: ledger consistent, nothing uncertified, all discharged).
+/// Otherwise fail closed (exit 1): reproduction alone is not a safety claim,
+/// and a bundle with uncertified/undischarged obligations represents a crate
+/// that did not fully verify. Pure so the soundness-relevant decision is
+/// unit-testable, mirroring the wrapper's `decide_pitbull_exit_code`.
+/// (Load failures, an empty bundle, and an invalid signature fail closed
+/// earlier with exit 2, before replay reaches this decision.)
+fn replay_exit_code(mismatches: usize, attests_full: bool) -> u8 {
+    if mismatches == 0 && attests_full {
+        0
+    } else {
+        1
+    }
+}
+/// Whether replay may proceed under the strict-signing policy (2026-06-15
+/// deep audit, F1/F2). `status` is the signature verification result when a
+/// key was provided, or `None` when no key was available to verify with.
+/// Under `require_signed`, only a verified (`Valid`) signature proceeds —
+/// unsigned, unverifiable (no key), or invalid all fail closed. Without it,
+/// everything proceeds EXCEPT a present-but-`Invalid` signature, which always
+/// fails closed. Pure for unit-testing.
+fn signing_policy_ok(
+    require_signed: bool,
+    status: Option<pitbull_vc::cert::SignatureStatus>,
+) -> bool {
+    use pitbull_vc::cert::SignatureStatus;
+    match (require_signed, status) {
+        (true, Some(SignatureStatus::Valid)) => true,
+        (true, _) => false, // strict: a verified signature is mandatory
+        (false, Some(SignatureStatus::Invalid)) => false, // a bad sig never passes
+        (false, _) => true, // lax: unsigned / unverified / valid all proceed
     }
 }
 fn run_rules(cli: &Cli) -> Result<ExitCode> {
@@ -519,5 +677,50 @@ mod tests {
     #[test]
     fn cli_parses() {
         Cli::command().debug_assert();
+    }
+    /// F3 completeness gate: a clean replay (exit 0) requires BOTH no
+    /// mismatches AND full-verification attestation. Reproduction alone, or
+    /// full coverage with a mismatch, must fail closed (exit 1).
+    #[test]
+    fn replay_exit_code_requires_reproduction_and_completeness() {
+        assert_eq!(replay_exit_code(0, true), 0, "reproduced + complete → ok");
+        assert_eq!(replay_exit_code(1, true), 1, "a mismatch fails even if complete");
+        assert_eq!(
+            replay_exit_code(0, false), 1,
+            "reproduced but INCOMPLETE coverage must fail closed (the F3 fix)",
+        );
+        assert_eq!(replay_exit_code(3, false), 1);
+    }
+    /// F1/F2 strict signing: under `PITBULL_REQUIRE_SIGNED` only a verified
+    /// signature proceeds; without it, everything proceeds except a
+    /// present-but-invalid signature.
+    #[test]
+    fn signing_policy_strict_requires_valid_signature() {
+        use pitbull_vc::cert::SignatureStatus::{Invalid, Unsigned, Valid};
+        // Strict: only a verified signature passes.
+        assert!(signing_policy_ok(true, Some(Valid)));
+        assert!(!signing_policy_ok(true, Some(Unsigned)));
+        assert!(!signing_policy_ok(true, Some(Invalid)));
+        assert!(!signing_policy_ok(true, None), "strict + no key must fail closed");
+        // Lax: proceed unless the signature is present-but-invalid.
+        assert!(signing_policy_ok(false, Some(Valid)));
+        assert!(signing_policy_ok(false, Some(Unsigned)));
+        assert!(signing_policy_ok(false, None));
+        assert!(!signing_policy_ok(false, Some(Invalid)), "a bad sig always fails");
+    }
+    /// F5 exit fidelity: `check` distinguishes could-not-run (2) from
+    /// not-verified (1) and clean (0), instead of collapsing all non-success
+    /// to 1.
+    #[test]
+    fn check_exit_code_distinguishes_couldnt_run_from_violations() {
+        // Clean: cargo ok, no cross-crate failure (manifest presence moot).
+        assert_eq!(check_exit_code(true, false, true), 0);
+        assert_eq!(check_exit_code(true, false, false), 0);
+        // A cross-crate gap even on a clean cargo build → not verified.
+        assert_eq!(check_exit_code(true, true, true), 1);
+        // cargo failed but analysis ran (manifests present) → violations.
+        assert_eq!(check_exit_code(false, false, true), 1);
+        // cargo failed AND no manifest emitted → analysis could not run.
+        assert_eq!(check_exit_code(false, false, false), 2);
     }
 }

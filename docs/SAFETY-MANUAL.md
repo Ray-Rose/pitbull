@@ -244,6 +244,36 @@ the boundary is never *silent*:
   than the defaults — treat such a verdict accordingly. The defaults are
   fail-closed, and a typo'd or unsupported config key now fails LOUD
   (`deny_unknown_fields`) rather than being silently ignored.
+### 3.8 Certificate completeness + provenance (2026-06-15 deep audit)
+A second whole-codebase re-audit re-confirmed there is no false-discharge path
+in the proof core, and hardened the **artifact / aggregation / provenance**
+layer — where Pitbull's verdict is packaged for a third party to trust:
+- **The proof certificate is a COMPLETE coverage ledger.** A bundle records
+  `total_obligations` and an `uncertified` list (pending / consistency-refused /
+  consistency-unconfirmed obligations), not only the discharged ones. It attests
+  full verification only when the ledger adds up, nothing is uncertified, and
+  every certificate discharged. `cargo pitbull replay` exits 0 ONLY when every
+  recorded verdict reproduces AND the bundle attests full verification — a clean
+  replay of a *partial* bundle is no longer mistakable for "the crate verified".
+  A legacy (pre-ledger) certificate is accepted for reproduction-checking but
+  cannot attest full verification (fail closed).
+- **Strict signing.** `PITBULL_REQUIRE_SIGNED` makes a verified HMAC-SHA256
+  signature mandatory at replay: an unsigned bundle, a missing key, or an
+  invalid signature all fail closed. Without it, an invalid signature still
+  fails closed; an unsigned bundle warns and replays (reproduction only).
+- **Cross-crate strictness + exit fidelity.** `cargo pitbull check --strict`
+  fails closed when a workspace crate was served from a warm cargo cache and not
+  re-analyzed this run — cargo's freshness fingerprint excludes `pitbull.toml`
+  and the solver set, so cached crates are silently not re-checked (run `cargo
+  clean` first for a complete verdict). `check` also now reports exit 2
+  ("verification could not run") distinctly from exit 1 ("not verified").
+- **`PITBULL_TOML` integrity.** The wrapper validates an env-supplied
+  `PITBULL_TOML` (path-traversal / extension / symlink) and exits 2 on a
+  violation. The residual — a hostile dependency `build.rs` pointing it at a
+  well-formed permissive `.toml` it wrote — is inherent to env-based config and
+  is covered by the §4 hermetic-environment obligation (PB073). Env config is
+  build.rs-forgeable by design, so treat a non-hermetic build's verdict
+  accordingly.
 ## 4. User obligations
 For the guarantee to hold:
 1. **Pin the toolchain** to one of `SUPPORTED_TOOLCHAINS`.
