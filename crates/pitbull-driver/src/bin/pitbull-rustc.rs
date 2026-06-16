@@ -1077,6 +1077,28 @@ impl PitbullCallbacks {
                             ),
                         }
                     }
+                    // Ed25519 asymmetric signing (frontier #2, 2026-06-16).
+                    // PITBULL_CERT_ED25519_KEY is a path to a 32-byte Ed25519
+                    // private seed; the matching PUBLIC key verifies the cert at
+                    // replay WITHOUT the secret (cross-domain non-repudiation).
+                    // Independent of the HMAC above — a bundle may carry both.
+                    // Best-effort: warn, never abort.
+                    if let Some(keypath) = std::env::var_os("PITBULL_CERT_ED25519_KEY") {
+                        match pitbull_vc::cert::read_ed25519_key_file(std::path::Path::new(&keypath)) {
+                            Ok(seed) => match bundle.sign_ed25519(&seed) {
+                                Ok(()) => {
+                                    eprintln!("pitbull-rustc: certificate signed (Ed25519).");
+                                }
+                                Err(e) => eprintln!(
+                                    "pitbull-rustc: WARNING: Ed25519 signing failed ({e}); \
+                                     certificate not Ed25519-signed.",
+                                ),
+                            },
+                            Err(e) => eprintln!(
+                                "pitbull-rustc: WARNING: {e}; certificate not Ed25519-signed.",
+                            ),
+                        }
+                    }
                     match bundle.to_json() {
                         Ok(text) => match std::fs::write(&out_path, text) {
                             Ok(()) => eprintln!(

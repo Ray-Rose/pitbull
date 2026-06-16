@@ -33,10 +33,14 @@
 //!   `PITBULL_CERT_OUT`; `cargo pitbull replay` re-runs each recorded SMT and
 //!   confirms BOTH reproduction AND full-verification coverage (`replay`
 //!   exit-0 requires `attests_full_verification`).
-//! - **Still future:** cross-DOMAIN non-repudiation needs an ASYMMETRIC layer
-//!   (Ed25519). HMAC is symmetric — it proves integrity within a trust domain,
-//!   but a holder of the key could re-sign a forged bundle. That asymmetric
-//!   layer is the remaining provenance step.
+//! - **Ed25519 (asymmetric): DONE (frontier #2, 2026-06-16).**
+//!   `sign_ed25519` / `verify_ed25519` add a cross-DOMAIN layer: a third party
+//!   verifies with only the signer's PUBLIC key (`ed25519_public_key` derives
+//!   it from the seed), so a verifier holding no secret can confirm provenance
+//!   — unlike the symmetric HMAC, where a holder of the key could re-sign a
+//!   forged bundle. A bundle may carry both signatures (each over the same
+//!   canonical content). Remaining future work: an X.509/PKI trust chain for
+//!   the public keys themselves.
 //!
 //! Replay needs only the solvers and this crate — it does NOT need the
 //! nightly `rustc_public` lane, because it re-runs recorded SMT rather
@@ -133,6 +137,37 @@ pub fn read_key_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
     Ok(key)
 }
 
+/// Read a 32-byte Ed25519 key (a private seed for signing, or a public key for
+/// verifying) from `path` — exactly 32 raw bytes. Frontier #2 (2026-06-16).
+/// Shared by the wrapper (signing) and `replay` (verifying) so both apply the
+/// same length check and error shape.
+///
+/// # Errors
+/// `Err` if the file is missing/unreadable or is not exactly 32 bytes.
+pub fn read_ed25519_key_file(path: &std::path::Path) -> Result<[u8; 32], String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("cannot read Ed25519 key file {}: {e}", path.display()))?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        format!(
+            "Ed25519 key file {} must be exactly 32 raw bytes; got {} bytes",
+            path.display(),
+            bytes.len(),
+        )
+    })
+}
+
+/// Derive the 32-byte Ed25519 PUBLIC key from a 32-byte private seed (RNG-free)
+/// — frontier #2, 2026-06-16. The seed SIGNS (`sign_ed25519`); this public key
+/// VERIFIES (`verify_ed25519`) and is what the signer publishes for
+/// cross-domain replay verification. Lets a holder of only the seed obtain the
+/// verifier's key without an RNG dependency.
+#[must_use]
+pub fn ed25519_public_key(seed: &[u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(seed)
+        .verifying_key()
+        .to_bytes()
+}
+
 /// Whether a certificate bundle carries a valid integrity signature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignatureStatus {
@@ -158,7 +193,12 @@ pub enum SignatureStatus {
 /// unknown → fail closed at replay. An older (v1-only) tool refuses a v2
 /// bundle via the `format_version > CERT_FORMAT_VERSION` check — also fail
 /// closed.
-pub const CERT_FORMAT_VERSION: u32 = 2;
+///
+/// v3 (2026-06-16, frontier #2): added the optional Ed25519 asymmetric
+/// signature (`ed25519_signature`) alongside the HMAC one. A v1/v2 bundle still
+/// parses (the field defaults to `None`); an older tool refuses a v3 bundle via
+/// the version check (fail closed), which it could not verify anyway.
+pub const CERT_FORMAT_VERSION: u32 = 3;
 
 /// Stable short tag for a `SolverResult`, used in the serialized
 /// certificate. Kept here (not a `SolverResult` method) so the
@@ -460,11 +500,21 @@ pub struct CertificateBundle {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uncertified: Vec<UncertifiedObligation>,
     /// Hex HMAC-SHA256 over the canonical bundle content (everything
-    /// except this field), set by [`CertificateBundle::sign`]. `None`
-    /// for an unsigned bundle; omitted from the JSON when absent so
+    /// except the two signature fields), set by [`CertificateBundle::sign`].
+    /// `None` for an HMAC-unsigned bundle; omitted from the JSON when absent so
     /// unsigned bundles and older certs round-trip cleanly (Task T.3).
+    /// Symmetric — proves integrity to anyone holding the same key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Hex Ed25519 signature (64 bytes) over the SAME canonical content, set by
+    /// [`CertificateBundle::sign_ed25519`] (frontier #2, 2026-06-16).
+    /// ASYMMETRIC — a third party verifies with only the signer's PUBLIC key
+    /// (via [`CertificateBundle::verify_ed25519`]), giving cross-domain
+    /// non-repudiation without trusting the verifier. Independent of the HMAC
+    /// field: a bundle may carry either, both, or neither. `None`/omitted when
+    /// not Ed25519-signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ed25519_signature: Option<String>,
 }
 
 impl CertificateBundle {
@@ -489,16 +539,19 @@ impl CertificateBundle {
             total_obligations: 0,
             uncertified: Vec::new(),
             signature: None,
+            ed25519_signature: None,
         }
     }
-    /// Canonical bytes the signature covers: the bundle serialized with
-    /// the `signature` field cleared (so the MAC is over content only).
-    /// serde_json over a struct is deterministic (declaration field
-    /// order; the bundle holds only `Vec`s, no nondeterministic maps),
-    /// so producer and verifier agree on these bytes.
+    /// Canonical bytes the signatures cover: the bundle serialized with BOTH
+    /// signature fields cleared, so the HMAC and the Ed25519 signature are over
+    /// EXACTLY the same content (and either can be added/verified independently
+    /// of the other). serde_json over a struct is deterministic (declaration
+    /// field order; the bundle holds only `Vec`s, no nondeterministic maps), so
+    /// producer and verifier agree on these bytes.
     fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         let mut copy = self.clone();
         copy.signature = None;
+        copy.ed25519_signature = None;
         serde_json::to_vec(&copy)
     }
     /// Sign the bundle in place with HMAC-SHA256 over its canonical
@@ -541,10 +594,65 @@ impl CertificateBundle {
             SignatureStatus::Invalid
         }
     }
-    /// Whether the bundle carries a signature (verified or not).
+    /// Whether the bundle carries an HMAC signature (verified or not).
     #[must_use]
     pub fn is_signed(&self) -> bool {
         self.signature.is_some()
+    }
+    /// Sign the bundle in place with Ed25519 over its canonical content
+    /// (frontier #2, 2026-06-16). `signing_key` is the 32-byte Ed25519 seed
+    /// (private key). ASYMMETRIC: the matching PUBLIC key verifies via
+    /// [`verify_ed25519`] without holding the secret — cross-domain
+    /// non-repudiation. Independent of the HMAC [`sign`]; a bundle may carry
+    /// both (each over the same canonical bytes).
+    ///
+    /// # Errors
+    /// Returns `Err` if the bundle cannot be canonicalized (serde).
+    pub fn sign_ed25519(&mut self, signing_key: &[u8; 32]) -> Result<(), String> {
+        use ed25519_dalek::{Signer, SigningKey};
+        let bytes = self
+            .canonical_bytes()
+            .map_err(|e| format!("canonicalizing bundle for Ed25519 signing: {e}"))?;
+        let sk = SigningKey::from_bytes(signing_key);
+        let sig = sk.sign(&bytes);
+        self.ed25519_signature = Some(to_hex(&sig.to_bytes()));
+        Ok(())
+    }
+    /// Verify the bundle's Ed25519 signature against `verifying_key` (the
+    /// 32-byte PUBLIC key the verifier trusts out-of-band — the bundle does NOT
+    /// carry the public key, since an attacker could swap both). `Unsigned` if
+    /// no Ed25519 signature is present; `Valid` if it verifies (strict —
+    /// non-canonical signatures and weak/torsion public keys are rejected);
+    /// `Invalid` on tampered content, wrong key, or a malformed signature/key.
+    #[must_use]
+    pub fn verify_ed25519(&self, verifying_key: &[u8; 32]) -> SignatureStatus {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        let Some(sig_hex) = &self.ed25519_signature else {
+            return SignatureStatus::Unsigned;
+        };
+        let Some(sig_bytes) = from_hex(sig_hex) else {
+            return SignatureStatus::Invalid;
+        };
+        let Ok(sig_arr) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+            return SignatureStatus::Invalid;
+        };
+        let signature = Signature::from_bytes(&sig_arr);
+        let Ok(vk) = VerifyingKey::from_bytes(verifying_key) else {
+            return SignatureStatus::Invalid;
+        };
+        let Ok(bytes) = self.canonical_bytes() else {
+            return SignatureStatus::Invalid;
+        };
+        if vk.verify_strict(&bytes, &signature).is_ok() {
+            SignatureStatus::Valid
+        } else {
+            SignatureStatus::Invalid
+        }
+    }
+    /// Whether the bundle carries an Ed25519 signature (verified or not).
+    #[must_use]
+    pub fn is_ed25519_signed(&self) -> bool {
+        self.ed25519_signature.is_some()
     }
     /// Whether the obligation ledger adds up: `total_obligations` equals the
     /// certified-plus-uncertified count. A mismatch means the bundle is
@@ -829,6 +937,111 @@ mod tests {
         assert_eq!(b.verify_signature(&key), SignatureStatus::Invalid);
         b.signature = Some(String::new());
         assert_eq!(b.verify_signature(&key), SignatureStatus::Invalid);
+    }
+
+    // ===== Ed25519 asymmetric signing (frontier #2, 2026-06-16) ============
+
+    /// Deterministic test keypair: `(private 32-byte seed, public key)`.
+    fn ed25519_keypair() -> ([u8; 32], [u8; 32]) {
+        use ed25519_dalek::SigningKey;
+        let seed = [7u8; 32];
+        let pk = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        (seed, pk)
+    }
+    fn ed25519_bundle() -> CertificateBundle {
+        let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
+        let mut b = CertificateBundle::new("0.1.0", "c", 2, 60, vec!["z3".into(), "cvc5".into()]);
+        b.obligations
+            .push(ObligationCertificate::from_run("o", "PB049", "(check-sat)", &results, 2));
+        b.total_obligations = 1;
+        b
+    }
+
+    /// Sign with Ed25519, verify with the matching PUBLIC key → Valid. And it
+    /// is INDEPENDENT of the HMAC layer: a bundle carrying BOTH verifies under
+    /// each (canonical bytes clear both signature fields).
+    #[test]
+    fn ed25519_sign_then_verify_valid_and_independent_of_hmac() {
+        let (sk, pk) = ed25519_keypair();
+        let (mut b, hmac_key) = signed_bundle(); // already HMAC-signed
+        b.sign_ed25519(&sk).expect("ed25519 sign");
+        assert!(b.is_ed25519_signed() && b.is_signed());
+        assert_eq!(b.verify_ed25519(&pk), SignatureStatus::Valid);
+        assert_eq!(b.verify_signature(&hmac_key), SignatureStatus::Valid, "HMAC still valid");
+    }
+
+    /// Tampering a signed field after Ed25519-signing invalidates the signature.
+    #[test]
+    fn ed25519_tampered_content_fails() {
+        let (sk, pk) = ed25519_keypair();
+        let mut b = ed25519_bundle();
+        b.sign_ed25519(&sk).expect("sign");
+        assert_eq!(b.verify_ed25519(&pk), SignatureStatus::Valid);
+        b.obligations[0].smt = "(assert false)\n(check-sat)\n".into();
+        assert_eq!(b.verify_ed25519(&pk), SignatureStatus::Invalid);
+    }
+
+    /// A different public key does not verify (asymmetric: only the matching
+    /// key validates).
+    #[test]
+    fn ed25519_wrong_pubkey_is_invalid() {
+        let (sk, _pk) = ed25519_keypair();
+        let mut b = ed25519_bundle();
+        b.sign_ed25519(&sk).expect("sign");
+        use ed25519_dalek::SigningKey;
+        let other_pk = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        assert_eq!(b.verify_ed25519(&other_pk), SignatureStatus::Invalid);
+    }
+
+    /// Unsigned → `Unsigned`; a malformed (non-hex or wrong-length) signature
+    /// fails closed to `Invalid`, never a panic.
+    #[test]
+    fn ed25519_unsigned_and_malformed_fail_closed() {
+        let (_sk, pk) = ed25519_keypair();
+        let mut b = ed25519_bundle();
+        assert_eq!(b.verify_ed25519(&pk), SignatureStatus::Unsigned);
+        b.ed25519_signature = Some("zz".into()); // non-hex
+        assert_eq!(b.verify_ed25519(&pk), SignatureStatus::Invalid);
+        b.ed25519_signature = Some("ab".into()); // valid hex, but not 64 bytes
+        assert_eq!(b.verify_ed25519(&pk), SignatureStatus::Invalid);
+    }
+
+    /// The Ed25519 signature survives a JSON round-trip and still verifies.
+    #[test]
+    fn ed25519_survives_json_round_trip() {
+        let (sk, pk) = ed25519_keypair();
+        let mut b = ed25519_bundle();
+        b.sign_ed25519(&sk).expect("sign");
+        let json = b.to_json().expect("serialize");
+        let back = CertificateBundle::from_json(&json).expect("deserialize");
+        assert_eq!(back.verify_ed25519(&pk), SignatureStatus::Valid);
+    }
+
+    /// `read_ed25519_key_file` requires exactly 32 raw bytes.
+    #[test]
+    fn ed25519_key_file_must_be_32_bytes() {
+        let p = std::env::temp_dir().join(format!("pitbull-ed25519-{}.key", std::process::id()));
+        std::fs::write(&p, [7u8; 32]).expect("write 32");
+        assert_eq!(read_ed25519_key_file(&p).expect("32 ok"), [7u8; 32]);
+        std::fs::write(&p, [7u8; 16]).expect("write 16");
+        assert!(read_ed25519_key_file(&p).is_err(), "16 bytes must be rejected");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `ed25519_public_key` derives the verifier matching a seed (RNG-free): a
+    /// signature made with the seed verifies under the derived public key —
+    /// the full sign→derive→verify round-trip the CLI provenance flow relies on.
+    #[test]
+    fn ed25519_public_key_derives_matching_verifier() {
+        let seed = [3u8; 32];
+        let pk = ed25519_public_key(&seed);
+        let mut b = ed25519_bundle();
+        b.sign_ed25519(&seed).expect("sign");
+        assert_eq!(
+            b.verify_ed25519(&pk),
+            SignatureStatus::Valid,
+            "the derived public key must verify a signature made with its seed",
+        );
     }
 
     /// Replay reproduces: a discharged cert, re-run with the same

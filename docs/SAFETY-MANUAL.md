@@ -285,8 +285,17 @@ layer — where Pitbull's verdict is packaged for a third party to trust:
   other env paths. As above, a hostile in-tree `build.rs` remains out of scope
   except under the PB073 hermetic-environment obligation; the certificate's
   HMAC (symmetric) makes cross-machine tamper detectable but is not a defense
-  against a build environment that can already reach `PITBULL_CERT_KEY` —
-  cross-domain non-repudiation needs the planned asymmetric (Ed25519) signing.
+  against a build environment that can already reach `PITBULL_CERT_KEY`.
+- **Ed25519 asymmetric signing (frontier #2, 2026-06-16).** Certificates can
+  now ALSO be Ed25519-signed (`PITBULL_CERT_ED25519_KEY` on `check`;
+  `PITBULL_CERT_ED25519_PUBKEY` on `replay`), independent of the HMAC layer.
+  Because Ed25519 is asymmetric, a third party verifies with only the signer's
+  PUBLIC key — cross-domain non-repudiation, the "don't-trust-the-verifier"
+  qualification story: a hostile build environment that reaches the public key
+  still cannot forge a signature (it lacks the private seed). Under
+  `PITBULL_REQUIRE_SIGNED`, replay requires at least one VERIFIED signature
+  (HMAC or Ed25519), and a present-but-invalid signature of either scheme fails
+  closed. A trust chain for the public keys themselves (X.509/PKI) is future work.
 ## 4. User obligations
 For the guarantee to hold:
 1. **Pin the toolchain** to one of `SUPPORTED_TOOLCHAINS`.

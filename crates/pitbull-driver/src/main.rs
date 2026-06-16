@@ -544,11 +544,51 @@ fn run_replay(_cli: &Cli, cert_path: &std::path::Path) -> Result<ExitCode> {
             }
         }
     }
-    if !signing_policy_ok(require_signed, sig_status) {
+    // Ed25519 asymmetric verification (frontier #2, 2026-06-16). If
+    // PITBULL_CERT_ED25519_PUBKEY is set, verify against that 32-byte PUBLIC
+    // key — a third party confirms provenance WITHOUT any secret. Like HMAC, a
+    // present-but-INVALID Ed25519 signature always fails closed.
+    let ed_status: Option<pitbull_vc::cert::SignatureStatus> =
+        match std::env::var_os("PITBULL_CERT_ED25519_PUBKEY") {
+            Some(pkpath) => {
+                let pk = pitbull_vc::cert::read_ed25519_key_file(std::path::Path::new(&pkpath))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Some(bundle.verify_ed25519(&pk))
+            }
+            None => None,
+        };
+    match ed_status {
+        Some(pitbull_vc::cert::SignatureStatus::Valid) => {
+            eprintln!("pitbull replay: Ed25519 signature OK (verified against the public key).");
+        }
+        Some(pitbull_vc::cert::SignatureStatus::Unsigned) => {
+            eprintln!(
+                "pitbull replay: WARNING: a public key was provided but the certificate \
+                 carries NO Ed25519 signature.",
+            );
+        }
+        Some(pitbull_vc::cert::SignatureStatus::Invalid) => {
+            anyhow::bail!(
+                "certificate Ed25519 signature is INVALID (tampered, or signed with a \
+                 different key) — refusing to replay",
+            );
+        }
+        None => {
+            if bundle.is_ed25519_signed() {
+                eprintln!(
+                    "pitbull replay: note: certificate is Ed25519-signed but no \
+                     PITBULL_CERT_ED25519_PUBKEY was provided — set it to verify \
+                     cross-domain provenance.",
+                );
+            }
+        }
+    }
+    if !signing_policy_ok(require_signed, sig_status, ed_status) {
         anyhow::bail!(
             "PITBULL_REQUIRE_SIGNED is set but this certificate is not backed by a \
-             verified signature (it needs PITBULL_CERT_KEY set AND a signature that \
-             verifies under it) — refusing to replay",
+             VERIFIED signature — provide PITBULL_CERT_KEY (HMAC) and/or \
+             PITBULL_CERT_ED25519_PUBKEY (Ed25519) matching a signature on the bundle \
+             — refusing to replay",
         );
     }
     // Rebuild the solver pool from the bundle's recorded names. Replay
@@ -673,23 +713,31 @@ fn replay_exit_code(mismatches: usize, attests_full: bool) -> u8 {
         1
     }
 }
-/// Whether replay may proceed under the strict-signing policy (2026-06-15
-/// deep audit, F1/F2). `status` is the signature verification result when a
-/// key was provided, or `None` when no key was available to verify with.
-/// Under `require_signed`, only a verified (`Valid`) signature proceeds —
-/// unsigned, unverifiable (no key), or invalid all fail closed. Without it,
-/// everything proceeds EXCEPT a present-but-`Invalid` signature, which always
-/// fails closed. Pure for unit-testing.
+/// Whether replay may proceed under the strict-signing policy, combining the
+/// HMAC and Ed25519 verification results (2026-06-15 F1/F2; extended for
+/// Ed25519 in frontier #2, 2026-06-16). Each argument is the verification
+/// result for that scheme, or `None` when that scheme's key was not provided.
+///
+/// - A present-but-`Invalid` signature of EITHER scheme always fails closed
+///   (an invalid signature is a red flag regardless of the other scheme).
+/// - Under `require_signed`, at least ONE scheme must be `Valid`.
+/// - Otherwise, proceed (unsigned / unverified are warn-and-continue).
+///
+/// Pure for unit-testing.
 fn signing_policy_ok(
     require_signed: bool,
-    status: Option<pitbull_vc::cert::SignatureStatus>,
+    hmac: Option<pitbull_vc::cert::SignatureStatus>,
+    ed25519: Option<pitbull_vc::cert::SignatureStatus>,
 ) -> bool {
     use pitbull_vc::cert::SignatureStatus;
-    match (require_signed, status) {
-        (true, Some(SignatureStatus::Valid)) => true,
-        (true, _) => false, // strict: a verified signature is mandatory
-        (false, Some(SignatureStatus::Invalid)) => false, // a bad sig never passes
-        (false, _) => true, // lax: unsigned / unverified / valid all proceed
+    if hmac == Some(SignatureStatus::Invalid) || ed25519 == Some(SignatureStatus::Invalid) {
+        return false; // a bad signature of either scheme never passes
+    }
+    if require_signed {
+        // Strict: at least one scheme must be VERIFIED.
+        hmac == Some(SignatureStatus::Valid) || ed25519 == Some(SignatureStatus::Valid)
+    } else {
+        true // lax: unsigned / unverified proceed (an Invalid was rejected above)
     }
 }
 fn run_rules(cli: &Cli) -> Result<ExitCode> {
@@ -735,16 +783,20 @@ mod tests {
     #[test]
     fn signing_policy_strict_requires_valid_signature() {
         use pitbull_vc::cert::SignatureStatus::{Invalid, Unsigned, Valid};
-        // Strict: only a verified signature passes.
-        assert!(signing_policy_ok(true, Some(Valid)));
-        assert!(!signing_policy_ok(true, Some(Unsigned)));
-        assert!(!signing_policy_ok(true, Some(Invalid)));
-        assert!(!signing_policy_ok(true, None), "strict + no key must fail closed");
-        // Lax: proceed unless the signature is present-but-invalid.
-        assert!(signing_policy_ok(false, Some(Valid)));
-        assert!(signing_policy_ok(false, Some(Unsigned)));
-        assert!(signing_policy_ok(false, None));
-        assert!(!signing_policy_ok(false, Some(Invalid)), "a bad sig always fails");
+        // Strict: at least one scheme (HMAC or Ed25519) must be Valid.
+        assert!(signing_policy_ok(true, Some(Valid), None));
+        assert!(signing_policy_ok(true, None, Some(Valid)), "Ed25519 alone suffices");
+        assert!(signing_policy_ok(true, Some(Unsigned), Some(Valid)), "either suffices");
+        assert!(!signing_policy_ok(true, Some(Unsigned), Some(Unsigned)));
+        assert!(!signing_policy_ok(true, None, None), "strict + no key must fail closed");
+        // A bad signature of EITHER scheme always fails, even alongside a Valid.
+        assert!(!signing_policy_ok(true, Some(Invalid), Some(Valid)));
+        assert!(!signing_policy_ok(false, Some(Invalid), None), "a bad HMAC always fails");
+        assert!(!signing_policy_ok(false, None, Some(Invalid)), "a bad Ed25519 always fails");
+        // Lax: proceed unless a present signature is invalid.
+        assert!(signing_policy_ok(false, Some(Valid), None));
+        assert!(signing_policy_ok(false, Some(Unsigned), Some(Unsigned)));
+        assert!(signing_policy_ok(false, None, None));
     }
     /// F5 exit fidelity: `check` distinguishes could-not-run (2) from
     /// not-verified (1) and clean (0), instead of collapsing all non-success
