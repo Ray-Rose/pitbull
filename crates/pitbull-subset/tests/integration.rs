@@ -1203,6 +1203,72 @@ fn wrapper_proves_ensures_add_one_discharges_under_precondition() {
         "Q.4b: add_one fully discharged (PB049 + PB076) should exit 0. Got {code:?}",
     );
 }
+/// Frontier #1 (Track B, 2026-06-16): a REAL fixed-point DSP routine discharges
+/// end-to-end. `scale_q(sample, gain, divisor) { (sample * gain) / divisor }`
+/// carries TWO AoRTE obligations — the `sample * gain` overflow (PB049) and the
+/// `/ divisor` division-by-zero (PB049). Under the contract `sample < 65536`,
+/// `gain < 65536` (so the product is < 2^32) and `divisor > 0`, BOTH discharge
+/// (`unsat`), so the wrapper exits 0. This is the first real §15 target proven
+/// through the live solver path; its fuzz-clean dual is
+/// `pb049_scale_q_safe_under_precondition` in aorte_proofs.rs. Z3-gated.
+#[test]
+fn wrapper_proves_scale_q_discharges_under_precondition() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_scale_q_discharges_under_precondition: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-scaleq-{}.toml", std::process::id()));
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-scaleq-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         #[pitbull::requires(\"sample < 65536\")]\n\
+         #[pitbull::requires(\"gain < 65536\")]\n\
+         #[pitbull::requires(\"divisor > 0\")]\n\
+         pub fn scale_q(sample: u32, gain: u32, divisor: u32) -> u32 {\n\
+             (sample * gain) / divisor\n\
+         }\n",
+    )
+    .expect("write probe.rs");
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_proves_scale_q_discharges_under_precondition: SKIPPED (no solver)");
+        return;
+    }
+    // Both the mul-overflow and the div-by-zero obligations must discharge.
+    assert!(
+        stderr.contains("(PB049)") && stderr.contains("discharged (unsat")
+            && !stderr.contains("NOT DISCHARGED"),
+        "scale_q must DISCHARGE both AoRTE obligations (mul-overflow + \
+         div-by-zero) under its contract. Got code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("2 obligation(s), 2 discharged"),
+        "scale_q should discharge BOTH obligations; stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(0), "scale_q fully discharged should exit 0. Got {code:?}");
+}
 /// Q.4b adversarial twin — a FALSE arithmetic postcondition does NOT
 /// discharge, isolated from overflow. `add_one(x){ x + 1 }` with
 /// `requires(x < 100)` + `ensures(result < 50)`: PB049 overflow

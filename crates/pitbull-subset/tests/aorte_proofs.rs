@@ -363,6 +363,37 @@ fn pb049_add_one_no_overflow_under_precondition() {
     }
 }
 
+/// Fixed-point gain scale (Q-format), audio-DSP style: `(sample * gain) /
+/// divisor`. Pitbull discharges BOTH AoRTE obligations end-to-end by 2-of-2
+/// (z3 + cvc5) agreement (verified 2026-06-16, Track-B frontier #1): the
+/// `sample * gain` overflow (PB049) under `sample < 65536 && gain < 65536`
+/// (so the product is `< 2^32`), and the `/ divisor` division-by-zero (PB049)
+/// under `divisor > 0`. This is the empirical half: fuzz ONLY the admitted
+/// domain and assert the precondition set is SUFFICIENT (no overflow / no
+/// div-by-zero), with a wide-arithmetic oracle that would catch a silent
+/// overflow.
+fn scale_q(sample: u32, gain: u32, divisor: u32) -> u32 {
+    (sample * gain) / divisor
+}
+
+#[test]
+fn pb049_scale_q_safe_under_precondition() {
+    let mut rng = Rng::new(0x5CA1_E000_0049_0001);
+    for _ in 0..ITERS {
+        // PRECONDITION: sample < 65536, gain < 65536 (⇒ product < 2^32, no mul
+        // overflow), divisor > 0 (no division by zero). Fuzz only this domain.
+        let sample = rng.next_u32() % 65536;
+        let gain = rng.next_u32() % 65536;
+        let divisor = 1 + (rng.next_u32() % 4096); // divisor >= 1
+        let out = scale_q(sample, gain, divisor);
+        // Wide-arithmetic oracle: the true product fits u32 (so the u32 mul did
+        // NOT overflow) and the division is exact. A silent overflow in
+        // `scale_q` would make `out` disagree with this u64 computation.
+        let oracle = ((u64::from(sample) * u64::from(gain)) / u64::from(divisor)) as u32;
+        assert_eq!(out, oracle, "scale_q({sample},{gain},{divisor}) must match the wide oracle");
+    }
+}
+
 /// Adversarial control: confirm the harness WOULD catch a real overflow if
 /// the precondition were dropped. `add_one(u32::MAX)` overflows; under
 /// `overflow-checks` (debug/test) that is a panic. We assert the panic
