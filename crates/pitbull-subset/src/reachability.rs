@@ -155,11 +155,13 @@ impl<'cfg, P: BodyProvider> ReachabilityDriver<'cfg, P> {
     ///
     /// Fail-closed posture (2026-06-15 deep audit): a reachable, non-trusted,
     /// non-excluded function whose body the provider cannot supply is NOT
-    /// silently skipped — it records a `CoverageGap` audit note (which the
-    /// wrapper folds into the exit code, fail closed). A body the verifier
-    /// could not see is a safety check that could not run, never an implicit
-    /// pass. (A genuinely foreign/extern item is the FFI surface, PB056, and
-    /// must be excluded or `#[pitbull::trusted]` explicitly.)
+    /// silently skipped — it records a `CoverageGap` audit note. A `CoverageGap`
+    /// is the fail-closed signal Pitbull's exit code keys on
+    /// (`SubsetReport::coverage_gap_count`), so wiring this (currently test-only)
+    /// driver into production would surface the unanalyzed body rather than hide
+    /// it. A body the verifier could not see is a safety check that could not
+    /// run, never an implicit pass. (A genuinely foreign/extern item is the FFI
+    /// surface, PB056, and must be excluded or `#[pitbull::trusted]` explicitly.)
     pub fn run(mut self, roots: Vec<ReachableItem>) -> SubsetReport {
         let mut visitor = SubsetVisitor::new(self.config);
         let mut worklist = roots;

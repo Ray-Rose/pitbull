@@ -23,7 +23,7 @@ repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 342 tests passing (190 subset-lib + 76 vc + 54 integration + 11 aorte_proofs + 11 driver-bin),
+- **State:** 343 tests passing (190 subset-lib + 77 vc + 54 integration + 11 aorte_proofs + 11 driver-bin),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -158,14 +158,14 @@ d3682f6 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **342 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **343 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The **342** breaks down: 4 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 190
-(subset lib) + 54 (integration) + 11 (aorte_proofs) + 76 (vc) = 342 (the
+The **343** breaks down: 4 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 190
+(subset lib) + 54 (integration) + 11 (aorte_proofs) + 77 (vc) = 343 (the
 2026-06-15 re-audit added +10 over the prior 332; see the dated subsection at
 the end of §1). This supersedes the long
 Task-S-era narration that previously lived here (which still said "226" while
@@ -244,9 +244,28 @@ core). Fixed this session, all fail-closed, none changing what discharges:
 
 Pure soundness-decision helpers added (mirroring `decide_pitbull_exit_code`):
 `replay_exit_code`, `signing_policy_ok`, `check_exit_code` — all unit-tested.
-Remaining (P2, LOW, deferred): `Rvalue::Repeat` inert-count comment;
-`capture_shift_amount` constant-mask pin test; intermediate-symlink /
-Windows-junction path notes.
+
+**Red-team follow-up (same day, separate commit).** Two adversarial agents
+re-attacked the two commits above. The soundness agent found NO new
+false-discharge path (every partial/legacy/mismatched/unsigned bundle fails
+closed behind two gates; the producer ledger is provably exact); the security
+agent confirmed the HMAC/ledger crypto is sound (the new fields ARE under the
+MAC). Four findings were then closed (+1 test → 343):
+- `attests_full_verification` returns false for a zero-obligation bundle —
+  defense-in-depth vs a future caller lacking `replay`'s empty-guard.
+- The reachability-manifest temp dir is created **EXCLUSIVELY** (unpredictable
+  name + `create_dir`, never reusing a pre-existing dir): closes a shared-host
+  manifest-injection lever where a co-tenant could pre-create
+  `pitbull-reach-<pid>` and suppress a real cross-crate gap (verdict-flip).
+- `PITBULL_REACH_DIR` now passes `check_env_path` (traversal/symlink) like the
+  other env paths (`check_env_path` gained an empty-extension "directory" mode).
+- The cert-written log reports the full ledger (total / certified / uncertified).
+
+Residuals accepted as covered by the PB073 hermetic-build obligation:
+`PITBULL_TOML` / `PITBULL_CERT_KEY` env injection (the cert-key path is
+read-amplification, not a leak — the key is never echoed). Remaining (P2, LOW):
+the `Rvalue::Repeat` inert-count comment; a `capture_shift_amount`
+constant-mask pin test; intermediate-symlink / Windows-junction path notes.
 
 ---
 

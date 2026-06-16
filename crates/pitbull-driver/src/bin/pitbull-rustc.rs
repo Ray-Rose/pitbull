@@ -796,7 +796,24 @@ impl PitbullCallbacks {
                     json.hash(&mut h);
                     let fname = format!("{crate_name}-{:016x}.json", h.finish());
                     let path = std::path::Path::new(&dir).join(fname);
-                    if let Err(e) = std::fs::write(&path, json) {
+                    // Security (2026-06-15 red-team, Finding 2): PITBULL_REACH_DIR
+                    // is build.rs-injectable like the other PITBULL_* paths but
+                    // previously skipped validation. Guard it the same way
+                    // (reject `..` traversal + a symlink dir) before writing —
+                    // empty ext list = "directory, no extension". Best-effort:
+                    // a bad value warns and skips; the missing manifest then
+                    // shows as INDETERMINATE, which `check --strict` fails closed
+                    // on. The residual (a real dir the build.rs owns) is the
+                    // env-config-forgeable case covered by the PB073
+                    // hermetic-build obligation.
+                    if let Err(e) =
+                        check_env_path("PITBULL_REACH_DIR", std::path::Path::new(&dir), &[])
+                    {
+                        eprintln!(
+                            "pitbull-rustc: WARNING: ignoring PITBULL_REACH_DIR ({e}); \
+                             reachability manifest not written",
+                        );
+                    } else if let Err(e) = std::fs::write(&path, json) {
                         eprintln!(
                             "pitbull-rustc: WARNING: could not write reachability manifest \
                              to {}: {e}",
@@ -1057,10 +1074,12 @@ impl PitbullCallbacks {
                     match bundle.to_json() {
                         Ok(text) => match std::fs::write(&out_path, text) {
                             Ok(()) => eprintln!(
-                                "pitbull-rustc: proof certificate ({} obligation(s)) \
-                                 written to {}",
-                                bundle.obligations.len(),
+                                "pitbull-rustc: proof certificate written to {} \
+                                 ({} obligation(s): {} certified, {} uncertified)",
                                 out_path.display(),
+                                bundle.total_obligations,
+                                bundle.obligations.len(),
+                                bundle.uncertified.len(),
                             ),
                             Err(e) => eprintln!(
                                 "pitbull-rustc: failed to write certificate to {}: {e}",
@@ -1475,11 +1494,15 @@ fn check_env_path(
             path.display(),
         ));
     }
-    let ext_ok = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| allowed_extensions.iter().any(|a| e.eq_ignore_ascii_case(a)))
-        .unwrap_or(false);
+    // An EMPTY `allowed_extensions` means "no extension requirement" — used
+    // for directory paths (e.g. PITBULL_REACH_DIR), which have no extension.
+    // The `..` and symlink checks still apply.
+    let ext_ok = allowed_extensions.is_empty()
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| allowed_extensions.iter().any(|a| e.eq_ignore_ascii_case(a)))
+            .unwrap_or(false);
     if !ext_ok {
         return Err(format!(
             "{var_name}={} does not end in one of {:?}; refusing as \

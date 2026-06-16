@@ -2045,6 +2045,24 @@ the std form and now also matches. No shadow type changes.
   change; disclosed in SAFETY-MANUAL §3.8. +10 tests (332→342). REMAINING (P2,
   LOW): `Rvalue::Repeat` inert-count comment; `capture_shift_amount`
   constant-mask pin test; intermediate-symlink / Windows-junction path notes.
+- ✅ Red-team follow-up to the 2026-06-15 hardening (same day). Two adversarial
+  agents re-attacked the cert/replay/check diff and the security/supply-chain
+  surface. The soundness agent found NO new false-discharge path (every
+  partial/legacy/mismatched/unsigned bundle fails closed behind two gates; the
+  producer ledger is provably exact); the security agent confirmed the
+  HMAC/ledger crypto is sound (the new `total_obligations`/`uncertified` fields
+  ARE under the MAC, constant-time verify, panic-free hex). Four findings closed
+  (+1 test → 343): (1) `attests_full_verification` now returns false for a
+  zero-obligation bundle (defense-in-depth vs a future caller lacking `replay`'s
+  empty-guard); (2) the reachability-manifest temp dir is created EXCLUSIVELY
+  (unpredictable name + `create_dir`, never reusing a pre-existing dir) — closes
+  a shared-host manifest-injection lever that could suppress a cross-crate gap
+  (a verdict-flip, the wrong direction); (3) `PITBULL_REACH_DIR` now passes
+  `check_env_path` like the other env paths (which gained an empty-extension
+  "directory" mode); (4) the cert-written log reports the full ledger. Residuals
+  (`PITBULL_TOML`/`PITBULL_CERT_KEY` env injection — the key path is
+  read-amplification not a leak) are covered by the PB073 hermetic-build
+  obligation. Pinned by `attests_full_verification_false_for_empty_bundle`.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is
@@ -2065,7 +2083,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 342 passing, 0 warnings, clippy clean
+# Stable: 343 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

@@ -34,13 +34,13 @@ use pitbull_subset::ArithOp;
 /// SMT bit-width used for index bound checks.
 ///
 /// Slice / array indices in Rust are `usize`, which is target-
-/// pointer-width-dependent. PSS-1 PB052 has the user pin the
-/// target pointer width in `pitbull.toml`'s `[verification]`
-/// table, but the v0.2 scaffold doesn't yet thread that down to
-/// the SMT layer. Hardcoded to 64 here on the assumption that
-/// v0.2 targets x86_64 / aarch64 / wasm64. When the threading
-/// lands, this constant becomes a parameter resolved from the
-/// `SubsetConfig.verification.target_pointer_width` field.
+/// pointer-width-dependent. The user pins the target pointer width in
+/// `pitbull.toml`'s `[subset]` table — the field
+/// `SubsetConfig.subset.target_pointer_width` ALREADY EXISTS and is
+/// validated (16/32/64) by `config.rs`. What is deferred is only the
+/// PLUMBING: the v0.2 scaffold does not yet thread that value down to the
+/// SMT layer, so this is hardcoded to 64. When the plumbing lands, this
+/// constant becomes a parameter resolved from that field.
 ///
 /// Rationale for hard-coding 64 vs 32: false-negative direction
 /// is asymmetric — a 64-bit encoding can model 32-bit problems

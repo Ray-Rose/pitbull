@@ -274,6 +274,16 @@ layer — where Pitbull's verdict is packaged for a third party to trust:
   is covered by the §4 hermetic-environment obligation (PB073). Env config is
   build.rs-forgeable by design, so treat a non-hermetic build's verdict
   accordingly.
+- **Shared-host build hardening (red-team follow-up).** The cross-crate
+  reachability gate exchanges per-crate manifests through a temp directory;
+  that directory is now created EXCLUSIVELY with an unpredictable name, so a
+  co-tenant on a shared CI host cannot pre-create it and inject a manifest that
+  suppresses a real cross-crate gap. `PITBULL_REACH_DIR` is validated like the
+  other env paths. As above, a hostile in-tree `build.rs` remains out of scope
+  except under the PB073 hermetic-environment obligation; the certificate's
+  HMAC (symmetric) makes cross-machine tamper detectable but is not a defense
+  against a build environment that can already reach `PITBULL_CERT_KEY` —
+  cross-domain non-repudiation needs the planned asymmetric (Ed25519) signing.
 ## 4. User obligations
 For the guarantee to hold:
 1. **Pin the toolchain** to one of `SUPPORTED_TOOLCHAINS`.

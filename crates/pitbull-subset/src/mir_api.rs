@@ -286,9 +286,11 @@ mod shadow {
         /// Source span.
         pub span: Span,
     }
-    /// MIR statement kinds. Mirror of `rustc_public::mir::StatementKind`.
-    ///
-    /// 13 variants, as of current nightly rustc.
+    /// MIR statement kinds. A deliberate SUPERSET of
+    /// `rustc_public::mir::StatementKind` (the pinned nightly surfaces 12; the
+    /// shadow carries an extra defensive variant so the visitor's dispatch
+    /// stays total). The adapter's `statement_kind` match produces only the
+    /// variants the pinned API actually has.
     #[derive(Clone, Debug)]
     pub enum StatementKind {
         /// `place = rvalue`.

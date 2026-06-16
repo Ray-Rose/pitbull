@@ -913,16 +913,28 @@ fn basic_block_data(bb: &rp::mir::BasicBlock) -> shadow::BasicBlockData {
     }
 }
 // =====================================================================
-// Tracking note for the still-pending translation surface.
+// Translation-surface status (updated 2026-06-15 deep audit).
 // =====================================================================
 //
-// Implemented in this commit (Batches 1-2):
-//   - operand, place, projection, const_operand          (Batch 1)
-//   - ty + ty_kind + rigid_ty + int/uint/float/adt_def   (Batch 2)
+// The MIR -> shadow translation surface is IMPLEMENTED and exhaustive:
+//   - operand, place, projection, const_operand
+//   - ty + ty_kind + rigid_ty + int/uint/float/adt_def
+//   - rvalue, statement_kind, terminator_kind (each a wildcard-FREE match
+//     over the pinned `rustc_public` variants — per the crate's no-defaults
+//     posture, a future API bump that adds a variant breaks THIS build
+//     loudly, which is the intended fail-safe: the audit then moves to the
+//     new variant rather than silently mistranslating it)
+//   - body() populates `blocks`
 //
-// Still pending (substantial pieces blocking the Box-emits-PB011 demo):
-//   - rvalue: 15 variants                       (Batch 3)
-//   - statement: 13 variants                    (Batch 4)
-//   - terminator: 15 variants                   (Batch 5)
-//   - body() must populate `blocks`             (Batch 6)
-//   - Real `Span` -> byte offsets via compiler_interface (post-§17.1)
+// NB: the shadow IR is a deliberate SUPERSET of what the pinned
+// `rustc_public` exposes. It carries a few defensive variants (e.g.
+// `Rvalue::NullaryOp` and several extra `TerminatorKind`s) that the current
+// pinned API does NOT surface, so the adapter's exhaustive matches above
+// never produce them today — they exist only so the visitor's dispatch stays
+// total if a future pin starts surfacing them. (So an apparent "missing
+// NullaryOp arm" in `rvalue` is correct, not a gap: matching it would name a
+// variant the pinned `Rvalue` does not have, which would not compile.)
+//
+// Honestly-deferred refinement (not a correctness gap): richer `Span`
+// byte-offset precision via the compiler interface; today spans pack
+// line/col + a u32 file-hash, sufficient for diagnostics.

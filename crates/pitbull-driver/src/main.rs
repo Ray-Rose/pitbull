@@ -149,10 +149,48 @@ fn run_check(cli: &Cli, strict: bool) -> Result<ExitCode> {
     // narrowing skipped that entry slips past both crates' local gates. We
     // have every wrapper run emit a reachability manifest into a fresh dir,
     // then verify the WHOLE-workspace closure here (SAFETY-MANUAL §3.6).
-    let manifest_dir = std::env::temp_dir().join(format!("pitbull-reach-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&manifest_dir); // clear any stale run
-    std::fs::create_dir_all(&manifest_dir)
-        .with_context(|| format!("creating reachability manifest dir {}", manifest_dir.display()))?;
+    // SECURITY (2026-06-15 red-team, Finding 1): create the manifest dir
+    // EXCLUSIVELY. The previous `pitbull-reach-<pid>` + remove_dir_all +
+    // create_dir_all let a co-tenant on a shared temp dir pre-create the path
+    // (pid is guessable) and inject a crafted manifest that the parent reads
+    // back — marking an unverified callee as `walked` SUPPRESSES a real
+    // cross-crate reachability gap, flipping that gate to "verified" (the wrong
+    // direction). `create_dir` fails if the path already exists, so a
+    // successful create means WE made it (default perms exclude others' writes);
+    // we NEVER reuse/remove a pre-existing dir, and we try a few unpredictable
+    // names (pid + nanos + counter) so an attacker cannot pre-create them all.
+    let manifest_dir = {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let mut created = None;
+        for attempt in 0..64u32 {
+            let candidate = base.join(format!("pitbull-reach-{pid}-{nanos}-{attempt}"));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => {
+                    created = Some(candidate);
+                    break;
+                }
+                // Path exists (stale or attacker-pre-created): do NOT reuse it.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("creating reachability manifest dir {}", candidate.display())
+                    });
+                }
+            }
+        }
+        created.ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not exclusively create a private reachability manifest dir under {} \
+                 (64 attempts exhausted); refusing to proceed",
+                base.display(),
+            )
+        })?
+    };
     eprintln!("pitbull check: invoking cargo check with RUSTC_WORKSPACE_WRAPPER={}", wrapper.display());
     eprintln!("pitbull check: PITBULL_TOML={}", pitbull_toml_abs.display());
     let status = std::process::Command::new("cargo")

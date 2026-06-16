@@ -30,9 +30,14 @@ pub struct VcGoal {
     /// that case prevents `(assert false)`-style precondition
     /// poisoning from silently "verifying" unsafe code.
     ///
-    /// `None` when the obligation has no assumptions (every
-    /// assertion set with zero assumptions is trivially
-    /// consistent, no extra solver call needed).
+    /// For `ArithmeticOverflow` / `IndexBound`: `None` when the obligation has
+    /// no assumptions (a zero-assumption set is trivially consistent, no extra
+    /// solver call needed). For `EnsuresPostcondition` the keying differs —
+    /// `obligation.assumptions` is always empty there (preconditions are baked
+    /// into the visitor-built `discharge_smt`), so this field instead carries
+    /// the visitor-supplied `consistency_smt`, which is `Some` exactly when the
+    /// ensures has preconditions to check for vacuity (see the
+    /// `EnsuresPostcondition` arm of `compile`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consistency_check: Option<String>,
 }

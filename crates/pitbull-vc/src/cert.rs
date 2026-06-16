@@ -22,17 +22,21 @@
 //! - **Tampering of the SMT problem** — if the recorded `smt` is
 //!   altered, replaying it generally yields a different verdict.
 //!
-//! ## What is NOT here yet (deliberate)
-//! - Cryptographic signing of the certificate (the "signed solver
-//!   outputs" half of the v0.3 roadmap). Pitbull deliberately ships no
-//!   hashing/crypto dependency today (see `pitbull-subset/Cargo.toml`),
-//!   so a self-referential hash would give only weak,
-//!   non-adversarial assurance. Replay (re-run + compare) is the
-//!   substance; a signature layer is a deliberate later step that adds
-//!   provenance/non-repudiation on top of this format.
-//! - Emission from the wrapper and a `cargo pitbull replay`
-//!   subcommand — wired in the follow-up increment (this module is the
-//!   stable-buildable data model + replay logic those will use).
+//! ## Status (updated 2026-06-15)
+//! - **Signing: DONE (HMAC-SHA256, Task T.3).** `sign` / `verify_signature`
+//!   below MAC the whole bundle — every field except `signature`, including the
+//!   coverage ledger (`total_obligations` / `uncertified`) — so a swapped SMT,
+//!   an edited verdict, or a lowered threshold is detectable to anyone holding
+//!   the key. `pitbull-vc` depends on `sha2` + `hmac` for this (the
+//!   `pitbull-subset` TCB core still ships no crypto dependency).
+//! - **Emission + replay: DONE (Task T.2).** The wrapper emits a bundle to
+//!   `PITBULL_CERT_OUT`; `cargo pitbull replay` re-runs each recorded SMT and
+//!   confirms BOTH reproduction AND full-verification coverage (`replay`
+//!   exit-0 requires `attests_full_verification`).
+//! - **Still future:** cross-DOMAIN non-repudiation needs an ASYMMETRIC layer
+//!   (Ed25519). HMAC is symmetric — it proves integrity within a trust domain,
+//!   but a holder of the key could re-sign a forged bundle. That asymmetric
+//!   layer is the remaining provenance step.
 //!
 //! Replay needs only the solvers and this crate — it does NOT need the
 //! nightly `rustc_public` lane, because it re-runs recorded SMT rather
@@ -564,7 +568,13 @@ impl CertificateBundle {
     /// `cargo pitbull replay` subcommand, which requires both.
     #[must_use]
     pub fn attests_full_verification(&self) -> bool {
-        self.ledger_consistent()
+        // A zero-obligation bundle attests NOTHING — there is nothing that was
+        // verified, so it must not read as "fully verified". Defense in depth
+        // (2026-06-15 red-team): `replay`'s empty-bundle guard already bails
+        // before this is consulted, but a future caller without that guard
+        // must not mistake an empty (or all-zero) bundle for a verification.
+        self.total_obligations != 0
+            && self.ledger_consistent()
             && self.uncertified.is_empty()
             && self
                 .obligations
@@ -877,6 +887,22 @@ mod tests {
         b.total_obligations = 1;
         assert!(b.ledger_consistent());
         assert!(b.attests_full_verification());
+    }
+
+    /// Defense in depth (2026-06-15 red-team): a zero-obligation bundle is
+    /// ledger-consistent (0 == 0) with nothing uncertified and `.all()`
+    /// vacuously true — but it attests NOTHING and must NOT read as fully
+    /// verified, lest a future caller (without `replay`'s empty-guard) treat
+    /// an empty bundle as a verification.
+    #[test]
+    fn attests_full_verification_false_for_empty_bundle() {
+        let b = CertificateBundle::new("0.1.0", "c", 2, 60, vec!["z3".into(), "cvc5".into()]);
+        assert_eq!(b.total_obligations, 0);
+        assert!(b.ledger_consistent(), "0 == 0 + 0");
+        assert!(
+            !b.attests_full_verification(),
+            "a zero-obligation bundle must not attest full verification",
+        );
     }
 
     /// An obligation left UNCERTIFIED (e.g. a pending PB043 panic) means the
