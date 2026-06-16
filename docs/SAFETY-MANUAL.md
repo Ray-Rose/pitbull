@@ -217,14 +217,17 @@ assumptions, security/supply-chain, and core operator-rule obligations) found
 **no false-discharge path** anywhere in the TCB. It surfaced three things you
 should nonetheless know — none is a false discharge, each is disclosed here so
 the boundary is never *silent*:
-- **Index bounds are modeled at 64-bit regardless of `target_pointer_width`.**
-  The PB054 index-bound SMT encoding fixes index/length bit-vectors at 64 bits
-  (`pitbull-vc/src/smt.rs::INDEX_SMT_BITS`). This is a SOUND over-approximation
-  — a 64-bit `unsat` implies `unsat` at any narrower true width — so it never
-  yields a false `verified`; but on a 16/32-bit target it may *fail to
-  discharge* a bound that is only provable using the narrower `usize` range
-  (it errs toward rejection). `target_pointer_width` still drives PB020
-  stack-sizing. Native per-width index modeling is tracked completeness work.
+- **Index bounds are modeled at the target `usize` width (resolved 2026-06-16,
+  frontier #5).** The PB054 index-bound SMT encoding now sizes the index/length
+  bit-vectors to `subset.target_pointer_width` (16/32/64): the wrapper threads
+  it via `compile_with_index_bits`, and the visitor sizes index-precondition
+  literals to the same width, so the model is EXACT on every supported target
+  (previously it over-approximated at 64 bits — sound, but it could *fail to
+  discharge* a bound only provable at the narrower `usize` range). The 64-bit
+  value is now only the fallback (`pitbull-vc/src/smt.rs::DEFAULT_INDEX_BITS`)
+  when no width is threaded; a literal/BV width mismatch would be an SMT sort
+  error → undischarged (fail closed), never a false `verified`.
+  `target_pointer_width` also drives PB020 stack-sizing.
 - **`#[requires("i < len")]` trusts `len` to be the slice's true length.** A
   precondition that bounds an index — e.g. `i < len` discharging `s[i]` —
   constrains a *free* length symbol; the v0.2 spec language cannot yet bind it

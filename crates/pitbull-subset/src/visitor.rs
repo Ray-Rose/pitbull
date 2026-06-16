@@ -2063,18 +2063,34 @@ impl<'cfg> SubsetVisitor<'cfg> {
     ) {
         let seq = self.vc_obligations.len();
         let id = format!("pb054-idx-{seq}");
+        // Frontier #5 (2026-06-16): translate index preconditions against the
+        // configured target `usize` width, so any literal (`i < 100`) is sized
+        // to the SAME width the index/length bit-vectors use in
+        // `compile_with_index_bits` (the wrapper passes
+        // `u32::from(target_pointer_width)`). A `usize` index is unsigned, so
+        // the predicate is `bvult`/etc. at any width; `i < len`
+        // (ident-vs-ident) is width-independent. Keeping the two in lockstep
+        // avoids an SMT sort mismatch (which would fail closed anyway).
+        let idx_ty: &str = match self.config.subset.target_pointer_width {
+            16 => "u16",
+            32 => "u32",
+            // 64 and (defensively) any other validated value use the 64-bit
+            // default, matching `smt::DEFAULT_INDEX_BITS`.
+            _ => "u64",
+        };
         // Each precondition string goes through three potential
         // paths, in order:
         //   1. `parse_ident_vs_ident_predicate` — `i < len`-style
         //      (vision-audit #2 / Phase B 2026-05-26). Translates
-        //      with target type `u64` (IndexBound's canonical
-        //      width). The two idents must resolve in the SMT
-        //      problem; we check against the known-name set
-        //      {`idx`, `len`, idx_source_name?} and audit-note
-        //      otherwise.
-        //   2. `parse_predicate` — `i < 100`-style ident-vs-int.
-        //      Same name binding rules; literal range-checked
-        //      against u64.
+        //      against the target `usize` type (`idx_ty`, sized from
+        //      `target_pointer_width` — frontier #5); for ident-vs-ident
+        //      the output is width-independent. The two idents must
+        //      resolve in the SMT problem; we check against the
+        //      known-name set {`idx`, `len`, idx_source_name?} and
+        //      audit-note otherwise.
+        //   2. `parse_predicate` — `i < 100`-style ident-vs-int. Same
+        //      name binding rules; literal sized to and range-checked
+        //      against the target `usize` width (`idx_ty`).
         //   3. `validate_assertion_form` — raw SMT-LIB splice
         //      (O.1 escape hatch). For preconditions that
         //      reference symbols our parser doesn't know.
@@ -2098,7 +2114,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 if known_smt_names.contains(&p.lhs.as_str())
                     && known_smt_names.contains(&p.rhs.as_str())
                 {
-                    match crate::predicate::ident_vs_ident_to_smt_assertion(&p, "u64") {
+                    match crate::predicate::ident_vs_ident_to_smt_assertion(&p, idx_ty) {
                         Ok(smt) => {
                             assumptions.push(smt);
                             continue;
@@ -2127,7 +2143,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
                     // `var` resolves; translate vs u64 (IndexBound
                     // canonical width). The translator emits
                     // `(assert (bv<op> <var> <hex-literal>))`.
-                    match crate::predicate::predicate_to_smt_assertion(&p, &p.var, "u64") {
+                    match crate::predicate::predicate_to_smt_assertion(&p, &p.var, idx_ty) {
                         Ok(smt) => {
                             assumptions.push(smt);
                             continue;

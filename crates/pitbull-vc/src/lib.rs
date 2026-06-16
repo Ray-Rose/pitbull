@@ -68,4 +68,4 @@ pub mod vc;
 pub use pitbull_subset::{ArithOp, VcObligation, VcObligationKind};
 pub use cert::{CertificateBundle, ObligationCertificate, ReplayOutcome};
 pub use solver::SolverResult;
-pub use vc::{compile, VcGoal};
+pub use vc::{compile, compile_with_index_bits, VcGoal};

@@ -35,22 +35,24 @@ use pitbull_subset::ArithOp;
 ///
 /// Slice / array indices in Rust are `usize`, which is target-
 /// pointer-width-dependent. The user pins the target pointer width in
-/// `pitbull.toml`'s `[subset]` table — the field
-/// `SubsetConfig.subset.target_pointer_width` ALREADY EXISTS and is
-/// validated (16/32/64) by `config.rs`. What is deferred is only the
-/// PLUMBING: the v0.2 scaffold does not yet thread that value down to the
-/// SMT layer, so this is hardcoded to 64. When the plumbing lands, this
-/// constant becomes a parameter resolved from that field.
+/// `pitbull.toml`'s `[subset]` table (`SubsetConfig.subset.target_pointer_width`,
+/// validated to 16/32/64). As of 2026-06-16 (frontier #5) that value IS
+/// threaded down to the SMT layer: the index-bound emitters take a `bits`
+/// parameter, `compile_with_index_bits` carries the configured width, and the
+/// wrapper passes `cfg.subset.target_pointer_width`. So on a 16/32-bit target
+/// the index/length bit-vectors are now modeled at the EXACT `usize` width
+/// (the disclosed 64-bit over-approximation is gone for those targets). This
+/// constant is the FALLBACK default used by `compile` and the test-only
+/// convenience emitters when no width is threaded.
 ///
-/// Rationale for hard-coding 64 vs 32: false-negative direction
-/// is asymmetric — a 64-bit encoding can model 32-bit problems
-/// (the extra bits are unconstrained, the solver finds the same
-/// counterexample), but a 32-bit encoding can't model 64-bit
-/// problems (the solver may report unsat for a problem with a
-/// 64-bit-only counterexample). So choosing the wider default
-/// keeps the encoding sound across both target widths until the
-/// proper threading is wired.
-const INDEX_SMT_BITS: u32 = 64;
+/// Rationale for 64 as the FALLBACK: the false-negative direction is
+/// asymmetric — a 64-bit encoding can model 32-bit problems (the extra bits
+/// are unconstrained, the solver finds the same counterexample), but a 32-bit
+/// encoding can't model 64-bit problems (it may report unsat for a problem
+/// with a 64-bit-only counterexample). So the wider value is the SOUND default
+/// when no target width is threaded; when one IS threaded (production), the
+/// exact `target_pointer_width` is used instead.
+pub const DEFAULT_INDEX_BITS: u32 = 64;
 /// Information about a primitive integer type for SMT encoding.
 struct IntInfo {
     /// Bit width.
@@ -317,17 +319,28 @@ pub fn emit_overflow_problem_with_assumptions(
 /// the negated-safety assertion, exactly as
 /// `emit_overflow_problem_with_assumptions` does — same audit
 /// posture, same lex-validation upstream contract.
+/// Width-parameterized index-bound problem (frontier #5, 2026-06-16). `bits`
+/// is the target `usize` width (16/32/64) threaded from
+/// `target_pointer_width`; the index/length bit-vectors and the source-name
+/// alias are all declared at that width, so on a 16/32-bit target the model is
+/// EXACT rather than the 64-bit over-approximation. The caller must ensure any
+/// `assumptions` (precondition literals) are sized to the SAME `bits` — the
+/// visitor does this by translating index preconditions against the matching
+/// `usize`-typed name (see `visitor::index_smt_ty_name`). A width mismatch
+/// would be an SMT sort error → solver `Error` → undischarged (fail closed),
+/// never a false discharge.
 #[must_use]
-pub fn emit_index_bound_problem_with_assumptions(
+pub fn emit_index_bound_problem_with_assumptions_sized(
     idx_alias: Option<&str>,
     assumptions: &[String],
+    bits: u32,
 ) -> String {
     let mut smt = format!(
         "(set-logic QF_BV)\n\
-         (declare-const __pb_idx (_ BitVec {INDEX_SMT_BITS}))\n\
-         (declare-const __pb_len (_ BitVec {INDEX_SMT_BITS}))\n\
-         (define-fun idx () (_ BitVec {INDEX_SMT_BITS}) __pb_idx)\n\
-         (define-fun len () (_ BitVec {INDEX_SMT_BITS}) __pb_len)\n",
+         (declare-const __pb_idx (_ BitVec {bits}))\n\
+         (declare-const __pb_len (_ BitVec {bits}))\n\
+         (define-fun idx () (_ BitVec {bits}) __pb_idx)\n\
+         (define-fun len () (_ BitVec {bits}) __pb_len)\n",
     );
     // Source-name alias (Task P.2). The arg name is wrapped in
     // SMT-LIB quoted-symbol syntax so any Rust identifier is
@@ -345,7 +358,7 @@ pub fn emit_index_bound_problem_with_assumptions(
         // so we just skip the source-name alias when it would collide.
         if name != "idx" && name != "len" {
             smt.push_str(&format!(
-                "(define-fun |{name}| () (_ BitVec {INDEX_SMT_BITS}) __pb_idx)\n",
+                "(define-fun |{name}| () (_ BitVec {bits}) __pb_idx)\n",
             ));
         }
     }
@@ -366,9 +379,19 @@ pub fn emit_index_bound_problem_with_assumptions(
     smt.push_str("(assert (bvuge __pb_idx __pb_len))\n(check-sat)\n");
     smt
 }
+/// Back-compat: the index-bound problem at the `DEFAULT_INDEX_BITS` (64) width.
+/// Used by callers that don't thread a target width (tests, and `compile`'s
+/// no-width entry point).
+#[must_use]
+pub fn emit_index_bound_problem_with_assumptions(
+    idx_alias: Option<&str>,
+    assumptions: &[String],
+) -> String {
+    emit_index_bound_problem_with_assumptions_sized(idx_alias, assumptions, DEFAULT_INDEX_BITS)
+}
 /// Convenience wrapper: emit an SMT-LIB problem with no
-/// assumptions and no idx alias. Useful in tests; production
-/// path uses the `_with_assumptions` variant directly.
+/// assumptions and no idx alias, at the default width. Useful in tests;
+/// production threads the target width via the `_sized` variant.
 #[must_use]
 pub fn emit_index_bound_problem() -> String {
     emit_index_bound_problem_with_assumptions(None, &[])
@@ -387,16 +410,17 @@ pub fn emit_index_bound_problem() -> String {
 /// problems — otherwise the consistency check would see a
 /// different model and the F1 guard could mis-fire.
 #[must_use]
-pub fn emit_index_bound_consistency_check(
+pub fn emit_index_bound_consistency_check_sized(
     idx_alias: Option<&str>,
     assumptions: &[String],
+    bits: u32,
 ) -> String {
     let mut smt = format!(
         "(set-logic QF_BV)\n\
-         (declare-const __pb_idx (_ BitVec {INDEX_SMT_BITS}))\n\
-         (declare-const __pb_len (_ BitVec {INDEX_SMT_BITS}))\n\
-         (define-fun idx () (_ BitVec {INDEX_SMT_BITS}) __pb_idx)\n\
-         (define-fun len () (_ BitVec {INDEX_SMT_BITS}) __pb_len)\n",
+         (declare-const __pb_idx (_ BitVec {bits}))\n\
+         (declare-const __pb_len (_ BitVec {bits}))\n\
+         (define-fun idx () (_ BitVec {bits}) __pb_idx)\n\
+         (define-fun len () (_ BitVec {bits}) __pb_len)\n",
     );
     if let Some(name) = idx_alias {
         // Skip when the source-arg name collides with one of the
@@ -411,7 +435,7 @@ pub fn emit_index_bound_consistency_check(
         // so we just skip the source-name alias when it would collide.
         if name != "idx" && name != "len" {
             smt.push_str(&format!(
-                "(define-fun |{name}| () (_ BitVec {INDEX_SMT_BITS}) __pb_idx)\n",
+                "(define-fun |{name}| () (_ BitVec {bits}) __pb_idx)\n",
             ));
         }
     }
@@ -423,6 +447,15 @@ pub fn emit_index_bound_consistency_check(
     }
     smt.push_str("(check-sat)\n");
     smt
+}
+/// Back-compat: the index-bound consistency check at the `DEFAULT_INDEX_BITS`
+/// (64) width. Must be passed the SAME `bits` as the matching main problem.
+#[must_use]
+pub fn emit_index_bound_consistency_check(
+    idx_alias: Option<&str>,
+    assumptions: &[String],
+) -> String {
+    emit_index_bound_consistency_check_sized(idx_alias, assumptions, DEFAULT_INDEX_BITS)
 }
 #[cfg(test)]
 mod tests {
@@ -775,5 +808,30 @@ mod tests {
             "alias must be defined before the assumption uses it; \
              alias={alias}, assumption={assumption}",
         );
+    }
+    /// Frontier #5 (2026-06-16): the `_sized` emitter models the index/length
+    /// bit-vectors at the THREADED target width (16/32), not the 64-bit
+    /// default — so a 16/32-bit target gets the exact `usize` model instead of
+    /// the over-approximation. The no-bits back-compat wrapper still defaults
+    /// to 64.
+    #[test]
+    fn index_bound_sized_uses_threaded_width() {
+        let smt32 = emit_index_bound_problem_with_assumptions_sized(Some("i"), &[], 32);
+        assert!(smt32.contains("(declare-const __pb_idx (_ BitVec 32))"), "got:\n{smt32}");
+        assert!(smt32.contains("(declare-const __pb_len (_ BitVec 32))"), "got:\n{smt32}");
+        assert!(smt32.contains("(define-fun |i| () (_ BitVec 32) __pb_idx)"), "got:\n{smt32}");
+        assert!(smt32.contains("(assert (bvuge __pb_idx __pb_len))"), "got:\n{smt32}");
+        let smt16 = emit_index_bound_problem_with_assumptions_sized(None, &[], 16);
+        assert!(smt16.contains("(declare-const __pb_idx (_ BitVec 16))"), "got:\n{smt16}");
+        // Consistency check mirrors the width.
+        let cs32 = emit_index_bound_consistency_check_sized(None, &["(assert (bvult idx #x00000064))".into()], 32);
+        assert!(cs32.contains("(declare-const __pb_idx (_ BitVec 32))"), "got:\n{cs32}");
+        assert!(!cs32.contains("bvuge"), "consistency check has no safety predicate; got:\n{cs32}");
+        // Back-compat no-bits wrapper still defaults to 64.
+        assert!(
+            emit_index_bound_problem_with_assumptions(None, &[])
+                .contains("(declare-const __pb_idx (_ BitVec 64))"),
+        );
+        assert_eq!(DEFAULT_INDEX_BITS, 64);
     }
 }

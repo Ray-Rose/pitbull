@@ -1002,7 +1002,13 @@ impl PitbullCallbacks {
             }
             let timeout = std::time::Duration::from_secs(raw_timeout.max(1));
             let (undischarged, certs, uncertified) =
-                dispatch_vc_obligations(&report, &solvers, threshold, timeout);
+                dispatch_vc_obligations(
+                    &report,
+                    &solvers,
+                    threshold,
+                    timeout,
+                    u32::from(cfg.subset.target_pointer_width),
+                );
             self.undischarged_obligations += undischarged;
             // Optional proof-certificate emission (Task T.2). When
             // PITBULL_CERT_OUT is set, write the replayable certificate
@@ -1184,6 +1190,8 @@ fn dispatch_vc_obligations(
     solvers: &[pitbull_vc::solver::Solver],
     threshold: usize,
     timeout: std::time::Duration,
+    // Target `usize` width (16/32/64) for PB054 index modeling (frontier #5).
+    index_bits: u32,
 ) -> (
     usize,
     Vec<pitbull_vc::cert::ObligationCertificate>,
@@ -1209,7 +1217,7 @@ fn dispatch_vc_obligations(
         // verdict line, so tests/SARIF consumers and auditors don't
         // have to map `pb054-idx-0` → PB054.
         let rule = obligation.kind.rule_id();
-        let Some(goal) = pitbull_vc::compile(obligation) else {
+        let Some(goal) = pitbull_vc::compile_with_index_bits(obligation, index_bits) else {
             eprintln!(
                 "pitbull-rustc: vc {} ({rule}): pending (compilation not yet supported for {:?})",
                 obligation.id, obligation.kind,

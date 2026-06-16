@@ -51,6 +51,19 @@ pub struct VcGoal {
 /// so an auditor sees the gap.
 #[must_use]
 pub fn compile(obligation: &VcObligation) -> Option<VcGoal> {
+    compile_with_index_bits(obligation, crate::smt::DEFAULT_INDEX_BITS)
+}
+/// Like [`compile`], but models PB054 `IndexBound` problems at `index_bits`
+/// (the target `usize` width — 16/32/64) instead of the 64-bit default
+/// (frontier #5, 2026-06-16). The wrapper passes
+/// `cfg.subset.target_pointer_width`; the visitor sizes the index-precondition
+/// literals to the SAME width, so the bit-vectors and literals stay consistent
+/// (a mismatch would be an SMT sort error → solver `Error` → undischarged,
+/// fail closed — never a false discharge). Other obligation kinds ignore
+/// `index_bits` (ArithmeticOverflow uses the operand's own type width;
+/// EnsuresPostcondition carries visitor-built SMT).
+#[must_use]
+pub fn compile_with_index_bits(obligation: &VcObligation, index_bits: u32) -> Option<VcGoal> {
     let (smt, consistency_check) = match &obligation.kind {
         VcObligationKind::ArithmeticOverflow { op, ty_name } => {
             let main = crate::smt::emit_overflow_problem_with_assumptions(
@@ -85,16 +98,18 @@ pub fn compile(obligation: &VcObligation) -> Option<VcGoal> {
             // and the verdict is "sat" (counterexample exists),
             // which is the honest verdict for an unproven claim.
             let alias = idx_source_name.as_deref();
-            let main = crate::smt::emit_index_bound_problem_with_assumptions(
+            let main = crate::smt::emit_index_bound_problem_with_assumptions_sized(
                 alias,
                 &obligation.assumptions,
+                index_bits,
             );
             let consistency = if obligation.assumptions.is_empty() {
                 None
             } else {
-                Some(crate::smt::emit_index_bound_consistency_check(
+                Some(crate::smt::emit_index_bound_consistency_check_sized(
                     alias,
                     &obligation.assumptions,
+                    index_bits,
                 ))
             };
             (main, consistency)
@@ -477,6 +492,32 @@ mod tests {
             first_idx < safety_idx,
             "assumptions must come before the safety predicate so the \
              solver has them as hypotheses; first={first_idx}, safety={safety_idx}",
+        );
+    }
+    /// Frontier #5 (2026-06-16): `compile_with_index_bits` threads the target
+    /// `usize` width into the IndexBound goal (32-bit here), while the default
+    /// `compile` keeps the 64-bit fallback.
+    #[test]
+    fn compile_with_index_bits_threads_target_width() {
+        let obligation = VcObligation {
+            id: "pb054-idx-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::IndexBound { idx_source_name: Some("i".into()) },
+            assumptions: vec!["(assert (bvult i len))".into()],
+        };
+        let goal32 = compile_with_index_bits(&obligation, 32).expect("IndexBound compiles");
+        assert!(
+            goal32.smt.contains("(declare-const __pb_idx (_ BitVec 32))")
+                && goal32.smt.contains("(define-fun |i| () (_ BitVec 32) __pb_idx)"),
+            "32-bit width must thread into the goal; got:\n{}",
+            goal32.smt,
+        );
+        // The default `compile` stays at the 64-bit fallback.
+        let goal64 = compile(&obligation).expect("IndexBound compiles");
+        assert!(
+            goal64.smt.contains("(declare-const __pb_idx (_ BitVec 64))"),
+            "default compile must stay 64-bit; got:\n{}",
+            goal64.smt,
         );
     }
 }
