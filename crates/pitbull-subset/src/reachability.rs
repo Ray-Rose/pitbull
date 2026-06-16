@@ -45,21 +45,31 @@
 //! out-of-phase (worst case for the user, safest for soundness). The real
 //! implementation queries `rustc_public::mir::MirPhase`.
 //!
-//! ## Production status (2026-06-14)
+//! ## Production status (updated 2026-06-15 deep-audit)
 //!
-//! `ReachabilityDriver` above is a COMPLETE, unit-tested reference
-//! implementation of the call-closure walk, but it is **not yet the
-//! production path**: the `pitbull-rustc` wrapper currently does a flat
-//! `all_local_items()` walk filtered by `verify_roots`, which on its own
-//! would skip in-crate callees of a root (a fail-open under explicit
-//! narrowing — issue #27). Until the driver is wired in (auto-walking the
-//! closure), the wrapper closes that hole the fail-CLOSED way: it collects
-//! the callees of every walked body (`callee_paths`) and, via
+//! `ReachabilityDriver` below is a unit-tested **reference** for the
+//! call-closure walk; it is **exercised only by this module's tests, not by
+//! production** (nothing in `pitbull-driver` constructs it). The
+//! `pitbull-rustc` wrapper does a flat `all_local_items()` walk filtered by
+//! `verify_roots`, which on its own would skip in-crate callees of a root (a
+//! fail-open under explicit narrowing — issue #27). Instead of the driver,
+//! the wrapper closes that hole the fail-CLOSED way: it collects the callees
+//! of every walked body (`callee_paths`) and, via
 //! `unverified_reachable_callees`, reports any in-crate function reachable
 //! from a verified root that was not itself verified — forcing a nonzero
 //! exit. Applied every run, this transitively requires the whole reachable
 //! in-crate closure to be covered before a "verified" verdict is possible.
-//! Both helpers are pure and live here so they are testable on stable.
+//! Those two helpers are pure and live here so they are testable on stable.
+//!
+//! **Do not wire `ReachabilityDriver` in as the production path without first
+//! closing the gaps the wrapper already handles.** The 2026-06-15 audit found
+//! it short of production-ready on two counts the prose previously hid by
+//! calling it "COMPLETE": it has no drop-glue injection (the wrapper adds
+//! every local `Drop::drop` impl to the referenced set, #27 drop-glue) and no
+//! cross-crate manifest (`ReachManifest`). Its previously-SILENT
+//! unavailable-body skip is now fail-closed — a reachable function whose body
+//! the provider can't supply records a `CoverageGap` note (see `run`) rather
+//! than being dropped — but the other two gaps are why it stays a reference.
 use crate::config::SubsetConfig;
 use crate::diagnostic::SubsetReport;
 use crate::mir_api::{Body, DefId, Span, Ty};
@@ -142,9 +152,21 @@ impl<'cfg, P: BodyProvider> ReachabilityDriver<'cfg, P> {
         }
     }
     /// Run the closure walk and produce the accumulated subset report.
+    ///
+    /// Fail-closed posture (2026-06-15 deep audit): a reachable, non-trusted,
+    /// non-excluded function whose body the provider cannot supply is NOT
+    /// silently skipped — it records a `CoverageGap` audit note (which the
+    /// wrapper folds into the exit code, fail closed). A body the verifier
+    /// could not see is a safety check that could not run, never an implicit
+    /// pass. (A genuinely foreign/extern item is the FFI surface, PB056, and
+    /// must be excluded or `#[pitbull::trusted]` explicitly.)
     pub fn run(mut self, roots: Vec<ReachableItem>) -> SubsetReport {
         let mut visitor = SubsetVisitor::new(self.config);
         let mut worklist = roots;
+        // Reachable functions whose body the provider could not supply.
+        // Recorded as coverage gaps after the walk (fail closed) rather than
+        // dropped — see the method doc and the module-level production note.
+        let mut unavailable_bodies: Vec<(String, Span)> = Vec::new();
         while let Some(item) = worklist.pop() {
             if self.visited.contains(&item.def_id.0) {
                 continue;
@@ -156,9 +178,14 @@ impl<'cfg, P: BodyProvider> ReachabilityDriver<'cfg, P> {
             match item.kind {
                 ItemKind::Function => {
                     let Some((body, callees)) = self.provider.body(&item) else {
-                        // Body unavailable. In production this means the
-                        // item is foreign (PB056 territory) or extern; the
-                        // visitor's signature check elsewhere flags it.
+                        // Body unavailable for a reachable function the verifier
+                        // was asked to cover. Fail closed: record a coverage gap
+                        // so the exit code reflects the un-analyzed body, instead
+                        // of the historic silent `continue` (a latent false
+                        // discharge if this driver were ever wired into
+                        // production).
+                        unavailable_bodies
+                            .push((item.path.clone(), self.provider.item_span(&item)));
                         continue;
                     };
                     visitor.visit_body(&body, item.trusted);
@@ -184,7 +211,21 @@ impl<'cfg, P: BodyProvider> ReachabilityDriver<'cfg, P> {
                 }
             }
         }
-        visitor.into_report()
+        let mut report = visitor.into_report();
+        // Fold unavailable-body coverage gaps into the report (fail closed).
+        for (path, span) in unavailable_bodies {
+            report.audit_notes.push(crate::diagnostic::AuditNote {
+                span,
+                message: format!(
+                    "reachability: body unavailable for reachable function `{path}`; \
+                     it could not be verified — exclude it, mark it \
+                     #[pitbull::trusted], or supply its MIR. Reported as a coverage \
+                     gap (fail closed)."
+                ),
+                kind: crate::diagnostic::AuditNoteKind::CoverageGap,
+            });
+        }
+        report
     }
     fn is_excluded(&self, path: &str) -> bool {
         self.exclude_patterns.iter().any(|pat| pattern_matches(pat, path))
@@ -545,6 +586,37 @@ mod tests {
         let driver = ReachabilityDriver::new(&cfg, provider);
         let report = driver.run(vec![fn_item(1, "crate::root")]);
         assert!(report.is_clean(), "report not clean: {:?}", report.errors);
+    }
+    /// Fail-closed regression (2026-06-15 deep audit): a reachable,
+    /// non-trusted, non-excluded function whose body the provider cannot
+    /// supply must NOT be a silent pass — the driver records a `CoverageGap`
+    /// note (which the wrapper folds into the exit code, fail closed).
+    /// Pre-fix this arm did a bare `continue`, dropping the un-analyzed body
+    /// silently — a latent false discharge had the driver been wired into
+    /// production.
+    #[test]
+    fn unavailable_body_is_coverage_gap_not_silent_skip() {
+        // Root has a body and references `crate::opaque`; the provider has NO
+        // body for `opaque` (id 2), simulating a reachable item whose MIR the
+        // walk cannot obtain.
+        let mut bodies = HashMap::new();
+        bodies.insert(1, (empty_body(DefId(1)), vec![fn_item(2, "crate::opaque")]));
+        // id 2 is deliberately absent from `bodies`.
+        let provider = StubProvider { bodies, types: HashMap::new() };
+        let cfg = SubsetConfig::default_for_test();
+        let driver = ReachabilityDriver::new(&cfg, provider);
+        let report = driver.run(vec![fn_item(1, "crate::root")]);
+        assert!(
+            report.coverage_gap_count() >= 1,
+            "an unavailable reachable body must record a coverage gap (fail \
+             closed), not be silently skipped; audit_notes={:?}",
+            report.audit_notes,
+        );
+        assert!(
+            report.audit_notes.iter().any(|n| n.message.contains("crate::opaque")),
+            "the coverage gap should name the unavailable function; got {:?}",
+            report.audit_notes,
+        );
     }
     #[test]
     fn trusted_does_not_propagate() {

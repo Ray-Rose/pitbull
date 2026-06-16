@@ -984,7 +984,7 @@ impl PitbullCallbacks {
                 );
             }
             let timeout = std::time::Duration::from_secs(raw_timeout.max(1));
-            let (undischarged, certs) =
+            let (undischarged, certs, uncertified) =
                 dispatch_vc_obligations(&report, &solvers, threshold, timeout);
             self.undischarged_obligations += undischarged;
             // Optional proof-certificate emission (Task T.2). When
@@ -1010,6 +1010,17 @@ impl PitbullCallbacks {
                         solvers.iter().map(|s| s.name.to_string()).collect(),
                     );
                     bundle.obligations = certs;
+                    // Complete coverage ledger (2026-06-15 deep audit): record
+                    // the TOTAL obligation count and every obligation that
+                    // produced no certificate, so a replayer can distinguish
+                    // partial coverage from full verification instead of
+                    // trusting "all listed certs discharged". `total_obligations`
+                    // is the true obligation count; if it ever disagrees with
+                    // certs + uncertified (a producer bug), the ledger check in
+                    // `CertificateBundle::from_json` rejects the bundle at
+                    // replay (fail closed).
+                    bundle.total_obligations = report.vc_obligations.len();
+                    bundle.uncertified = uncertified;
                     // Sign the bundle if a key is configured (Task T.3).
                     // PITBULL_CERT_KEY is a path to a key file; an
                     // HMAC-SHA256 over the canonical bundle makes the
@@ -1141,15 +1152,24 @@ fn solver_breakdown(results: &[(String, pitbull_vc::SolverResult)]) -> String {
 /// or buggy `z3` on `PATH` could rubber-stamp unsafe code by
 /// wrongly returning `unsat` (Safety Manual §3.3).
 ///
-/// Returns the number of undischarged obligations for the
-/// wrapper's exit-code calculation (F10).
+/// Returns `(undischarged_count, certificates, uncertified)`: the
+/// undischarged count for the wrapper's exit-code calculation (F10); one
+/// `ObligationCertificate` per obligation that reached the gate; and one
+/// `UncertifiedObligation` per obligation that did NOT (pending /
+/// consistency-refused / consistency-unconfirmed). The caller writes both
+/// vecs plus the total count into the bundle so the certificate is a COMPLETE
+/// coverage ledger, not just the discharged subset (2026-06-15 deep audit).
 #[cfg(rustc_public_real)]
 fn dispatch_vc_obligations(
     report: &pitbull_subset::SubsetReport,
     solvers: &[pitbull_vc::solver::Solver],
     threshold: usize,
     timeout: std::time::Duration,
-) -> (usize, Vec<pitbull_vc::cert::ObligationCertificate>) {
+) -> (
+    usize,
+    Vec<pitbull_vc::cert::ObligationCertificate>,
+    Vec<pitbull_vc::cert::UncertifiedObligation>,
+) {
     use pitbull_vc::solver::{run_solvers, vote, AgreementVerdict};
     let mut solver_missing_announced = false;
     let mut discharged = 0usize;
@@ -1161,6 +1181,10 @@ fn dispatch_vc_obligations(
     // decision to replay; their "undischarged" status is recorded on
     // stderr. Certifying those refusal decisions is a future extension.
     let mut certs: Vec<pitbull_vc::cert::ObligationCertificate> = Vec::new();
+    // Obligations that never reach the gate (pending / consistency-refused /
+    // consistency-unconfirmed). Recorded so the certificate bundle is a
+    // COMPLETE ledger, not just the discharged subset (2026-06-15 deep audit).
+    let mut uncertified: Vec<pitbull_vc::cert::UncertifiedObligation> = Vec::new();
     for obligation in &report.vc_obligations {
         // Canonical PSS-1 rule ID (uppercase `PBxxx`) on every
         // verdict line, so tests/SARIF consumers and auditors don't
@@ -1171,6 +1195,11 @@ fn dispatch_vc_obligations(
                 "pitbull-rustc: vc {} ({rule}): pending (compilation not yet supported for {:?})",
                 obligation.id, obligation.kind,
             );
+            uncertified.push(pitbull_vc::cert::UncertifiedObligation {
+                id: obligation.id.clone(),
+                rule: rule.to_string(),
+                status: "pending".to_string(),
+            });
             undischarged += 1;
             continue;
         };
@@ -1202,6 +1231,11 @@ fn dispatch_vc_obligations(
                     obligation.id,
                     solver_breakdown(&cs_results),
                 );
+                uncertified.push(pitbull_vc::cert::UncertifiedObligation {
+                    id: obligation.id.clone(),
+                    rule: rule.to_string(),
+                    status: "consistency-refused".to_string(),
+                });
                 undischarged += 1;
                 continue;
             }
@@ -1243,6 +1277,11 @@ fn dispatch_vc_obligations(
                         sat_voters.len(),
                         solver_breakdown(&cs_results),
                     );
+                    uncertified.push(pitbull_vc::cert::UncertifiedObligation {
+                        id: obligation.id.clone(),
+                        rule: rule.to_string(),
+                        status: "consistency-unconfirmed".to_string(),
+                    });
                     undischarged += 1;
                     continue;
                 }
@@ -1356,7 +1395,7 @@ fn dispatch_vc_obligations(
         undischarged,
         solvers.len(),
     );
-    (undischarged, certs)
+    (undischarged, certs, uncertified)
 }
 /// Load pitbull.toml from `$PITBULL_TOML` (if set) or from `./pitbull.toml`
 /// in the current working directory. Falls back to the default test

@@ -146,7 +146,15 @@ pub enum SignatureStatus {
 /// On-disk format version. Bump on any breaking schema change so a
 /// replayer can refuse a format it doesn't understand (fail closed)
 /// rather than silently misread it.
-pub const CERT_FORMAT_VERSION: u32 = 1;
+///
+/// v2 (2026-06-15 deep audit): added the coverage ledger
+/// (`total_obligations` + `uncertified`) so a bundle attests the disposition
+/// of EVERY obligation, not just the ones that reached the gate. A v1 bundle
+/// still parses (the new fields default), but its coverage is treated as
+/// unknown → fail closed at replay. An older (v1-only) tool refuses a v2
+/// bundle via the `format_version > CERT_FORMAT_VERSION` check — also fail
+/// closed.
+pub const CERT_FORMAT_VERSION: u32 = 2;
 
 /// Stable short tag for a `SolverResult`, used in the serialized
 /// certificate. Kept here (not a `SolverResult` method) so the
@@ -215,6 +223,33 @@ pub struct SolverVerdictRecord {
     /// Verdict tag (`solver_result_tag`): `sat`/`unsat`/`unknown`/
     /// `timeout`/`error`/`not-installed`.
     pub verdict: String,
+}
+
+/// An obligation that produced NO replayable [`ObligationCertificate`]
+/// because it never reached the agreement gate: the VC compiler returned no
+/// goal (`pending`), or the precondition consistency guard refused it /
+/// could not confirm it. Recorded so the bundle is a COMPLETE ledger of the
+/// crate's obligations.
+///
+/// 2026-06-15 deep audit: before this, the wrapper counted these toward its
+/// (correct) exit code but emitted no certificate for them — so the bundle
+/// listed only the gate-reaching obligations with no denominator, and a
+/// replayer seeing "every listed cert discharged" could wrongly conclude the
+/// CRATE verified. A non-discharged obligation that DID reach the gate is
+/// instead an `ObligationCertificate` with a non-`discharged` verdict; this
+/// type is only for the ones that never got that far.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UncertifiedObligation {
+    /// Obligation id (e.g. `pb043-panic-0`).
+    pub id: String,
+    /// Canonical PSS-1 rule (e.g. `PB043`).
+    pub rule: String,
+    /// Why it never reached the gate: `pending` (no SMT compiled),
+    /// `consistency-refused` (preconditions contradictory), or
+    /// `consistency-unconfirmed` (could not confirm preconditions jointly
+    /// satisfiable).
+    pub status: String,
 }
 
 /// A replayable record of one obligation's gate decision.
@@ -401,8 +436,25 @@ pub struct CertificateBundle {
     pub timeout_seconds: u64,
     /// Solver pool names used to certify.
     pub solvers: Vec<String>,
-    /// One entry per obligation that reached the solver.
+    /// One entry per obligation that reached the agreement gate (it has a
+    /// replayable SMT decision). Obligations that never reached the gate are
+    /// in `uncertified`, not here.
     pub obligations: Vec<ObligationCertificate>,
+    /// Total VC obligations the crate produced — the denominator for
+    /// coverage. The bundle is a COMPLETE ledger iff this equals
+    /// `obligations.len() + uncertified.len()` (see `ledger_consistent`).
+    /// Defaulted for back-compat with format_version-1 bundles (which did not
+    /// record it); a 0 here on a bundle that has obligations means "coverage
+    /// unknown" and replay treats it as fail-closed (2026-06-15 deep audit).
+    #[serde(default)]
+    pub total_obligations: usize,
+    /// Obligations that produced no replayable certificate
+    /// (pending / consistency-refused / consistency-unconfirmed). Listed so
+    /// a replayer can detect PARTIAL coverage rather than mistaking "every
+    /// listed cert discharged" for "crate verified". Empty in the
+    /// fully-discharged case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncertified: Vec<UncertifiedObligation>,
     /// Hex HMAC-SHA256 over the canonical bundle content (everything
     /// except this field), set by [`CertificateBundle::sign`]. `None`
     /// for an unsigned bundle; omitted from the JSON when absent so
@@ -430,6 +482,8 @@ impl CertificateBundle {
             timeout_seconds,
             solvers,
             obligations: Vec::new(),
+            total_obligations: 0,
+            uncertified: Vec::new(),
             signature: None,
         }
     }
@@ -488,6 +542,35 @@ impl CertificateBundle {
     pub fn is_signed(&self) -> bool {
         self.signature.is_some()
     }
+    /// Whether the obligation ledger adds up: `total_obligations` equals the
+    /// certified-plus-uncertified count. A mismatch means the bundle is
+    /// incomplete (a v1 bundle with `total_obligations == 0`) or tampered;
+    /// either way replay must fail closed (2026-06-15 deep audit).
+    #[must_use]
+    pub fn ledger_consistent(&self) -> bool {
+        self.total_obligations == self.obligations.len() + self.uncertified.len()
+    }
+    /// Whether this bundle attests a FULLY verified crate: the ledger is
+    /// consistent, NO obligation was left uncertified, and EVERY certified
+    /// obligation discharged. This is the artifact-level analogue of the
+    /// wrapper's exit-0 — and precisely the property the 2026-06-15 audit
+    /// found was not checkable from the bundle alone (it listed only the
+    /// discharged certs, with no denominator, so "all listed certs
+    /// discharged" did not imply "crate verified").
+    ///
+    /// It does NOT re-run solvers; a discharged cert could still fail to
+    /// reproduce. A trustworthy "this crate is verified" decision is this
+    /// AND every certificate reproducing under [`replay_bundle`] — see the
+    /// `cargo pitbull replay` subcommand, which requires both.
+    #[must_use]
+    pub fn attests_full_verification(&self) -> bool {
+        self.ledger_consistent()
+            && self.uncertified.is_empty()
+            && self
+                .obligations
+                .iter()
+                .all(ObligationCertificate::is_discharged)
+    }
     /// Serialize to pretty JSON (the on-disk certificate format).
     ///
     /// # Errors
@@ -518,6 +601,22 @@ impl CertificateBundle {
         // certificate.
         for ob in &bundle.obligations {
             ob.check_internal_consistency()?;
+        }
+        // Reject a bundle whose obligation ledger doesn't add up — incomplete
+        // or tampered (2026-06-15 deep audit). Skipped when
+        // `total_obligations == 0`: that is a format_version-1 bundle (the
+        // field predates v2) whose coverage is simply unknown, and replay's
+        // completeness gate (`attests_full_verification`) already fails closed
+        // on it. A v2 producer always sets a non-zero, consistent total.
+        if bundle.total_obligations != 0 && !bundle.ledger_consistent() {
+            return Err(format!(
+                "certificate bundle ledger is inconsistent: total_obligations {} \
+                 != {} certified + {} uncertified; refusing to replay an \
+                 incomplete or tampered bundle",
+                bundle.total_obligations,
+                bundle.obligations.len(),
+                bundle.uncertified.len(),
+            ));
         }
         Ok(bundle)
     }
@@ -589,11 +688,13 @@ mod tests {
         bundle
             .obligations
             .push(ObligationCertificate::from_run("pb049-neg-0", "PB049", "(check-sat)", &results, 2));
+        bundle.total_obligations = 1; // a complete, consistent ledger
         let json = bundle.to_json().expect("serialize");
         let back = CertificateBundle::from_json(&json).expect("deserialize");
         assert_eq!(back, bundle);
         assert_eq!(back.format_version, CERT_FORMAT_VERSION);
         assert_eq!(back.timeout_seconds, 60);
+        assert_eq!(back.total_obligations, 1);
     }
 
     /// A bundle from a NEWER format version is refused (fail closed).
@@ -642,6 +743,7 @@ mod tests {
         let mut b = CertificateBundle::new("0.1.0", "c", 2, 60, vec!["z3".into(), "cvc5".into()]);
         b.obligations
             .push(ObligationCertificate::from_run("pb049-neg-0", "PB049", "(check-sat)", &results, 2));
+        b.total_obligations = 1; // complete ledger; the MAC now covers it too
         let key = b"super-secret-ci-key".to_vec();
         b.sign(&key).expect("sign");
         (b, key)
@@ -760,5 +862,112 @@ mod tests {
         assert_eq!(cert.verdict, "discharged");
         let fresh = [r("z3", SolverResult::Unsat)];
         assert!(replay_with_results(&cert, &fresh).is_match());
+    }
+
+    // ===== coverage ledger (2026-06-15 deep audit: cert completeness) =====
+
+    /// A bundle whose `total_obligations` equals its discharged certs, with
+    /// nothing uncertified, attests full verification.
+    #[test]
+    fn attests_full_verification_true_for_complete_discharged_bundle() {
+        let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
+        let mut b = CertificateBundle::new("0.1.0", "c", 2, 60, vec!["z3".into(), "cvc5".into()]);
+        b.obligations
+            .push(ObligationCertificate::from_run("o0", "PB049", "(check-sat)", &results, 2));
+        b.total_obligations = 1;
+        assert!(b.ledger_consistent());
+        assert!(b.attests_full_verification());
+    }
+
+    /// An obligation left UNCERTIFIED (e.g. a pending PB043 panic) means the
+    /// crate is NOT fully verified — even though the listed cert discharged.
+    /// This is the exact silent-narrowing the audit flagged: a clean replay
+    /// of a complete-looking bundle must no longer imply the crate verified.
+    #[test]
+    fn attests_full_verification_false_with_uncertified() {
+        let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
+        let mut b = CertificateBundle::new("0.1.0", "c", 2, 60, vec!["z3".into(), "cvc5".into()]);
+        b.obligations
+            .push(ObligationCertificate::from_run("o0", "PB049", "(check-sat)", &results, 2));
+        b.uncertified.push(UncertifiedObligation {
+            id: "pb043-panic-0".into(),
+            rule: "PB043".into(),
+            status: "pending".into(),
+        });
+        b.total_obligations = 2;
+        assert!(b.ledger_consistent(), "1 certified + 1 uncertified == 2");
+        assert!(
+            !b.attests_full_verification(),
+            "a pending/uncertified obligation must defeat full-verification",
+        );
+    }
+
+    /// A certified-but-NOT-discharged obligation (here a `refuted`) defeats
+    /// full verification.
+    #[test]
+    fn attests_full_verification_false_with_nondischarged_cert() {
+        let unsat = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
+        let sat = [r("z3", SolverResult::Sat), r("cvc5", SolverResult::Sat)];
+        let mut b = CertificateBundle::new("0.1.0", "c", 2, 60, vec!["z3".into(), "cvc5".into()]);
+        b.obligations
+            .push(ObligationCertificate::from_run("o0", "PB049", "(check-sat)", &unsat, 2));
+        b.obligations
+            .push(ObligationCertificate::from_run("o1", "PB049", "(check-sat)", &sat, 2));
+        b.total_obligations = 2;
+        assert!(b.ledger_consistent());
+        assert!(!b.obligations[1].is_discharged());
+        assert!(!b.attests_full_verification());
+    }
+
+    /// A ledger that doesn't add up (total != certified + uncertified) is not
+    /// full verification — and is refused at load (fail closed).
+    #[test]
+    fn ledger_inconsistent_defeats_full_verification_and_load() {
+        let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
+        let mut b = CertificateBundle::new("0.1.0", "c", 2, 60, vec!["z3".into(), "cvc5".into()]);
+        b.obligations
+            .push(ObligationCertificate::from_run("o0", "PB049", "(check-sat)", &results, 2));
+        b.total_obligations = 5; // claims 5 obligations; only 1 accounted for
+        assert!(!b.ledger_consistent());
+        assert!(!b.attests_full_verification());
+        let json = b.to_json().expect("serialize");
+        let err = CertificateBundle::from_json(&json)
+            .expect_err("ledger-inconsistent bundle must be refused at load");
+        assert!(err.contains("ledger is inconsistent"), "got: {err}");
+    }
+
+    /// The coverage ledger (total + uncertified) survives a JSON round-trip.
+    #[test]
+    fn ledger_survives_json_round_trip() {
+        let results = [r("z3", SolverResult::Unsat), r("cvc5", SolverResult::Unsat)];
+        let mut b = CertificateBundle::new("0.1.0", "c", 2, 60, vec!["z3".into(), "cvc5".into()]);
+        b.obligations
+            .push(ObligationCertificate::from_run("o0", "PB049", "(check-sat)", &results, 2));
+        b.uncertified.push(UncertifiedObligation {
+            id: "pb043-panic-0".into(),
+            rule: "PB043".into(),
+            status: "pending".into(),
+        });
+        b.total_obligations = 2;
+        let json = b.to_json().expect("serialize");
+        let back = CertificateBundle::from_json(&json).expect("deserialize");
+        assert_eq!(back, b);
+        assert_eq!(back.total_obligations, 2);
+        assert_eq!(back.uncertified.len(), 1);
+        assert_eq!(back.uncertified[0].status, "pending");
+    }
+
+    /// A legacy format_version-1 bundle (no ledger fields) still LOADS — its
+    /// `total_obligations` defaults to 0 — but does NOT attest full
+    /// verification, because coverage is unknown (fail closed).
+    #[test]
+    fn v1_bundle_without_ledger_does_not_attest_full_verification() {
+        let json = r#"{"format_version":1,"tool_version":"x","crate_name":"c","threshold":2,"timeout_seconds":60,"solvers":["z3","cvc5"],"obligations":[{"id":"o0","rule":"PB049","smt":"(check-sat)","solver_results":[{"solver":"z3","verdict":"unsat"},{"solver":"cvc5","verdict":"unsat"}],"verdict":"discharged","unsat_votes":2,"threshold":2}]}"#;
+        let b = CertificateBundle::from_json(json).expect("v1 bundle still parses");
+        assert_eq!(b.total_obligations, 0, "v1 has no ledger; defaults to 0");
+        assert!(
+            !b.attests_full_verification(),
+            "unknown coverage (v1) must not be treated as full verification",
+        );
     }
 }
