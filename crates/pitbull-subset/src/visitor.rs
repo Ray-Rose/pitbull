@@ -2238,7 +2238,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
     ///
     /// Only emits when `current_body_ensures` is non-empty. The
     /// obligation carries:
-    /// - `ret_name = "result"` (Creusot's lowercase convention)
+    /// - `ret_name = "result"` (the spec binding for the return value)
     /// - `ret_ty_name = primitive_int_name_from_ty(&body.return_ty)`
     ///   or empty string when the return type isn't a primitive
     ///   integer (the future encoder rejects non-int return types

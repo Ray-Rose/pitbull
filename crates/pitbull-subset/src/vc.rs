@@ -134,10 +134,9 @@ pub enum VcObligationKind {
     EnsuresPostcondition {
         /// Source-level name of the binding used in the
         /// postcondition to refer to the return value. Today
-        /// always `"result"` (matches Creusot's convention;
-        /// lowercase, no SPARK-style capitalization workarounds).
-        /// The field is reserved for future per-function
-        /// renaming should that ever be useful.
+        /// always `"result"` (the lowercase spec binding for the
+        /// return value). The field is reserved for future
+        /// per-function renaming should that ever be useful.
         ret_name: String,
         /// Rust primitive integer type name of the return value
         /// (e.g. `Some("u32")`, `Some("i64")`). The future SMT

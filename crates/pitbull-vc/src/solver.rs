@@ -7,7 +7,7 @@
 //!
 //! Future:
 //! - CVC5 adapter, same shape.
-//! - Alt-Ergo adapter (Why3's native solver).
+//! - Alt-Ergo adapter.
 //! - Multi-solver agreement gate: run all three, require 2-of-3
 //!   `unsat` agreement before reporting an obligation discharged.
 //!   See Safety Manual §3.3 for the soundness rationale (1,500+

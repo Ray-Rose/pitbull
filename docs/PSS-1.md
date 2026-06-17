@@ -278,7 +278,7 @@ presence means our phase assumption is wrong. Fail closed.
 ### PB050 — Floating-point arithmetic
 **Detects.** `f16`, `f32`, `f64`, `f128` in any reachable type or
 operand; FP intrinsics.
-**Future.** v0.3 via Why3's float theory and CVC5's FP support.
+**Future.** v0.3 via an SMT float theory (e.g. CVC5's FP support).
 ### PB051 — Narrowing or sign-changing `as` casts
 **Detects.** `Rvalue::Cast(CastKind::IntToInt, _, _)` and
 `FloatToInt` / `IntToFloat` / `PtrToInt` / `IntToPtr` / `PtrToPtr`.
@@ -460,7 +460,8 @@ Severity changes (e.g. from `Error` to `Audit`) are major-version
 events.
 ## 17. Open issues for v0.2
 The following are tracked but not in v0.1:
-- Translation backend (MIR → Coma → Why3 → SMT).
+- Higher-level VC encoding backend for functional-correctness predicates
+  (beyond the direct AoRTE → SMT-LIB path).
 - Proof certificate format and replay command. **MVP shipped (Task T.1
   + T.2):** `pitbull-vc::cert` defines the replayable bundle and the
   wrapper emits it to `PITBULL_CERT_OUT`; `cargo pitbull replay` re-runs
@@ -572,8 +573,8 @@ the std form and now also matches. No shadow type changes.
   `PITBULL_TOML` env var.
   Note: `#[pitbull::verify]` attribute-based seeding remains a future
   option (requires `register_tool(pitbull)` in user crates AND
-  proc-macro re-emission). Path-based filtering matches Creusot's
-  approach and avoids both UX hurdles.
+  proc-macro re-emission). Path-based filtering avoids both UX
+  hurdles.
 - ✅ Activate `corpus_runs_full_pipeline` integration test (Task C).
   Subprocess-based test that invokes the built `pitbull-rustc.exe`
   against each corpus file, gracefully skipping if prerequisites
@@ -2098,10 +2099,12 @@ the std form and now also matches. No shadow type changes.
   per-obligation verdict, correct in both the solver and no-solver lanes.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
-  rustc internals like `rustc_data_structures`, `rustc_index`). This is
-  a known `rustc_private` mechanism limitation; tools like Kani and
-  Creusot solve it by running tests inside `rustc_driver` callbacks
-  rather than as standalone test binaries. The pitbull-subset crate's
+  rustc internals like `rustc_data_structures`, `rustc_index`). This is a
+  known `rustc_private` mechanism limitation (the rustc internals ship
+  dylib-only). The CI nightly-e2e lane sidesteps it by building the real
+  wrapper once under the opt-in and running the suite in plain shadow-IR
+  mode pointed at it via `PITBULL_RUSTC` (see
+  `tests/integration.rs::locate_wrapper`). The pitbull-subset crate's
   unit tests work fine on stable Rust (post-audit-cleanup baseline:
   332 passing, 0 ignored — was 49 + 1 ignored in the v0.1
   baseline; the surge tracks the v0.2 deductive-backend, HIR

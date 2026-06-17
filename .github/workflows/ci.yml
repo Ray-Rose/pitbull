@@ -84,8 +84,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install pinned nightly toolchain
-        # The wrapper is hardcoded to nightly-2026-01-29 (the Creusot
-        # migration cadence). Components rustc-dev + rust-src are required for
+        # The wrapper is hardcoded to nightly-2026-01-29 (the pinned
+        # rustc_public toolchain). Components rustc-dev + rust-src are required for
         # the rustc_private extern crates. NOTE: `--component` takes ONE value,
         # so each component needs its own flag — a single
         # `--component rustc-dev rust-src` makes rustup read `rust-src` as a

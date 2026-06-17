@@ -14,12 +14,14 @@
 #   pitbull-driver     — `cargo pitbull` subcommand. Orchestrates compilation,
 #                        subset checking, translation, and SMT dispatch.
 #
-# Translation (MIR → Coma → Why3) for functional-correctness predicates and
-# proof-certificate format live in further crates added in v0.3+.
+# The proof-certificate format lives in `pitbull-vc::cert`. Richer VC encodings
+# for functional-correctness predicates (beyond the AoRTE obligations) are
+# future work.
 #
-# Toolchain pinning. We track Creusot's nightly to stay compatible with the
-# upstream we fork the (planned) MIR → Coma layer from. Update in lockstep
-# with Creusot releases; the cadence is roughly quarterly.
+# Toolchain pinning. The `pitbull-rustc` wrapper builds against the unstable
+# `rustc_public` API (via `rustc_private`), which is nightly-only, so the
+# workspace pins a single nightly (see CI / `rust-toolchain`). Bump the pin and
+# the adapter in lockstep.
 ################################################################################
 [workspace]
 resolver = "2"

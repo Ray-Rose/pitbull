@@ -12,10 +12,8 @@
 //! - We want the verification policy under explicit version control and
 //!   reviewable as a unit — diffs to `pitbull.toml` should jump out in code
 //!   review.
-//! - It mirrors Creusot's design: the upstream tool uses a separate field
-//!   `default-members` under `[package.metadata.creusot]` to designate
-//!   verification targets distinct from `cargo build` targets. We borrow the
-//!   same separation but lift it out of `Cargo.toml` for the reasons above.
+//! - Verification targets (roots) are kept distinct from `cargo build`
+//!   targets, lifted out of `Cargo.toml` into this dedicated file.
 //!
 //! ## Validation
 //!
@@ -489,8 +487,8 @@ impl SubsetConfig {
 }
 /// The toolchain identifiers Pitbull v0.1.0 supports.
 ///
-/// Each entry must correspond to a (Ferrocene release, rustc nightly,
-/// Creusot fork) triple validated by the release process. Adding an entry
+/// Each entry must correspond to a (Ferrocene release, rustc nightly)
+/// pair validated by the release process. Adding an entry
 /// here without adding the supporting matrix to CI is a release-blocking
 /// bug.
 pub const SUPPORTED_TOOLCHAINS: &[&str] = &[

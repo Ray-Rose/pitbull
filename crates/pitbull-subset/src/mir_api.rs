@@ -11,8 +11,7 @@
 //! As of this writing, `rustc_public` is the migration target API for tools
 //! formerly using internal rustc crates. The crate is not yet stabilized on
 //! stable Rust; it is exposed through the nightly toolchain via the
-//! `rustc_private` mechanism. Both Kani and Creusot are migrating to this
-//! surface; Pitbull rides the same migration.
+//! `rustc_private` mechanism; Pitbull builds against it directly.
 //!
 //! When upstream stabilizes, we drop the nightly pin from `rust-toolchain.toml`
 //! and this module becomes trivial re-exports.

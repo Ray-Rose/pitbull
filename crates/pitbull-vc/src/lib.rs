@@ -30,10 +30,10 @@
 //!   safety property is *violatable*), we want a human-readable
 //!   trace, not an SMT-LIB model. Planned for v0.2 iteration after
 //!   the basic pipeline works.
-//! - MIR → Coma → Why3 path (Creusot-fork lineage). The v0.2
-//!   scaffold takes a shortcut and emits SMT-LIB directly for
-//!   simple obligations (arithmetic overflow). The Why3 layer
-//!   lands when functional-correctness predicates need it (v0.3+).
+//! - Richer VC encodings for functional-correctness predicates. The
+//!   v0.2 scaffold emits SMT-LIB directly for the AoRTE obligations
+//!   (arithmetic overflow, index bounds, …); a higher-level encoding
+//!   layer is future work, only needed once specs go beyond AoRTE.
 //!
 //! ## Soundness posture
 //!

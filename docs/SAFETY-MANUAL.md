@@ -62,10 +62,9 @@ Pitbull outside the Ferrocene-pinned configuration void the
 guarantee.
 ### 3.2 The Pitbull pipeline
 - **`pitbull-subset`** (this crate): the PSS-1 enforcer.
-- **`pitbull-translate`** (v0.2+): the MIR→Coma translator (forked
-  from Creusot).
-- **`pitbull-vc`** (v0.2+): VC generation.
-- **`pitbull-driver`**: orchestration.
+- **`pitbull-vc`**: VC generation, SMT-LIB emission, and solver dispatch.
+- **`pitbull-driver`**: orchestration (the `cargo pitbull` subcommand and
+  the `pitbull-rustc` compiler wrapper).
 A bug in any of these is a soundness bug. Defenses:
 - Mutation testing at 100% kill rate (CI gate).
 - Multi-solver agreement (2-of-3 default; configurable).
@@ -74,8 +73,8 @@ A bug in any of these is a soundness bug. Defenses:
 - Miri cross-validation under Tree Borrows on fuzzed inputs (v0.2+).
 - Differential testing against Kani (v0.2+).
 ### 3.3 The proof tooling
-- **Why3** (verification platform).
-- **Z3, CVC5, Alt-Ergo** (SMT solvers).
+- **Z3, CVC5** (SMT solvers; Alt-Ergo is configurable but lacks the
+  bit-vector theory the AoRTE obligations need).
 A solver soundness bug can produce a false "verified" result. The
 2-of-3 agreement requirement, combined with proof-certificate replay,
 substantially mitigates this. As of May 2026, cumulative testing
@@ -350,8 +349,6 @@ version bump (with a documented migration path).
 Pitbull stands on:
 - **SPARK / Ada and GNATprove** for the deductive verification
   paradigm.
-- **Creusot** for the prophecy-based modular semantics of safe Rust
-  and for the MIR→Why3 translation infrastructure.
 - **Verus** for linear ghost permissions and the mode discipline
   separating spec, proof, and executable code.
 - **Kani** for the rustc_public migration path and for the
@@ -359,5 +356,5 @@ Pitbull stands on:
 - **Ferrocene** for the qualified compiler distribution and the
   certified core subset of `core`.
 - **Miri** for the Tree Borrows aliasing model implementation.
-- **Why3, Z3, CVC5, Alt-Ergo** for the SMT layer.
+- **Z3, CVC5, Alt-Ergo** for the SMT layer.
 The shoulders are well-established.

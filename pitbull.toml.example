@@ -8,7 +8,7 @@
 name = "example-crate"
 # PSS-1 PB071: which Pitbull-supported toolchain pair this project pins.
 # The string identifies a known-good combination of (Ferrocene release,
-# rustc nightly used by Pitbull internals, Creusot fork version).
+# rustc nightly used by Pitbull internals).
 toolchain = "pitbull-0.1.0-ferrocene-26.02.0"
 [verification]
 # Hard timeout per verification condition (seconds). Timeout counts as failure.
