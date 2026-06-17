@@ -93,17 +93,36 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-01-29 --component rustc-dev --component rust-src
       - uses: Swatinem/rust-cache@v2
-      - name: Install z3 (best-effort; solver-dependent e2e tests skip without it)
+      - name: Install pinned solvers (z3 4.13.4 + cvc5 1.3.4 from releases)
         shell: bash
-        # Lets the discharge e2e tests actually run (else they skip via
-        # no_solver_available). Non-blocking: a failed install just means those
-        # tests skip. The 2-solver-agreement / `[N assumptions]` tests ALSO need
-        # cvc5, which we don't install here — they skip gracefully via
-        # `full_solver_pool_unavailable` (run locally with z3 + cvc5 for full
-        # coverage).
+        continue-on-error: true
+        # Use the PINNED solver versions from GitHub releases, NOT distro
+        # packages. Discharge correctness depends on the solver version: Ubuntu's
+        # apt z3 is 4.8.x, which predates the SMT-LIB `bvuaddo`/`bvumul_noovfl`
+        # overflow predicates Pitbull emits and returns `sat` for provably-safe
+        # obligations. These exact builds are what the local/WSL lane verified
+        # green. continue-on-error + the test-side skip guards
+        # (no_solver_available / full_solver_pool_unavailable /
+        # discharge_env_unavailable) keep the job green even if a download fails.
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y z3 || true; fi
-          if [ "$RUNNER_OS" = "Windows" ]; then choco install z3 -y || true; fi
+          set -e
+          mkdir -p "$RUNNER_TEMP/solvers" && cd "$RUNNER_TEMP/solvers"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            z3z=z3-4.13.4-x64-win.zip;        cvc5a=cvc5-Win64-x86_64-static.zip
+          else
+            z3z=z3-4.13.4-x64-glibc-2.35.zip; cvc5a=cvc5-Linux-x86_64-static.zip
+          fi
+          curl -fsSL -o z3.zip   "https://github.com/Z3Prover/z3/releases/download/z3-4.13.4/$z3z"
+          curl -fsSL -o cvc5.zip "https://github.com/cvc5/cvc5/releases/download/cvc5-1.3.4/$cvc5a"
+          python3 -c "import zipfile; zipfile.ZipFile('z3.zip').extractall('z3')"
+          python3 -c "import zipfile; zipfile.ZipFile('cvc5.zip').extractall('cvc5')"
+          z3bin=$(find z3   -type f \( -name z3   -o -name z3.exe   \) | head -1)
+          cv5bin=$(find cvc5 -type f \( -name cvc5 -o -name cvc5.exe \) | head -1)
+          chmod +x "$z3bin" "$cv5bin" 2>/dev/null || true
+          dirname "$z3bin"  >> "$GITHUB_PATH"
+          dirname "$cv5bin" >> "$GITHUB_PATH"
+          "$z3bin" --version
+          "$cv5bin" --version | head -1
       - name: Build wrapper (nightly + opt-in) and stage it
         shell: bash
         # Build the REAL rustc_public wrapper under the nightly opt-in, then copy
