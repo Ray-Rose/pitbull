@@ -241,9 +241,19 @@ is bounded below); auto-inference for structural recursion in v0.2.
 **Future.** Advisory at v0.2; inference for structurally bounded loops.
 ### PB043 — `panic!` without unreachability proof
 **Detects.** Reachable call to `core::panicking::*` or any function
-whose return type is `!` originating in panic infrastructure.
+whose return type is `!` originating in panic infrastructure. The visitor
+emits a `PanicReachability` obligation; `pitbull-vc::compile` returns `None`
+for it today, so it is surfaced as **pending** (never a false discharge).
+**Backend (Frontier #4, 2026-06-16).** The SMT encoding for proving a panic
+site unreachable exists and is z3-verified: `smt::emit_panic_unreachability_problem`
+asserts the preconditions and the path condition and reads `unsat` as
+"unreachable", guarded by a mandatory vacuity check so contradictory
+preconditions cannot vacuously discharge a reachable panic. It is not yet
+wired into `compile` — the visitor does not yet capture the per-site path
+condition (path-sensitive symbolic execution), which is the deferred core.
 **Rationale.** The AoRTE goal.
-**Future.** Permanent.
+**Future.** Visitor-side path-condition capture, then wire the encoding into
+`compile`; counterexample rendering from the `sat` model.
 ### PB044 — Non-terminating spec function
 **Rationale.** Spec inconsistency makes every proof vacuous — the
 worst failure mode.

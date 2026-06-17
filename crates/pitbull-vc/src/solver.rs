@@ -773,6 +773,64 @@ mod tests {
             ),
         }
     }
+    /// Frontier #4 end-to-end: the PB043 panic-unreachability encoding has the
+    /// semantics it claims under a real solver. Skips gracefully if z3 isn't
+    /// installed (the scaffold must run on machines without the solver stack).
+    ///
+    /// REACHABLE: preconditions `x < 10` with a panic guarded by `x >= 5` — the
+    /// inputs 5..=9 reach the panic, so the reachability problem is `sat`
+    /// (undischarged — the honest verdict).
+    ///
+    /// UNREACHABLE: preconditions `x < 5` with the same `x >= 5` guard — no
+    /// input satisfies both, so the problem is `unsat` (the panic is provably
+    /// unreachable — dischargeable).
+    ///
+    /// VACUOUS: contradictory preconditions `x < 5 AND x >= 10` make the
+    /// consistency check itself `unsat`; a caller seeing this MUST refuse to
+    /// discharge — otherwise a reachable panic would be "proven" unreachable by
+    /// vacuous implication (the cardinal false discharge).
+    #[test]
+    fn end_to_end_panic_unreachability_via_z3() {
+        let decls = vec!["(declare-const x (_ BitVec 32))".to_string()];
+        let guard = "(bvuge x #x00000005)"; // x >= 5
+        let reachable = smt::emit_panic_unreachability_problem(
+            &decls,
+            &["(assert (bvult x #x0000000A))".to_string()], // x < 10
+            guard,
+        );
+        let unreachable = smt::emit_panic_unreachability_problem(
+            &decls,
+            &["(assert (bvult x #x00000005))".to_string()], // x < 5
+            guard,
+        );
+        let vacuous_cs = smt::emit_panic_unreachability_consistency_check(
+            &decls,
+            &[
+                "(assert (bvult x #x00000005))".to_string(), // x < 5
+                "(assert (bvuge x #x0000000A))".to_string(), // x >= 10
+            ],
+        );
+        let t = Duration::from_secs(5);
+        match invoke_z3_with_timeout(&reachable, t) {
+            SolverResult::Sat => {}
+            SolverResult::NotInstalled => {
+                eprintln!(
+                    "end_to_end_panic_unreachability_via_z3: SKIPPED — z3 not installed.",
+                );
+                return;
+            }
+            other => panic!("reachable panic: expected Sat; got {other:?}"),
+        }
+        assert!(
+            matches!(invoke_z3_with_timeout(&unreachable, t), SolverResult::Unsat),
+            "unreachable panic (x<5 AND x>=5) must be unsat (dischargeable)",
+        );
+        assert!(
+            matches!(invoke_z3_with_timeout(&vacuous_cs, t), SolverResult::Unsat),
+            "contradictory preconditions must make the vacuity check unsat \
+             (so the caller fails closed instead of vacuously discharging)",
+        );
+    }
     /// Audit hardening (red-team F9): a problem with TWO check-sat
     /// directives (which can happen if a multi-directive injection
     /// somehow slipped through pitbull-subset's validator) must be

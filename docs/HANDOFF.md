@@ -51,7 +51,13 @@ repo only (no remote).
   narrower-width shift amounts remain. PB043 (panic reachability) and PB041
   (**direct self-recursion**, callee `DefId` == body `DefId`, as of Frontier
   #3 / 2026-06-16) emit obligations that `compile` returns `None` for
-  (reported "pending"; never falsely discharged). The other ~71 rules are
+  (reported "pending"; never falsely discharged). Frontier #4 (2026-06-16)
+  landed the PB043 *backend* SMT encoding — `smt::emit_panic_unreachability_problem`
+  plus its mandatory vacuity guard, proven under z3 (reachable -> sat,
+  unreachable -> unsat, contradictory-precondition -> unsat) — but it stays
+  out of the live `compile` arm until the visitor captures the per-site path
+  condition (the deferred path-sensitive core), so PB043 remains pending
+  end-to-end with no false-discharge risk. The other ~71 rules are
   syntactic visitor rejects.
 - **Next task (recommended):** Task R closed the division/over-shift
   AoRTE hole; **Task S closed the loudest TCB hole** — a single
@@ -758,7 +764,7 @@ git commit -m "..."
 | u32 file-hash collisions | `Span::file` is a u32 hash. At ~65K files, 50% collision probability. | `pitbull-subset/src/mir_api/adapter.rs` (and `mir_api.rs::Span`) | Bumping to u64 ripples through the shadow IR. Tracked. |
 | Constant operand extraction (O.2.5) | ✅ DONE in `0d52ae1`. Adapter now extracts integer values via `try_extract_integer_value`; visitor synthesizes `(assert (= rhs #x...))` pinning assertions. Sign-extension fix in `a930691`. | — | Closed. |
 | `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `719dba8`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |
-| Path-sensitive symbolic exec | PB043 PanicReachability obligations are emitted but `pitbull-vc::compile` returns None for the kind. | `pitbull-vc/src/vc.rs::compile` | The SMT encoding for "panic site is unreachable" requires path-sensitive analysis — multi-week task. |
+| Path-sensitive symbolic exec | **Partial (Frontier #4, 2026-06-16):** the SMT *encoding* for "panic site is unreachable" now exists and is z3-verified — `smt::emit_panic_unreachability_problem` asserts `(assumptions AND path_condition)` (unsat => unreachable) with a mandatory vacuity guard so contradictory preconditions cannot vacuously discharge a reachable panic. `compile` still returns None for `PanicReachability`; the remaining (deferred) core is the visitor-side capture of the per-site path condition from the MIR CFG. | `pitbull-subset` visitor + `pitbull-vc/src/{smt,vc}.rs` | Path-condition capture is the multi-week part; the encoding + vacuity reasoning are done and tested. |
 | Termination measures (PB041) | **Partial (Frontier #3, 2026-06-16):** direct self-recursion (callee `DefId` == body `DefId`) now emits a `RecursionDecreases` obligation, surfaced as *pending* (`compile` returns `None`, never a false discharge). Remaining: mutual-recursion SCC detection + SMT discharge of a `#[decreases]` measure. | visitor + vc | Whole-call-graph SCC + measure-decrease encoding deferred. |
 | Bounds checks (PB054) | ✅ DONE in Tasks P / P.1 / P.2 + audit-cleanup. Visitor emits `IndexBound { idx_source_name: Option<String> }`; compile emits QF_BV with `__pb_idx`/`__pb_len` canonical names + `idx`/`len` aliases + optional source-name alias in quoted-symbol syntax for raw-ident safety. End-to-end discharge under Z3 verified by `wrapper_proves_bounded_index_safe_under_precondition`. | — | Closed. |
 | Z3 subprocess timeout / output cap | Z3 invocation can hang indefinitely on a pathological SMT problem; no captured-output size cap. | `pitbull-vc/src/solver.rs` | DoS vector flagged in audit finding N3 (2026-05-26). Mitigation requires spawning + try_wait + size-cap; bigger change than the audit-cleanup pass absorbed. |

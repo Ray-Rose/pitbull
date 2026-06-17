@@ -457,6 +457,80 @@ pub fn emit_index_bound_consistency_check(
 ) -> String {
     emit_index_bound_consistency_check_sized(idx_alias, assumptions, DEFAULT_INDEX_BITS)
 }
+/// Frontier #4 (2026-06-16): SMT encoding for PB043 panic *unreachability* —
+/// the backend half of the path-sensitive panic-reachability scaffold.
+///
+/// A panic site is UNREACHABLE iff its path condition cannot be satisfied under
+/// the function's preconditions — i.e. `(assumptions AND path_condition)` is
+/// UNSAT. This emits exactly that problem: the caller-provided variable
+/// `declarations`, the `assumptions` (preconditions, already validated
+/// `(assert ...)` forms), and the `path_condition` (the conjunction of branch
+/// guards leading to the panic, as a single boolean SMT term) asserted as the
+/// REACHABILITY condition. The polarity matches every other Pitbull check: we
+/// assert the *negation of safety* (here, reachability) and read `unsat` =>
+/// safe (the panic is unreachable); `sat` => a concrete input reaches the panic
+/// (undischarged, with the model as a counterexample).
+///
+/// SOUNDNESS — vacuity guard. An `unsat` here is only meaningful if the
+/// assumptions are themselves satisfiable. Contradictory preconditions make
+/// EVERYTHING vacuously `unsat`, which would falsely "prove" a genuinely
+/// reachable panic unreachable — the cardinal false discharge this project
+/// exists to prevent. The caller MUST run
+/// [`emit_panic_unreachability_consistency_check`] first and refuse to
+/// discharge unless the assumptions alone are `sat` — the same F1 guard the
+/// overflow and index-bound paths already use.
+///
+/// This function is the backend the live pipeline is NOT yet wired to: the
+/// visitor does not capture `path_condition` yet (path-sensitive symbolic
+/// execution is the deferred core), so `vc::compile` still returns `None` for
+/// `PanicReachability` and no panic obligation is discharged today. It is
+/// exercised by unit tests that supply a path condition directly, pinning the
+/// encoding and its vacuity guard so the wiring can land soundly later.
+#[must_use]
+pub fn emit_panic_unreachability_problem(
+    declarations: &[String],
+    assumptions: &[String],
+    path_condition: &str,
+) -> String {
+    let mut smt = String::from("(set-logic QF_BV)\n");
+    push_lines(&mut smt, declarations);
+    push_lines(&mut smt, assumptions);
+    // Assert the reachability condition (the negation of "unreachable"):
+    // `unsat` => no model satisfies the preconditions AND the path to the
+    // panic => the panic is unreachable => safe.
+    smt.push_str("(assert ");
+    smt.push_str(path_condition);
+    smt.push_str(")\n(check-sat)\n");
+    smt
+}
+/// Vacuity guard for [`emit_panic_unreachability_problem`] (red-team F1):
+/// declarations + assumptions + `check-sat`, with NO path condition. An `unsat`
+/// here means the preconditions are logically contradictory, so any `unsat` on
+/// the main problem is vacuously true and MUST NOT be read as a discharge.
+/// Mirrors [`emit_consistency_check`] and
+/// [`emit_index_bound_consistency_check_sized`].
+#[must_use]
+pub fn emit_panic_unreachability_consistency_check(
+    declarations: &[String],
+    assumptions: &[String],
+) -> String {
+    let mut smt = String::from("(set-logic QF_BV)\n");
+    push_lines(&mut smt, declarations);
+    push_lines(&mut smt, assumptions);
+    smt.push_str("(check-sat)\n");
+    smt
+}
+/// Append each line to `smt`, ensuring every line is newline-terminated.
+/// Shared by the panic-unreachability problem/consistency emitters so the two
+/// stay byte-identical up to the trailing safety predicate.
+fn push_lines(smt: &mut String, lines: &[String]) {
+    for line in lines {
+        smt.push_str(line);
+        if !line.ends_with('\n') {
+            smt.push('\n');
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,5 +907,84 @@ mod tests {
                 .contains("(declare-const __pb_idx (_ BitVec 64))"),
         );
         assert_eq!(DEFAULT_INDEX_BITS, 64);
+    }
+    /// Frontier #4: the panic-unreachability problem declares the caller's
+    /// variables, splices the assumptions, asserts the path condition (the
+    /// reachability term whose `unsat` means "unreachable"), and ends with
+    /// exactly one check-sat. A diff here means the PB043 encoding semantics
+    /// changed — catch it in review.
+    #[test]
+    fn panic_unreachability_problem_is_well_formed() {
+        let decls = vec!["(declare-const x (_ BitVec 32))".to_string()];
+        let assumptions = vec!["(assert (bvult x #x0000000A))".to_string()];
+        let smt =
+            emit_panic_unreachability_problem(&decls, &assumptions, "(bvuge x #x00000005)");
+        assert!(smt.starts_with("(set-logic QF_BV)\n"), "got:\n{smt}");
+        assert!(
+            smt.contains("(declare-const x (_ BitVec 32))"),
+            "declarations must be spliced; got:\n{smt}",
+        );
+        assert!(
+            smt.contains("(assert (bvult x #x0000000A))"),
+            "assumptions must be spliced; got:\n{smt}",
+        );
+        assert!(
+            smt.contains("(assert (bvuge x #x00000005))"),
+            "path condition must be asserted as the reachability term; got:\n{smt}",
+        );
+        assert_eq!(
+            smt.matches("(check-sat)").count(),
+            1,
+            "exactly one check-sat; got:\n{smt}",
+        );
+        // Balanced parens — a malformed problem would make every solver Error
+        // (undischarged, fail closed), but pin the well-formedness regardless.
+        assert_eq!(
+            smt.matches('(').count(),
+            smt.matches(')').count(),
+            "parens must balance; got:\n{smt}",
+        );
+    }
+    /// Frontier #4: the vacuity guard must carry the declarations + assumptions
+    /// but NOT the path condition — an `unsat` here means the preconditions are
+    /// contradictory (so a main-problem `unsat` would be vacuous). If the path
+    /// condition leaked into this problem the F1 vacuity check would be
+    /// meaningless and contradictory preconditions could falsely discharge a
+    /// reachable panic.
+    #[test]
+    fn panic_unreachability_consistency_omits_path_condition() {
+        let decls = vec!["(declare-const x (_ BitVec 32))".to_string()];
+        let assumptions = vec!["(assert (bvult x #x0000000A))".to_string()];
+        let cs = emit_panic_unreachability_consistency_check(&decls, &assumptions);
+        assert!(
+            cs.contains("(declare-const x (_ BitVec 32))"),
+            "declarations; got:\n{cs}",
+        );
+        assert!(
+            cs.contains("(assert (bvult x #x0000000A))"),
+            "assumptions; got:\n{cs}",
+        );
+        assert!(
+            !cs.contains("bvuge"),
+            "consistency check must NOT carry the path condition; got:\n{cs}",
+        );
+        assert_eq!(
+            cs.matches("(check-sat)").count(),
+            1,
+            "exactly one check-sat; got:\n{cs}",
+        );
+    }
+    /// Frontier #4: declarations/assumptions supplied without a trailing
+    /// newline are still newline-terminated in the emitted problem, so two
+    /// directives never collapse onto one line (which would change the parse).
+    #[test]
+    fn panic_unreachability_normalizes_newlines() {
+        let decls = vec!["(declare-const x (_ BitVec 8))".to_string()];
+        let assumptions = vec!["(assert (bvult x #x05))".to_string()];
+        let smt = emit_panic_unreachability_problem(&decls, &assumptions, "(bvuge x #x05)");
+        assert!(
+            smt.contains("(declare-const x (_ BitVec 8))\n(assert (bvult x #x05))\n"),
+            "lines must be newline-separated; got:\n{smt}",
+        );
     }
 }
