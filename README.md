@@ -74,8 +74,7 @@ The constructs we forbid are not forbidden because they are bad — they are
 forbidden because v0.1 does not have a sound model for them yet. Each rule has
 a tracked `Future` plan in `docs/PSS-1.md`.
 ## Toolchain
-Pitbull pins to a specific nightly that matches our fork of Creusot's
-translator. Use `rust-toolchain.toml` in your project root:
+Pitbull pins to a specific nightly. Use `rust-toolchain.toml` in your project root:
 ```toml
 [toolchain]
 channel = "nightly-2026-01-29"
