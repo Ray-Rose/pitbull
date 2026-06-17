@@ -38,7 +38,7 @@ edition      = "2021"
 rust-version = "1.87"
 license      = "MIT OR Apache-2.0"
 authors      = ["The Pitbull Authors"]
-repository   = "https://github.com/pitbull-verify/pitbull"
+repository   = "https://github.com/Ray-Rose/pitbull"
 [workspace.lints.rust]
 # We are writing a soundness-bearing tool. Lints are not aesthetic — they are
 # defense in depth.

@@ -261,7 +261,7 @@ impl SubsetReport {
                     "driver": {
                         "name": "pitbull-subset",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "informationUri": "https://github.com/pitbull-verify/pitbull",
+                        "informationUri": "https://github.com/Ray-Rose/pitbull",
                         "rules": crate::rules::RULES.iter().map(|r| serde_json::json!({
                             "id": format!("{}", r.id),
                             "name": r.title,
