@@ -225,11 +225,18 @@ value crosses a function boundary.
 **Future.** v0.2.
 ## 8. Category F — Control flow
 ### PB041 — Recursion without `#[decreases]`
-**Detects.** Any function in a strongly-connected component of the
-call graph lacking a `#[pitbull::decreases]` attribute.
+**Detects.** As of Frontier #3 (2026-06-16), **direct self-recursion** —
+a call whose resolved callee `DefId` equals the enclosing body's `DefId` —
+emits a `RecursionDecreases` obligation. `compile` returns `None` for that
+kind, so it is surfaced honestly as **pending** (a documented undischarged
+obligation, never a false discharge). Mutual recursion across a
+multi-function strongly-connected component still requires whole-call-graph
+SCC analysis and is not yet detected.
 **Rationale.** Non-terminating spec functions are unsoundness; for
 executable functions, non-termination defeats AoRTE.
-**Future.** Permanent; auto-inference for structural recursion in v0.2.
+**Future.** Mutual-recursion SCC detection; SMT discharge of a
+`#[pitbull::decreases]` measure (proving the measure strictly decreases and
+is bounded below); auto-inference for structural recursion in v0.2.
 ### PB042 — Loops without `#[variant]`
 **Future.** Advisory at v0.2; inference for structurally bounded loops.
 ### PB043 — `panic!` without unreachability proof
@@ -562,8 +569,10 @@ the std form and now also matches. No shadow type changes.
   against each corpus file, gracefully skipping if prerequisites
   (wrapper binary, nightly toolchain) are missing. `PITBULL_REQUIRE_E2E=1`
   escalates missing-prerequisites to hard failure for CI.
-  Documented unimplemented exceptions: PB041 (call-graph SCC analysis
-  not implemented), PB054 (VC obligation, not visitor rule).
+  Documented unimplemented exceptions: PB041 (direct self-recursion now
+  emits a *pending* obligation as of Frontier #3; full call-graph SCC /
+  mutual-recursion detection not yet implemented), PB054 (VC obligation,
+  not visitor rule).
 - ✅ Wrapper enumerates static + const items (Task E, corrected by
   Task H). `pitbull-rustc` matches on `CrateItem::kind()` and
   dispatches `ItemKind::Static` through `visit_static_item` (PB018

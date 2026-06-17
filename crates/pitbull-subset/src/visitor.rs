@@ -79,7 +79,7 @@
 //!   `pitbull-vc`.
 use crate::diagnostic::{SubsetError, SubsetReport};
 use crate::mir_api::{
-    AdtDef, AggregateKind, AssertMessage, Body, CastKind, ConstOperand, FloatTy,
+    AdtDef, AggregateKind, AssertMessage, Body, CastKind, ConstOperand, DefId, FloatTy,
     NonDivergingIntrinsic, Operand, Place, ProjectionElem, RetagKind, RigidTy, Rvalue,
     Span, Statement, StatementKind, Terminator, TerminatorKind, Ty, TyKind,
 };
@@ -175,6 +175,11 @@ pub struct SubsetVisitor<'cfg> {
     /// Whether the current expression context is spec mode.
     /// In spec mode, additional rules (PB064, PB066, PB069) apply.
     in_spec_context: bool,
+    /// `DefId` of the body currently being walked, set at each `visit_body`.
+    /// Used to detect direct SELF-recursion (frontier #3, 2026-06-16): a
+    /// `Call` whose resolved callee `DefId` equals this is a recursive call,
+    /// which emits a `RecursionDecreases` (PB041) termination obligation.
+    current_body_def_id: Option<DefId>,
 }
 impl<'cfg> SubsetVisitor<'cfg> {
     /// Construct a fresh visitor from project config.
@@ -194,6 +199,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
             current_body_trusted: false,
             saw_return_with_ensures: false,
             in_spec_context: false,
+            current_body_def_id: None,
         }
     }
     /// Install the precondition list for the next `visit_body`
@@ -303,6 +309,9 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// monomorphized item in the call closure of `#[pitbull::verify]` roots.
     pub fn visit_body(&mut self, body: &Body, trusted: bool) {
         self.current_body_trusted = trusted;
+        // Identity of the body being walked — for self-recursion detection
+        // (frontier #3). Overwritten each visit_body, so no cross-body leak.
+        self.current_body_def_id = Some(body.def_id);
         // Cache locals so VC emission (e.g. operand-type resolution
         // for Rvalue::BinaryOp) can look up types without threading
         // the body through every visit method. Cleared on the next
@@ -674,7 +683,13 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // pattern-match on the path; if it's a function pointer or closure,
         // separate rules fire.
         match func {
-            Operand::Constant(c) => self.classify_called_function(c, span),
+            Operand::Constant(c) => {
+                self.classify_called_function(c, span);
+                // Frontier #3 (2026-06-16): a direct SELF-recursive call emits
+                // a PB041 termination obligation (pending) — recursion is no
+                // longer silently accepted.
+                self.maybe_emit_recursion_obligation(c, span);
+            }
             Operand::Copy(p) | Operand::Move(p) => {
                 // Calling through a local of `fn` type: PB032 (function
                 // pointers). The local's *type* triggers PB032 elsewhere;
@@ -687,6 +702,37 @@ impl<'cfg> SubsetVisitor<'cfg> {
             self.visit_operand(arg, span);
         }
         self.visit_place(dest, span);
+    }
+    /// Frontier #3 (2026-06-16): detect direct SELF-recursion — a `Call` whose
+    /// resolved callee `DefId` equals the body currently being walked — and
+    /// emit a `RecursionDecreases` (PB041) termination obligation.
+    ///
+    /// The obligation is PENDING today: `pitbull-vc::compile` returns `None`
+    /// for `RecursionDecreases`, because proving the `#[decreases]` measure
+    /// strictly decreases AND is bounded below is the deferred SMT core. So a
+    /// self-recursive function is now reported as an UNPROVEN termination
+    /// obligation (undischarged → fail closed) instead of being SILENTLY
+    /// ACCEPTED as it was before — closing the documented PB041 gap on its
+    /// detection side. (Mutual recursion needs call-graph SCC analysis, and
+    /// loops need PB042 `#[variant]`; both remain separate, deferred gaps.)
+    ///
+    /// Emits one obligation per recursive call site (SPARK-style: every
+    /// recursive call must decrease the measure). Keyed on `DefId` equality so
+    /// it cannot mis-fire on a same-named function in another crate.
+    fn maybe_emit_recursion_obligation(&mut self, c: &ConstOperand, span: Span) {
+        let (Some(callee), Some(self_id)) = (c.def_id, self.current_body_def_id) else {
+            return;
+        };
+        if callee.0 != self_id.0 {
+            return;
+        }
+        let seq = self.vc_obligations.len();
+        self.vc_obligations.push(crate::vc::VcObligation {
+            id: format!("pb041-rec-{seq}"),
+            span,
+            kind: crate::vc::VcObligationKind::RecursionDecreases,
+            assumptions: Vec::new(),
+        });
     }
     /// Classify a call by its callee's `DefId` path.
     ///
@@ -3859,6 +3905,75 @@ mod tests {
             report.vc_obligations[0].id.starts_with("pb049-add-"),
             "VC id should follow pb{{nnn}}-{{tag}}-{{seq}} format; got {:?}",
             report.vc_obligations[0].id,
+        );
+    }
+    /// Frontier #3 (2026-06-16): a direct self-recursive call — one whose
+    /// callee `DefId` equals the enclosing body's `DefId` — must emit exactly
+    /// one `RecursionDecreases` (PB041) obligation; a call to a *different*
+    /// `DefId`, or an indirect call with no resolved callee, must emit none.
+    /// This is the stable-lane unit that pins the detection logic the e2e
+    /// `wrapper_reports_pending_recursion_obligation` exercises on real MIR
+    /// (where the wrapper threads the real body `DefId` via
+    /// `adapter::def_id(item.def_id())`). Without that threading the body id
+    /// is the placeholder `DefId(0)` and self-calls would silently slip past.
+    #[test]
+    fn self_recursion_emits_recursion_decreases_obligation() {
+        use crate::mir_api::*;
+        // A one-block body whose sole terminator is a call to `callee`.
+        let make_body = |self_id: u64, callee: Option<u64>| Body {
+            def_id: DefId(self_id),
+            arg_tys: vec![],
+            arg_names: vec![],
+            return_ty: Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) },
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![],
+            blocks: vec![BasicBlockData {
+                statements: vec![],
+                terminator: Terminator {
+                    kind: TerminatorKind::Call {
+                        func: Operand::Constant(ConstOperand {
+                            ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
+                            def_id: callee.map(DefId),
+                            path: None,
+                            value: None,
+                        }),
+                        args: vec![],
+                        destination: Place { local: Local(0), projection: vec![] },
+                        target: None,
+                    },
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let count_recursion = |body: &Body| {
+            let mut v = SubsetVisitor::new(&cfg);
+            v.visit_body(body, false);
+            v.into_report()
+                .vc_obligations
+                .into_iter()
+                .filter(|o| {
+                    matches!(o.kind, crate::vc::VcObligationKind::RecursionDecreases)
+                })
+                .count()
+        };
+        assert_eq!(
+            count_recursion(&make_body(7, Some(7))),
+            1,
+            "self-recursive call (callee DefId == body DefId) must emit one \
+             RecursionDecreases obligation",
+        );
+        assert_eq!(
+            count_recursion(&make_body(7, Some(9))),
+            0,
+            "call to a different DefId is not self-recursion",
+        );
+        assert_eq!(
+            count_recursion(&make_body(7, None)),
+            0,
+            "indirect call with no resolved callee DefId is not self-recursion",
         );
     }
     /// O.1 regression: when the visitor has spec-derived

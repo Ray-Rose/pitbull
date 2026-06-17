@@ -48,9 +48,11 @@ repo only (no remote).
   bodies) + Q.4b (wrapping `Add`/`Sub`/`Mul`) + Q.4c (`Div`/`Rem` via
   bvsdiv/bvudiv/bvsrem/bvurem) + Q.4d (shifts `bvshl`/`bvlshr`/`bvashr`),
   so `add_one`, `safe_div`, `halve` discharge; bitwise ops + variable
-  narrower-width shift amounts remain. PB043 / PB041 still emit obligations that `compile` returns
-  `None` for (reported "pending"). The other ~71 rules are syntactic
-  visitor rejects.
+  narrower-width shift amounts remain. PB043 (panic reachability) and PB041
+  (**direct self-recursion**, callee `DefId` == body `DefId`, as of Frontier
+  #3 / 2026-06-16) emit obligations that `compile` returns `None` for
+  (reported "pending"; never falsely discharged). The other ~71 rules are
+  syntactic visitor rejects.
 - **Next task (recommended):** Task R closed the division/over-shift
   AoRTE hole; **Task S closed the loudest TCB hole** — a single
   hostile/buggy `z3` on PATH can no longer rubber-stamp unsafe code,
@@ -757,7 +759,7 @@ git commit -m "..."
 | Constant operand extraction (O.2.5) | ✅ DONE in `0d52ae1`. Adapter now extracts integer values via `try_extract_integer_value`; visitor synthesizes `(assert (= rhs #x...))` pinning assertions. Sign-extension fix in `a930691`. | — | Closed. |
 | `#[pitbull::requires]` attribute extraction (O.3) | ✅ DONE in `719dba8`. HIR pre-pass extracts string-literal arguments from `#[pitbull::requires("...")]`; merged with `pitbull.toml`-based preconditions. Verdict lines now include `[N assumption(s)]` suffix. | — | Closed. |
 | Path-sensitive symbolic exec | PB043 PanicReachability obligations are emitted but `pitbull-vc::compile` returns None for the kind. | `pitbull-vc/src/vc.rs::compile` | The SMT encoding for "panic site is unreachable" requires path-sensitive analysis — multi-week task. |
-| Termination measures (PB041) | Recursion-decreasing obligations not yet emitted. | visitor + vc | Needs call-graph SCC analysis, currently a documented gap. |
+| Termination measures (PB041) | **Partial (Frontier #3, 2026-06-16):** direct self-recursion (callee `DefId` == body `DefId`) now emits a `RecursionDecreases` obligation, surfaced as *pending* (`compile` returns `None`, never a false discharge). Remaining: mutual-recursion SCC detection + SMT discharge of a `#[decreases]` measure. | visitor + vc | Whole-call-graph SCC + measure-decrease encoding deferred. |
 | Bounds checks (PB054) | ✅ DONE in Tasks P / P.1 / P.2 + audit-cleanup. Visitor emits `IndexBound { idx_source_name: Option<String> }`; compile emits QF_BV with `__pb_idx`/`__pb_len` canonical names + `idx`/`len` aliases + optional source-name alias in quoted-symbol syntax for raw-ident safety. End-to-end discharge under Z3 verified by `wrapper_proves_bounded_index_safe_under_precondition`. | — | Closed. |
 | Z3 subprocess timeout / output cap | Z3 invocation can hang indefinitely on a pathological SMT problem; no captured-output size cap. | `pitbull-vc/src/solver.rs` | DoS vector flagged in audit finding N3 (2026-05-26). Mitigation requires spawning + try_wait + size-cap; bigger change than the audit-cleanup pass absorbed. |
 | PB049 silent skip on projected operands | ✅ DONE in audit-cleanup. `maybe_emit_overflow_obligation` now emits a `PB049: ... skipped` audit note when operand types can't be resolved (projected operands like `p.0 + p.1`, mismatched types). Pre-fix the obligation was silently dropped — auditors reading "0 obligations" would falsely conclude verified. | — | Closed (audit finding N1, 2026-05-26). |

@@ -277,11 +277,14 @@ fn corpus_runs_full_pipeline() {
 /// limitation; the corpus file is "future-proof" for when the rule
 /// is implemented in a later milestone.
 ///
-/// - PB041 (recursion without `#[decreases]`): requires call-graph
-///   strongly-connected-component analysis. The visitor walks bodies
-///   one at a time without the call graph. v0.2's reachability
-///   driver in pitbull-subset/src/reachability.rs has the BodyProvider
-///   plumbing but the SCC detection is not yet implemented.
+/// PB041 was REMOVED from this list (frontier #3, 2026-06-16): the visitor now
+/// detects direct SELF-recursion (a `Call` whose callee `DefId` equals the
+/// body being walked) and emits a `RecursionDecreases` obligation, so the
+/// reject file's `(PB041)` rule string now fires uppercase in stderr — which
+/// is what the reject check requires. The obligation is undischarged (the
+/// termination-measure SMT is deferred), so PB041 moved to the
+/// `KNOWN_UNDISCHARGED_ACCEPT` list for its accept side. MUTUAL recursion
+/// (needs call-graph SCC) and loops (PB042 `#[variant]`) remain deferred.
 ///
 /// PB054 was removed from this list in Task P.1: the visitor now
 /// emits an `IndexBound` obligation for slice indices,
@@ -293,7 +296,7 @@ fn corpus_runs_full_pipeline() {
 /// "undischarged (no solver)" without) but the rule fires
 /// uppercase in stderr, which is what this integration test
 /// requires.
-const KNOWN_UNIMPLEMENTED_REJECT: &[u16] = &[41];
+const KNOWN_UNIMPLEMENTED_REJECT: &[u16] = &[];
 /// PB rule numbers whose corpus ACCEPT test cannot pass yet because
 /// the verifier can detect the candidate but cannot yet discharge
 /// it (i.e. prove the safety property holds even when a sound
@@ -322,7 +325,17 @@ const KNOWN_UNIMPLEMENTED_REJECT: &[u16] = &[41];
 ///   demonstrates a successful PB054 discharge by routing the
 ///   precondition through `pitbull.toml` (raw SMT-LIB form) —
 ///   that path IS fully wired.
-const KNOWN_UNDISCHARGED_ACCEPT: &[u16] = &[54];
+///
+/// - PB041 (recursion without `#[decreases]`), frontier #3 (2026-06-16): the
+///   visitor now DETECTS direct self-recursion and emits a `RecursionDecreases`
+///   obligation, but `pitbull-vc::compile` returns `None` for that kind (the
+///   termination-measure decrease/bounded SMT is deferred), so the accept file
+///   `PB041_decreasing_recursion.rs` — whose `#[decreases]` is stripped by the
+///   corpus harness anyway — surfaces the `(PB041)` pending obligation and the
+///   contains-check would read it as "rule fired". Run-only until the measure
+///   discharge lands. The dedicated e2e test
+///   `wrapper_reports_pending_recursion_obligation` pins the detection.
+const KNOWN_UNDISCHARGED_ACCEPT: &[u16] = &[41, 54];
 /// PB rule numbers whose corpus ACCEPT file is currently REJECTED by the
 /// verifier as a documented FALSE POSITIVE (conservative, sound — the
 /// verifier rejects safe code it cannot yet prove safe). Distinct from
@@ -1268,6 +1281,37 @@ fn wrapper_proves_scale_q_discharges_under_precondition() {
         "scale_q should discharge BOTH obligations; stderr:\n{stderr}",
     );
     assert_eq!(code, Some(0), "scale_q fully discharged should exit 0. Got {code:?}");
+}
+/// Frontier #3 (2026-06-16): the wrapper DETECTS direct self-recursion and
+/// emits a PENDING `RecursionDecreases` (PB041) termination obligation — no
+/// longer silently accepting recursion (the documented PB041 gap, closed on
+/// its detection side). The termination-measure SMT is deferred, so the
+/// obligation stays pending/undischarged → fail closed. Runs the
+/// `factorial` reject corpus file through the real wrapper. Does NOT need a
+/// solver (a pending obligation is reported before any solver call).
+#[test]
+fn wrapper_reports_pending_recursion_obligation() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_reports_pending_recursion_obligation: SKIPPED (no wrapper)");
+        return;
+    };
+    let corpus = Path::new("tests")
+        .join("corpus")
+        .join("reject")
+        .join("PB041_undecorated_recursion.rs");
+    let stderr = run_one_corpus_file(&env, &corpus).expect("wrapper should run");
+    assert!(
+        stderr.contains("(PB041)") && stderr.contains("pb041-rec"),
+        "self-recursion must emit a PB041 RecursionDecreases obligation; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("pending"),
+        "the recursion obligation must report `pending` (termination SMT deferred); \
+         stderr:\n{stderr}",
+    );
 }
 /// Q.4b adversarial twin — a FALSE arithmetic postcondition does NOT
 /// discharge, isolated from overflow. `add_one(x){ x + 1 }` with

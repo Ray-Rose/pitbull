@@ -519,6 +519,16 @@ impl PitbullCallbacks {
                     let real_body = item.expect_body();
                     let mut shadow_body =
                         pitbull_subset::mir_api::adapter::body(&real_body);
+                    // Thread the body's real DefId (the adapter leaves a
+                    // placeholder DefId(0) — "threaded by caller"). Uses the
+                    // SAME `adapter::def_id` converter the call-site
+                    // `const_operand` uses, so a self-recursive call's callee
+                    // DefId equals this body's DefId — the basis for frontier
+                    // #3 self-recursion detection (PB041). Without this the
+                    // body DefId stays 0, never matching a real callee, and
+                    // recursion goes undetected.
+                    shadow_body.def_id =
+                        pitbull_subset::mir_api::adapter::def_id(item.def_id());
                     // Task Q.1 audit-cleanup (2026-05-26): the
                     // adapter's `body()` hardcodes `is_unsafe: false`
                     // and `is_async: false` because the rustc_public
