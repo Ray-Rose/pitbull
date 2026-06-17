@@ -371,8 +371,31 @@ impl E2eEnv {
         Some(Self { wrapper, nightly_sysroot: sysroot })
     }
 }
-/// Look for the built wrapper binary at the workspace target dir.
+/// Look for the built wrapper binary.
+///
+/// Honors `PITBULL_RUSTC` (an explicit path to a pre-built `pitbull-rustc`)
+/// first. This lets CI / local runs build the real `rustc_public` wrapper once
+/// under the nightly opt-in, then run the whole test suite in plain shadow-IR
+/// mode (NO opt-in) pointed at that binary. Decoupling the wrapper from the
+/// test-compile sidesteps two problems at once: the "running the suite rebuilds
+/// `target/debug/pitbull-rustc` as the STUB" race (audit H1, 2026-05-31) and
+/// the Linux-only "crate `rustc_*` required to be available in rlib format"
+/// error that compiling the suite *under* the opt-in triggers (the
+/// `rustc_private` crates ship dylib-only). Falls back to walking up from
+/// `CARGO_MANIFEST_DIR` to `target/{debug,release}/pitbull-rustc(.exe)`.
 fn locate_wrapper() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("PITBULL_RUSTC") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+        // An explicit override that does not exist is a configuration error,
+        // NOT a reason to silently fall back to a target-dir binary (which may
+        // be a stub) — return None so `PITBULL_REQUIRE_E2E` escalates it to a
+        // loud failure rather than a false pass. (Soundness posture: never
+        // silently exercise the stub when the real wrapper was requested.)
+        return None;
+    }
     // Walk up from CARGO_MANIFEST_DIR looking for target/debug/pitbull-rustc(.exe).
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
     let crate_dir = PathBuf::from(manifest_dir);
@@ -413,6 +436,19 @@ fn no_solver_available(stderr: &str) -> bool {
     stderr.contains("no configured solver is installed")
         || stderr.contains("undischarged (no solver)")
         || stderr.contains("z3 not installed")
+}
+/// True when the wrapper could not assemble its FULL configured solver pool —
+/// e.g. a 2-of-2 agreement gate with only z3 present (`cvc5=not-installed`), so
+/// the F1 consistency check could not be confirmed and the verdict took the
+/// "could not confirm the preconditions are jointly satisfiable" path. That
+/// path omits the `[N assumption(s)]` differential suffix, so tests that read
+/// the suffix must skip-with-pass when the pool is incomplete: they need BOTH
+/// z3 and cvc5. This matches the documented CI posture that cvc5 is optional —
+/// run locally with both solvers for full coverage. Distinct from
+/// `no_solver_available` ("ZERO solvers"); this is "fewer than the threshold".
+fn full_solver_pool_unavailable(stderr: &str) -> bool {
+    stderr.contains("not-installed")
+        || stderr.contains("could not confirm the preconditions are jointly satisfiable")
 }
 /// Parse the count `N` from the wrapper's summary line
 /// "... N subset violation(s)". `None` if the line isn't present.
@@ -891,6 +927,13 @@ fn pitbull_requires_attribute_attaches_precondition() {
         run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
             .expect("wrapper should spawn");
     let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) || full_solver_pool_unavailable(&stderr) {
+        eprintln!(
+            "SKIPPED — needs the full solver pool (z3 + cvc5); the pool was \
+             incomplete, so the `[N assumption(s)]` suffix is absent.",
+        );
+        return;
+    }
     // Differential signal: the precondition attribute adds one
     // assumption on top of the const-pin O.2.5 already adds.
     // The wrapper now prints `[N assumptions]` per verdict line.
@@ -1829,6 +1872,13 @@ fn pitbull_requires_expression_form_attaches_precondition() {
         run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
             .expect("wrapper should spawn");
     let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) || full_solver_pool_unavailable(&stderr) {
+        eprintln!(
+            "SKIPPED — needs the full solver pool (z3 + cvc5); the pool was \
+             incomplete, so the `[N assumption(s)]` suffix is absent.",
+        );
+        return;
+    }
     assert!(
         stderr.contains("[2 assumptions]"),
         "Q.3: expression-form `#[pitbull::requires(x < 100)]` should be extracted \
@@ -1867,6 +1917,13 @@ fn pitbull_requires_string_literal_form_still_works() {
         run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
             .expect("wrapper should spawn");
     let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) || full_solver_pool_unavailable(&stderr) {
+        eprintln!(
+            "SKIPPED — needs the full solver pool (z3 + cvc5); the pool was \
+             incomplete, so the `[N assumption(s)]` suffix is absent.",
+        );
+        return;
+    }
     assert!(
         stderr.contains("[2 assumptions]"),
         "Q.3 backcompat: string-literal form must still produce `[2 assumptions]`. \
@@ -1914,6 +1971,13 @@ fn pitbull_requires_on_impl_method_attaches_precondition() {
         run_one_corpus_file_preserving_attrs(&env, &probe_rs, &[])
             .expect("wrapper should spawn");
     let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) || full_solver_pool_unavailable(&stderr) {
+        eprintln!(
+            "SKIPPED — needs the full solver pool (z3 + cvc5); the pool was \
+             incomplete, so the `[N assumption(s)]` suffix is absent.",
+        );
+        return;
+    }
     assert!(
         stderr.contains("[2 assumptions]"),
         "Q.2: `#[pitbull::requires]` on impl method should produce \
@@ -2124,6 +2188,13 @@ fn no_pitbull_requires_attribute_keeps_only_const_pin() {
     let (stderr, _code) = run_one_corpus_file_full(&env, &probe_rs, &[])
         .expect("wrapper should spawn");
     let _ = fs::remove_file(&probe_rs);
+    if no_solver_available(&stderr) || full_solver_pool_unavailable(&stderr) {
+        eprintln!(
+            "SKIPPED — needs the full solver pool (z3 + cvc5); the pool was \
+             incomplete, so the `[N assumption(s)]` suffix is absent.",
+        );
+        return;
+    }
     assert!(
         stderr.contains("[1 assumption]"),
         "O.3 control: without the attribute, the obligation \
@@ -2957,6 +3028,13 @@ fn mixed_width_unsigned_amount_binds_precondition() {
         2,
         "expected two shift obligations (g + h); stderr:\n{stderr}",
     );
+    if no_solver_available(&stderr) || full_solver_pool_unavailable(&stderr) {
+        eprintln!(
+            "SKIPPED (assumption-binding assert) — needs the full solver pool \
+             (z3 + cvc5); the pool was incomplete.",
+        );
+        return;
+    }
     // The UNSIGNED amount (g) now carries the bound precondition — pre-fix a
     // variable mixed-width amount was left free, so NEITHER shift had one.
     assert!(

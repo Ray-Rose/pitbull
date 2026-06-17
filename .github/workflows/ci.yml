@@ -85,39 +85,56 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install pinned nightly toolchain
         # The wrapper is hardcoded to nightly-2026-01-29 (the Creusot
-        # migration cadence). Components rustc-dev + rust-src are
-        # required for the rustc_private extern crates.
+        # migration cadence). Components rustc-dev + rust-src are required for
+        # the rustc_private extern crates. NOTE: `--component` takes ONE value,
+        # so each component needs its own flag — a single
+        # `--component rustc-dev rust-src` makes rustup read `rust-src` as a
+        # second toolchain NAME and skip the component (2026-06-16 fix).
         run: |
-          rustup toolchain install nightly-2026-01-29 --component rustc-dev rust-src
+          rustup toolchain install nightly-2026-01-29 --component rustc-dev --component rust-src
       - uses: Swatinem/rust-cache@v2
       - name: Install z3 (best-effort; solver-dependent e2e tests skip without it)
         shell: bash
         # Lets the discharge e2e tests actually run (else they skip via
-        # no_solver_available). Non-blocking: a failed install just means
-        # those tests skip. The 2-solver-agreement test also needs cvc5,
-        # which we don't install — it skips gracefully (see that test).
+        # no_solver_available). Non-blocking: a failed install just means those
+        # tests skip. The 2-solver-agreement / `[N assumptions]` tests ALSO need
+        # cvc5, which we don't install here — they skip gracefully via
+        # `full_solver_pool_unavailable` (run locally with z3 + cvc5 for full
+        # coverage).
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y z3 || true; fi
           if [ "$RUNNER_OS" = "Windows" ]; then choco install z3 -y || true; fi
-      - name: Build wrapper (nightly + opt-in)
+      - name: Build wrapper (nightly + opt-in) and stage it
+        shell: bash
+        # Build the REAL rustc_public wrapper under the nightly opt-in, then copy
+        # it OUT of the target dir. The e2e tests are pointed at this staged copy
+        # via PITBULL_RUSTC (below), so the test step runs in plain shadow-IR
+        # mode (NO opt-in) without (a) rebuilding the wrapper as the STUB at the
+        # same target path (audit H1, 2026-05-31) or (b) the Linux
+        # "crate `rustc_*` required in rlib format" error that compiling the
+        # whole suite UNDER the opt-in triggers (rustc_private ships dylib-only).
+        # The Unix link path to the toolchain's libLLVM is emitted by
+        # pitbull-driver/build.rs; see that file (2026-06-16).
         env:
           PITBULL_USE_RUSTC_PUBLIC: "1"
-        run: cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc
+        run: |
+          cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc
+          if [ "$RUNNER_OS" = "Windows" ]; then EXT=.exe; else EXT=; fi
+          mkdir -p "$RUNNER_TEMP/pb"
+          cp "target/debug/pitbull-rustc$EXT" "$RUNNER_TEMP/pb/pitbull-rustc$EXT"
+          echo "PITBULL_RUSTC=$RUNNER_TEMP/pb/pitbull-rustc$EXT" >> "$GITHUB_ENV"
       - name: Run e2e tests (PITBULL_REQUIRE_E2E=1)
-        # The corpus integration tests subprocess-invoke the wrapper.
-        # PITBULL_REQUIRE_E2E=1 escalates "wrapper missing" to a hard
-        # failure instead of graceful skip — required here, because
-        # the wrapper *was* built in the previous step.
+        shell: bash
+        # Run the whole suite in plain shadow-IR mode (NO opt-in, default
+        # toolchain). The e2e integration tests subprocess-invoke the REAL
+        # wrapper via the PITBULL_RUSTC override staged above;
+        # PITBULL_REQUIRE_E2E=1 escalates a missing / non-existent override to a
+        # HARD failure (never a silent stub or skip) — the same soundness
+        # posture the H1 fix protected, now enforced by the override path
+        # (locate_wrapper returns None when PITBULL_RUSTC doesn't exist) instead
+        # of by compiling the suite under the opt-in. --test-threads=1: the
+        # wrapper writes a pid-named temp artifact, but parallel invocations
+        # against the same corpus file would still race on the output path.
         env:
           PITBULL_REQUIRE_E2E: "1"
-          # Audit 2026-05-31 (H1 fix): run on the SAME nightly + opt-in as
-          # the wrapper build. Previously this step ran `cargo test` on
-          # STABLE without the opt-in, which rebuilt pitbull-rustc as the
-          # STUB (different rustc fingerprint, opt-in unset) at the same
-          # target path — so the e2e tests exercised the stub, silently
-          # defeating this job's entire purpose.
-          PITBULL_USE_RUSTC_PUBLIC: "1"
-        # --test-threads=1: the wrapper writes a unique temp pid in
-        # filenames, but parallel invocations against the same
-        # corpus file would still race on the output artifact path.
-        run: cargo +nightly-2026-01-29 test --workspace --all-features -- --test-threads=1
+        run: cargo test --workspace --all-features -- --test-threads=1

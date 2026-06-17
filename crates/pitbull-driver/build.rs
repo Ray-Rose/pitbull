@@ -41,4 +41,28 @@ fn main() {
         );
     }
     println!("cargo:rustc-cfg=rustc_public_real");
+    // Unix link path to the toolchain's internal LLVM (2026-06-16).
+    //
+    // The `pitbull-rustc` wrapper links `librustc_driver`, which has a link-
+    // and run-time dependency on the toolchain's `libLLVM-*.so` living in
+    // `<sysroot>/lib`. On Windows the wrapper instead prepends the rustc bin
+    // dir to `PATH` at runtime so the DLL resolves, so no build-time flag is
+    // needed there. On Unix, rustc does NOT add `<sysroot>/lib` to the link
+    // search path for an out-of-tree binary, so the link fails with
+    // `unable to find library -lLLVM-*`; the binary also needs that dir on its
+    // rpath to find the `.so` at run time (the e2e tests subprocess-invoke the
+    // built wrapper). Emit both. Gated on `#[cfg(unix)]` (the build host) so
+    // Windows builds are unaffected, and reached only on the opted-in nightly
+    // lane above, so the default/stable build is byte-for-byte unchanged.
+    #[cfg(unix)]
+    if let Some(sysroot) = std::process::Command::new(&rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+    {
+        let libdir = format!("{}/lib", sysroot.trim());
+        println!("cargo:rustc-link-search=native={libdir}");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
+    }
 }
