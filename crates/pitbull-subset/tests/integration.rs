@@ -3618,3 +3618,223 @@ fn prelude_namespace_covers_trait_dispatched_stdlib() {
         failures.join("\n\n"),
     );
 }
+
+// ============================================================================
+// Independent adversarial red-team — the cardinal soundness invariant.
+//
+// Authored 2026-07-09 as a FRESH, independent probe set: deliberately not
+// derived from the rules' own unit fixtures or the corpus, because the value of
+// a red-team is exercising the tool with programs written by different hands
+// than the code + docs under audit. Complements the negative control in
+// `aorte_proofs.rs` (unconstrained `x + 1` must not verify) with broad coverage
+// of every AoRTE failure mode plus precondition-semantics traps (off-by-one,
+// wrong-variable, contradictory/vacuous) and a boundary-sharpness pair.
+//
+// The no-false-discharge invariant is SOLVER-INDEPENDENT: a known-unsafe
+// program fails closed whether via a subset violation, a coverage gap, a
+// pending PB043 obligation, or an "undischarged (no solver)" arithmetic
+// obligation. So `red_team_no_false_discharge` asserts even on a solverless
+// host. Only the completeness half (`red_team_safe_code_verifies`) needs
+// solvers, and it skips per-probe when the discharge environment is missing.
+// ============================================================================
+
+/// Known-UNSAFE programs. Each MUST be rejected (exit != 0); a single exit-0
+/// here is a cardinal false discharge (the worst possible bug in a
+/// soundness-bearing verifier). Attribute-form preconditions require the
+/// `register_tool(pitbull)` crate headers, included inline where used.
+const RED_TEAM_UNSAFE: &[(&str, &str)] = &[
+    ("overflow_unconstrained", "pub fn add_one(x: u32) -> u32 { x + 1 }\n"),
+    ("unsigned_underflow", "pub fn sub(x: u32) -> u32 { x - 1 }\n"),
+    ("neg_overflow", "pub fn n(x: i32) -> i32 { -x }\n"),
+    ("div_by_zero", "pub fn d(a: u32, b: u32) -> u32 { a / b }\n"),
+    ("rem_by_zero", "pub fn r(a: u32, b: u32) -> u32 { a % b }\n"),
+    ("signed_div_unguarded", "pub fn d(a: i32, b: i32) -> i32 { a / b }\n"),
+    ("over_shift_const", "pub fn s(x: u32) -> u32 { x << 40 }\n"),
+    ("pow_overflow", "pub fn p(x: u32, k: u32) -> u32 { x.pow(k) }\n"),
+    ("as_cast_truncation", "pub fn f(x: u64) -> u8 { x as u8 }\n"),
+    ("unwrap_panic", "pub fn u(o: Option<u8>) -> u8 { o.unwrap() }\n"),
+    (
+        "explicit_panic",
+        "pub fn g(x: u32) -> u32 { if x == 0 { panic!(\"boom\") } else { x } }\n",
+    ),
+    (
+        "unreachable_reachable",
+        "pub fn f(x: u32) -> u32 { if x > 0 { x } else { unreachable!() } }\n",
+    ),
+    ("assert_can_fail", "pub fn f(x: u32) -> u32 { assert!(x > 5); x }\n"),
+    ("array_index_dynamic_unbounded", "pub fn at(a: &[u8; 3], i: usize) -> u8 { a[i] }\n"),
+    ("slice_range_index", "pub fn f(s: &[u8]) -> u8 { s[1..3][0] }\n"),
+    ("unsafe_block_deref", "pub fn f(p: *const u8) -> u8 { unsafe { *p } }\n"),
+    (
+        "transmute",
+        "pub fn t(x: u32) -> f32 { unsafe { core::mem::transmute(x) } }\n",
+    ),
+    ("box_heap_alloc", "pub fn b() -> Box<u8> { Box::new(0) }\n"),
+    (
+        "offbyone_index_precond",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"i <= len\")]\n\
+         pub fn at(s: &[u8], i: usize) -> u8 { s[i] }\n",
+    ),
+    (
+        "wrong_variable_precond",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"y < 100\")]\n\
+         pub fn add(x: u32, y: u32) -> u32 { x + 1 }\n",
+    ),
+    (
+        "contradictory_precond",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"x < 5\")]\n#[pitbull::requires(\"x > 10\")]\n\
+         pub fn add_one(x: u32) -> u32 { x + 1 }\n",
+    ),
+    (
+        "vacuous_u32_lt0_precond",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"x < 0\")]\n\
+         pub fn add_one(x: u32) -> u32 { x + 1 }\n",
+    ),
+    (
+        "mul_weak_precond",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"x < 100000\")]\n#[pitbull::requires(\"y < 100000\")]\n\
+         pub fn m(x: u32, y: u32) -> u32 { x * y }\n",
+    ),
+    (
+        // One unit past the safe boundary: x,y < 2^31 + 1 lets x + y reach
+        // 2^32 (overflow). The safe twin lives in RED_TEAM_SAFE.
+        "add_one_past_safe_boundary",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"x < 2147483649\")]\n#[pitbull::requires(\"y < 2147483649\")]\n\
+         pub fn f(x: u32, y: u32) -> u32 { x + y }\n",
+    ),
+];
+
+/// Known-SAFE programs. `needs_solver` marks those that require the SMT pool to
+/// discharge an obligation (skip-with-pass when the discharge env is
+/// unavailable); the rest verify with no solver (trusted-total or no obligation).
+const RED_TEAM_SAFE: &[(&str, &str, bool)] = &[
+    ("const_return", "pub fn c() -> u32 { 42 }\n", false),
+    ("wrapping_add_total", "pub fn f(x: u32, y: u32) -> u32 { x.wrapping_add(y) }\n", false),
+    (
+        "checked_add_total",
+        "pub fn f(x: u32, y: u32) -> Option<u32> { x.checked_add(y) }\n",
+        false,
+    ),
+    ("saturating_sub_total", "pub fn f(x: u32, y: u32) -> u32 { x.saturating_sub(y) }\n", false),
+    (
+        "bounded_add",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"x < 100\")]\n\
+         pub fn add_one(x: u32) -> u32 { x + 1 }\n",
+        true,
+    ),
+    (
+        "safe_div_nonzero",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"y > 0\")]\n\
+         pub fn d(x: u32, y: u32) -> u32 { x / y }\n",
+        true,
+    ),
+    (
+        "bounded_index",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"i < len\")]\n\
+         pub fn at(s: &[u8], i: usize) -> u8 { s[i] }\n",
+        true,
+    ),
+    (
+        "bounded_mul",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"x < 1000\")]\n#[pitbull::requires(\"y < 1000\")]\n\
+         pub fn m(x: u32, y: u32) -> u32 { x * y }\n",
+        true,
+    ),
+    (
+        // The safe twin of `add_one_past_safe_boundary`: x,y < 2^31 bounds the
+        // sum at 2^32 - 2 = u32::MAX - 1, so it discharges. Pins that the BV
+        // reasoning is sharp at the exact overflow boundary, not approximate.
+        "add_tight_safe_boundary",
+        "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+         #[pitbull::requires(\"x < 2147483648\")]\n#[pitbull::requires(\"y < 2147483648\")]\n\
+         pub fn f(x: u32, y: u32) -> u32 { x + y }\n",
+        true,
+    ),
+];
+
+/// CARDINAL INVARIANT: no known-unsafe program is ever reported "verified".
+/// Solver-independent (see module note) so it runs even without z3/cvc5.
+#[test]
+fn red_team_no_false_discharge() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("red_team_no_false_discharge: SKIPPED — wrapper prerequisites missing.");
+        return;
+    };
+    let mut failures: Vec<String> = Vec::new();
+    for (label, src) in RED_TEAM_UNSAFE {
+        let (stderr, code) = run_wrapper_on_source(&env, src, &[]).expect("wrapper run");
+        if wrapper_verified(code) {
+            failures.push(format!(
+                "*** CARDINAL FALSE DISCHARGE *** `{label}` (known-unsafe) was VERIFIED \
+                 (exit 0).\n  src:\n{src}\n  stderr:\n{stderr}"
+            ));
+        } else if !stderr.contains("crate analyzed") {
+            // Rejected, but not by Pitbull's own analysis (e.g. a rustc compile
+            // error would exit non-zero too) — the probe would then pass for the
+            // wrong reason. Surface it so the probe gets fixed, never silently
+            // trusted.
+            failures.push(format!(
+                "`{label}` did not reach Pitbull analysis (no `crate analyzed` line) — the \
+                 probe likely fails to compile; fix the probe.\n  src:\n{src}\n  stderr:\n{stderr}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "independent red-team found {} soundness/probe failure(s) of {} probes:\n\n{}",
+        failures.len(),
+        RED_TEAM_UNSAFE.len(),
+        failures.join("\n\n"),
+    );
+}
+
+/// COMPLETENESS SANITY: known-safe programs verify — proving the tool is not
+/// trivially rejecting everything, and (with `add_tight_safe_boundary` vs the
+/// reject set's `add_one_past_safe_boundary`) pinning that the bit-vector
+/// reasoning is sharp at the exact overflow boundary. Solver-discharged probes
+/// skip-with-pass when the discharge environment is missing.
+#[test]
+fn red_team_safe_code_verifies() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("red_team_safe_code_verifies: SKIPPED — wrapper prerequisites missing.");
+        return;
+    };
+    let mut failures: Vec<String> = Vec::new();
+    for (label, src, needs_solver) in RED_TEAM_SAFE {
+        let (stderr, code) = run_wrapper_on_source(&env, src, &[]).expect("wrapper run");
+        if *needs_solver && discharge_env_unavailable(&stderr) {
+            eprintln!(
+                "red_team_safe_code_verifies: `{label}` SKIPPED — discharge env unavailable."
+            );
+            continue;
+        }
+        if !wrapper_verified(code) {
+            failures.push(format!(
+                "completeness gap: safe `{label}` was NOT verified (exit {code:?}).\n  \
+                 src:\n{src}\n  stderr:\n{stderr}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "red-team completeness probes failed ({}):\n\n{}",
+        failures.len(),
+        failures.join("\n\n"),
+    );
+}
