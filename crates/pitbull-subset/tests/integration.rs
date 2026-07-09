@@ -3493,6 +3493,23 @@ const NET_TOTAL: &[(&str, &str)] = &[
     ("slice_len", "pub fn f(s: &[u8]) -> usize { s.len() }"),
     ("slice_first", "pub fn f(s: &[u8]) -> Option<&u8> { s.first() }"),
     ("slice_first_chunk", "pub fn f(s: &[u8]) -> bool { s.first_chunk::<4>().is_some() }"),
+    // Pure combinators + total slice search added 2026-07-09 (were conservative
+    // false-rejects before; each is provably panic-free).
+    ("opt_and", "pub fn f(o: Option<u32>, p: Option<u32>) -> Option<u32> { o.and(p) }"),
+    ("opt_or", "pub fn f(o: Option<u32>, p: Option<u32>) -> Option<u32> { o.or(p) }"),
+    ("opt_xor", "pub fn f(o: Option<u32>, p: Option<u32>) -> Option<u32> { o.xor(p) }"),
+    ("opt_zip", "pub fn f(o: Option<u32>, p: Option<u8>) -> Option<(u32, u8)> { o.zip(p) }"),
+    ("opt_get_or_insert", "pub fn f(o: &mut Option<u32>, v: u32) -> u32 { *o.get_or_insert(v) }"),
+    (
+        "opt_transpose",
+        "pub fn f(o: Option<Result<u32, u8>>) -> Result<Option<u32>, u8> { o.transpose() }",
+    ),
+    ("res_and", "pub fn f(r: Result<u32, u8>, s: Result<u32, u8>) -> Result<u32, u8> { r.and(s) }"),
+    ("res_or", "pub fn f(r: Result<u32, u8>, s: Result<u32, u8>) -> Result<u32, u8> { r.or(s) }"),
+    (
+        "slice_binary_search",
+        "pub fn f(s: &[u32], x: &u32) -> Result<usize, usize> { s.binary_search(x) }",
+    ),
 ];
 
 #[test]

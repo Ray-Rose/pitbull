@@ -3285,6 +3285,19 @@ pub fn is_trusted_total_library_call(p: &str) -> bool {
             || p.ends_with("::map_err")
             || p.ends_with("::and_then")
             || p.ends_with("::or_else")
+            // Pure combinators — return the other operand / None / a
+            // restructured value; none has a panic path (verified total against
+            // the real wrapper + NET_TOTAL, 2026-07-09). `ends_with` is exact so
+            // `::and` != `::and_then`, `::or` != `::or_else`/`::ok_or`,
+            // `::zip` != `::unzip`, `::get_or_insert` != `::get_or_insert_with`
+            // (the `_with` closure form is excluded — it ICEs rustc_public on
+            // the pinned nightly, tracked separately).
+            || p.ends_with("::and")
+            || p.ends_with("::or")
+            || p.ends_with("::xor")
+            || p.ends_with("::zip")
+            || p.ends_with("::transpose")
+            || p.ends_with("::get_or_insert")
             || p.ends_with("::ok")
             || p.ends_with("::err")
             || p.ends_with("::ok_or")
@@ -3384,6 +3397,11 @@ pub fn is_trusted_total_library_call(p: &str) -> bool {
             || p.ends_with("::iter_mut")
             || p.ends_with("::split_at_checked")
             || p.ends_with("::split_at_mut_checked")
+            // Total: returns `Result<usize, usize>`; never panics (verified
+            // total against the real wrapper, 2026-07-09). `ends_with` is exact,
+            // so the closure-taking `binary_search_by`/`_by_key` are NOT matched
+            // here (they ICE rustc_public on the pinned nightly — tracked).
+            || p.ends_with("::binary_search")
             || p.ends_with("::as_ptr")
             || p.ends_with("::as_mut_ptr")
             || p.ends_with("::as_bytes")
@@ -5281,6 +5299,17 @@ mod tests {
             "core::slice::<impl [T]>::first_chunk",
             "std::option::Option::<T>::is_some",
             "core::result::Result::<T, E>::map",
+            // Pure combinators added 2026-07-09 (exact renderings observed from
+            // the real wrapper). All total — no panic path.
+            "std::option::Option::<T>::and",
+            "std::option::Option::<T>::or",
+            "std::option::Option::<T>::xor",
+            "std::option::Option::<T>::zip",
+            "std::option::Option::<T>::get_or_insert",
+            "std::option::Option::<std::result::Result<T, E>>::transpose",
+            "std::result::Result::<T, E>::and",
+            "std::result::Result::<T, E>::or",
+            "core::slice::<impl [T]>::binary_search",
         ];
         for p in allowed {
             assert!(is_trusted_total_library_call(p), "should be allow-listed total: {p}");
@@ -5305,6 +5334,13 @@ mod tests {
             "std::ops::Neg::neg",
             "std::ops::Add::add",
             "std::ops::Index::index", // panicking (caught by the slice/index matcher too)
+            // Exact-match discipline (2026-07-09): the closure-taking siblings
+            // of the newly-added combinators are DELIBERATELY excluded — they
+            // ICE rustc_public on the pinned nightly — and `ends_with` must not
+            // let them ride in on the shorter name.
+            "std::option::Option::<T>::get_or_insert_with",
+            "core::slice::<impl [T]>::binary_search_by",
+            "core::slice::<impl [T]>::binary_search_by_key",
         ];
         for p in denied {
             assert!(!is_trusted_total_library_call(p), "should NOT be allow-listed: {p}");
