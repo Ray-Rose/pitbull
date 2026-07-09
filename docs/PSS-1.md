@@ -436,9 +436,12 @@ each variant has either an `accept` (with documented rationale) or a
 `reject` (pointing to a PB rule). **No default arm exists.** Adding a
 new MIR variant upstream causes a compile error in `pitbull-subset`;
 the audit moves to the new variant.
-The mutation-testing harness (`pitbull-subset::mutation`) is the
-second line of defense: for every rule, perturbations of its predicate
-must be detected by the test suite. Required score is 100%.
+A mutation-testing harness (`pitbull-subset::mutation`) is *intended* as a
+second line of defense: for every rule, perturbations of its predicate should
+be detected by the test suite, with a 100% kill-rate as the target release
+gate. **Status: not yet active** — the module is a stub that is not wired to
+cargo-mutants and there is no CI gate enforcing the score. This is roadmap, not
+a current guarantee.
 ## 15. Test-corpus requirements
 For PSS-1 v0.1 release:
 - One representative reject and one accept example per category. *(v0.1
@@ -2097,6 +2100,32 @@ the std form and now also matches. No shadow type changes.
   `"0 undischarged"` VC summary and wrongly demanded exit 1 once the safe
   `x << 4` (4 < 32) legitimately discharges — it now branches on the
   per-obligation verdict, correct in both the solver and no-solver lanes.
+- ✅ Independent red-team + docs-honesty pass (2026-07-09). (1) An INDEPENDENT
+  adversarial red-team of the cardinal claim: a fresh probe set — authored
+  separately from the rules' own fixtures/corpus, since the value of a red-team
+  is testing the tool with different hands than the code+docs under audit — was
+  driven through the real wrapper with z3 4.16.0 + cvc5 1.3.4 voting. Result:
+  **zero false discharges, zero false rejects.** Every known-unsafe form is
+  rejected (unconstrained/method/neg/shift/mul overflow, div & rem by zero,
+  signed `MIN/-1`, off-by-one `i<=len` index, wrong-variable precondition,
+  unsafe, transmute, Box, unwrap, `unreachable!`, `assert!`, slice-range index,
+  `as`-truncation); the consistency guard refuses contradictory (`x<5 && x>10`)
+  and vacuous (`x<0` for u32) preconditions rather than vacuously discharging;
+  `panic!` is caught twice (fmt coverage-gap + PB043). The BV reasoning is SHARP
+  at the exact overflow boundary — `x+y` under `x,y<2^31` discharges (sum ≤
+  u32::MAX-1) but `x,y<2^31+1` is rejected. This is now a permanent regression
+  suite: `integration.rs::{red_team_no_false_discharge, red_team_safe_code_
+  verifies}` (the no-false-discharge half is solver-independent — fail-closed
+  regardless of solver availability — so it guards even the stable lane). (2) A
+  docs-honesty pass removed the last overclaims flagged after the Creusot scrub:
+  the README's non-existent `qualification/` dir and present-tense Ferrocene
+  claim, and the SAFETY-MANUAL's listing of mutation-testing (100% CI gate),
+  Miri cross-validation, and Kani differential testing as ACTIVE TCB defenses —
+  none of which are wired (no Miri anywhere; `mutation.rs` is an unwired stub;
+  the CI comments already disclosed this). All are now split into honest
+  active-vs-planned, and the mutation-harness claim in §14 was corrected to
+  "not yet active". No code behavior changed; the separation between what is
+  verified and what is aspirational is now explicit.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is a

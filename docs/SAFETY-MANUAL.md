@@ -53,41 +53,85 @@ Pitbull v0.1 is intentionally narrow. The following are out of scope:
 A bug in any of the following invalidates Pitbull's guarantee. Each
 item names the responsible upstream party.
 ### 3.1 The compiler
-- **Ferrocene** (compiler distribution and qualification).
-- **LLVM** (code generation).
 - **rustc** (source-to-MIR lowering, monomorphization,
-  borrow-checking, drop elaboration).
-Pitbull does not validate the compiler's correctness. Users running
-Pitbull outside the Ferrocene-pinned configuration void the
+  borrow-checking, drop elaboration). The verifier's wrapper currently
+  builds against the pinned **`nightly-2026-01-29`** toolchain, because it
+  consumes the unstable `rustc_public` reflection API.
+- **LLVM** (code generation).
+- **Ferrocene** — the *intended* qualified compiler distribution for
+  safety-critical deployment. This is **roadmap, not current state**:
+  `rustc_public` is nightly-only, so the wrapper does not yet run on a
+  Ferrocene release, and the `pitbull-0.1.0-ferrocene-26.02.0` toolchain
+  identifier (PB071) is a forward-looking pin, not proof of a completed
+  Ferrocene integration.
+Pitbull does not validate the compiler's correctness. Running Pitbull on
+any toolchain other than the pinned one it was built against voids the
 guarantee.
 ### 3.2 The Pitbull pipeline
 - **`pitbull-subset`** (this crate): the PSS-1 enforcer.
 - **`pitbull-vc`**: VC generation, SMT-LIB emission, and solver dispatch.
 - **`pitbull-driver`**: orchestration (the `cargo pitbull` subcommand and
   the `pitbull-rustc` compiler wrapper).
-A bug in any of these is a soundness bug. Defenses:
-- Mutation testing at 100% kill rate (CI gate).
-- Multi-solver agreement (2-of-3 default; configurable).
-- Proof-certificate replay against current solver binaries
-  (catches solver-bug-dependent proofs).
-- Miri cross-validation under Tree Borrows on fuzzed inputs (v0.2+).
-- Differential testing against Kani (v0.2+).
+A bug in any of these is a soundness bug.
+
+**Defenses active today (implemented + tested):**
+- Multi-solver agreement — default **2-of-2** over `[z3, cvc5]` (threshold
+  and pool configurable). Discharge requires `threshold` distinct solvers to
+  agree `unsat` with zero `sat`; any `sat`+`unsat` split is a loud
+  `Disagreement` that fails closed.
+- Proof-certificate replay against current solver binaries (`cargo pitbull
+  replay`), catching solver-bug-dependent proofs, with HMAC-SHA256 and
+  optional Ed25519 signing.
+- Fail-closed exit code and a complete coverage-gap ledger: exit 0 cannot
+  mean "verified except the parts I could not model".
+- `#![forbid(unsafe_code)]` on every TCB crate root.
+- An **independent adversarial red-team regression suite**
+  (`crates/pitbull-subset/tests/integration.rs::red_team_*`): fresh
+  known-unsafe programs across every AoRTE failure mode — plus precondition
+  traps (off-by-one, wrong-variable, contradictory/vacuous) and a
+  boundary-sharpness pair — each of which must be rejected, run through the
+  real wrapper in the nightly-e2e CI lane. The no-false-discharge half is
+  solver-independent (an unsafe program fails closed via a subset violation,
+  coverage gap, pending obligation, or an undischarged arithmetic obligation).
+
+**Defenses PLANNED but NOT yet implemented (do not rely on these for
+assurance today):**
+- Mutation testing as a 100%-kill-rate CI gate. A harness stub exists
+  (`pitbull-subset/src/mutation.rs`) but is **not wired to cargo-mutants** and
+  there is no CI gate.
+- Miri cross-validation under Tree Borrows on fuzzed inputs. **No Miri
+  integration exists in the repository.**
+- Differential testing against Kani.
+These items were previously listed here as if active; they are roadmap. See
+the CI workflow (`.github/workflows/ci.yml`), which documents the same gaps.
 ### 3.3 The proof tooling
 - **Z3, CVC5** (SMT solvers; Alt-Ergo is configurable but lacks the
   bit-vector theory the AoRTE obligations need).
 A solver soundness bug can produce a false "verified" result. The
-2-of-3 agreement requirement, combined with proof-certificate replay,
-substantially mitigates this. As of May 2026, cumulative testing
-campaigns have found 1,500+ unique bugs in Z3 and CVC5, including 400+
-soundness bugs. Users requiring the highest assurance should:
-- Set `verification.solver_agreement = 3`.
+**default 2-of-2** agreement requirement over `[z3, cvc5]`, combined with
+proof-certificate replay, substantially mitigates this: published SMT-solver
+fuzzing campaigns have found large numbers of bugs in Z3 and CVC5, including
+soundness bugs, so relying on a single solver's `unsat` is not acceptable for
+a soundness-bearing tool. Users requiring higher assurance should:
+- Add a third **independent, bit-vector-capable** solver to
+  `verification.solvers` and raise `verification.solver_agreement` to match
+  (raising `solver_agreement` alone, without enlarging the pool, makes every
+  obligation `Inconclusive` — fail-closed, but nothing discharges).
 - Set `reporting.strict_replay = true`.
-- Enable the (future) Coq/Lean back-check for prelude axioms.
+- (Planned, not yet implemented) A Coq/Lean back-check for the prelude
+  allow-list.
 ### 3.4 The prelude
-The Pitbull prelude axiomatizes a small subset of `core` (integer
-operations, `Option`, `Result`, slice indexing). The prelude's
-axioms are part of the TCB; their consistency is checked offline
-against Coq/Lean (v0.2+).
+The Pitbull "prelude" today is the **trusted-total allow-list**
+(`visitor.rs::is_trusted_total_library_call`) — the enumerated `core`/`std`
+methods assumed panic-free and AoRTE-total (the `wrapping_*`/`checked_*`/
+`saturating_*` int methods, `Ord::min`/`max`/`clamp`, `From`/`TryFrom`, the
+total `char`/slice/`Option`/`Result` methods, …). Primitive integer arithmetic
+and slice-index semantics are not axiomatized separately; they are encoded
+**directly** as QF_BV SMT problems (`pitbull-vc/src/smt.rs`). This allow-list is
+part of the TCB: wrongly listing a panicking method as total would be a
+soundness bug. A **formal axiomatization checked offline against Coq/Lean is
+planned (v0.2+) but not yet implemented**; today the allow-list's correctness
+rests on review plus the corpus/regression tests.
 ### 3.5 The user-supplied spec
 - `#[pitbull::trusted]` items are user assertions. The justification
   attribute is required (PB067) and the trust budget is bounded
@@ -310,13 +354,15 @@ For the guarantee to hold:
    (PB075).
 6. **Run `pitbull replay` in CI** so that stale proofs disagreeing
    with current solver versions block merges.
-7. **Cross-validate with Miri under Tree Borrows** for any code
-   path your spec touches: `MIRIFLAGS=-Zmiri-tree-borrows cargo
-   miri test`. (Available now as a soft gate; required for full
-   conformance.)
+7. **(Recommended, general practice.)** Cross-validate with Miri under
+   Tree Borrows for any code path your spec touches: `MIRIFLAGS=-Zmiri-tree-borrows
+   cargo miri test`. NOTE: Pitbull does **not** yet provide or run a Miri gate
+   itself — this is external cross-validation you run on your own code, not a
+   Pitbull-integrated defense (see §3.2).
 8. **Do not modify the Pitbull pipeline.** If you must (e.g. for
-   downstream integration), document the change and re-run the
-   qualification kit.
+   downstream integration), document the change, re-run the full test suite,
+   and re-establish the multi-solver + replay evidence for your build. (A
+   packaged qualification kit is planned but not yet part of this repository.)
 ## 5. Known limitations of v0.1
 - **No support for `unsafe`.** This is deliberate; see PB001–PB010
   in PSS-1.

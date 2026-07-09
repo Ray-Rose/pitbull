@@ -80,9 +80,15 @@ Pitbull pins to a specific nightly because it builds against the unstable `rustc
 channel = "nightly-2026-01-29"
 components = ["rustc-dev", "llvm-tools-preview"]
 ```
-For ISO 26262 / IEC 61508 / DO-178C qualified deployment, Pitbull layers on
-top of Ferrocene. The Pitbull qualification kit is in `qualification/`
-(separately versioned, separately maintained).
+For ISO 26262 / IEC 61508 / DO-178C qualified deployment, the intended path is
+to run on top of Ferrocene (Rust's qualified toolchain). This is a **roadmap
+goal, not a current capability**: the wrapper today builds against the unstable
+`rustc_public` API, which ships only on the pinned nightly above, so it does not
+yet run on a Ferrocene release. A qualification kit is likewise **planned but
+not present in this repository** — do not treat the `[project] toolchain`
+identifier (`pitbull-0.1.0-ferrocene-26.02.0`) as evidence of a completed
+Ferrocene integration; it is a forward-looking pin, not a runtime check that you
+are on Ferrocene.
 ## Not in scope
 Pitbull does not prove timing, side-channel resistance, or non-interference.
 It does not re-verify the compiler beneath it. It does not detect hardware
