@@ -217,9 +217,44 @@ fn run_check(cli: &Cli, strict: bool) -> Result<ExitCode> {
     // nightly wrapper (analysis never ran) looked identical to "violations
     // found". If cargo failed AND no crate emitted a reachability manifest,
     // the analysis pass did not run — surface that as exit 2.
-    let code = check_exit_code(status.success(), cross_crate_failed, manifests_present);
+    let code = check_exit_code(status.success(), cross_crate_failed, manifests_present, strict);
+    // Deep audit 2026-07-09 (CRITICAL class: exit 0 with zero analysis): a
+    // fully-warm cargo cache means the wrapper never ran THIS invocation —
+    // no crate was (re-)analyzed, and any pitbull.toml change since the
+    // cached runs was NEVER APPLIED (cargo's fingerprint does not include
+    // pitbull.toml). Pre-fix this printed "analysis pass exited cleanly" and
+    // exited 0 even under --strict (the empty-manifest early return in
+    // run_cross_crate_gate bypassed the strict gate designed to catch warm-
+    // cache incompleteness). Now: --strict fails closed (exit 2); the
+    // default warns LOUDLY and says how to force re-analysis.
+    if status.success() && !manifests_present {
+        if strict {
+            eprintln!(
+                "pitbull check: COULD NOT CONFIRM (exit 2, --strict) — cargo succeeded but \
+                 no crate emitted a reachability manifest THIS run (fully warm cargo cache: \
+                 nothing was recompiled, so no Pitbull analysis ran in this invocation). \
+                 Cached verdicts were produced under the pitbull.toml in effect at THAT \
+                 time; a config change since was NOT applied. Run `cargo clean` (or touch \
+                 the crate sources) and re-run.",
+            );
+        } else {
+            eprintln!(
+                "pitbull check: WARNING — no crate was analyzed THIS run (fully warm cargo \
+                 cache). The clean exit reflects PRIOR runs' analysis; if pitbull.toml \
+                 changed since, that change was NOT applied. `cargo clean` forces \
+                 re-analysis; `--strict` fails closed on this condition.",
+            );
+        }
+    }
     match code {
-        0 => eprintln!("pitbull check: configuration OK; analysis pass exited cleanly"),
+        0 if manifests_present => {
+            eprintln!("pitbull check: configuration OK; analysis pass exited cleanly");
+        }
+        0 => eprintln!(
+            "pitbull check: configuration OK; cargo exited cleanly (WARM CACHE — see the \
+             warning above: no new analysis ran this invocation)",
+        ),
+        2 if status.success() => {} // strict warm-cache: message already printed above
         2 => eprintln!(
             "pitbull check: COULD NOT RUN (exit 2) — cargo failed and no crate emitted a \
              reachability manifest, so the Pitbull analysis pass did not run. The nightly \
@@ -234,15 +269,31 @@ fn run_check(cli: &Cli, strict: bool) -> Result<ExitCode> {
     }
     Ok(ExitCode::from(code))
 }
-/// Pure exit decision for `cargo pitbull check` (2026-06-15 deep audit, F5).
-/// Distinguishes the three CI-relevant outcomes instead of collapsing every
-/// non-success to 1: `0` clean, `2` could-not-run (cargo failed AND no
-/// manifest was emitted — the analysis pass never ran), else `1` not-verified
-/// (violations / undischarged / a cross-crate gap, incl. `--strict`'s
-/// cache-incomplete coverage). Pure so the decision is unit-testable.
-fn check_exit_code(cargo_success: bool, cross_crate_failed: bool, manifests_present: bool) -> u8 {
+/// Pure exit decision for `cargo pitbull check` (2026-06-15 deep audit, F5;
+/// warm-cache strict gate 2026-07-09). Distinguishes the CI-relevant
+/// outcomes instead of collapsing every non-success to 1: `0` clean, `2`
+/// could-not-run (cargo failed AND no manifest was emitted — the analysis
+/// pass never ran) OR could-not-confirm (`--strict` with cargo success but
+/// zero manifests: a fully-warm cache ran no analysis this invocation), else
+/// `1` not-verified (violations / undischarged / a cross-crate gap, incl.
+/// `--strict`'s cache-incomplete coverage). Pure so the decision is
+/// unit-testable.
+fn check_exit_code(
+    cargo_success: bool,
+    cross_crate_failed: bool,
+    manifests_present: bool,
+    strict: bool,
+) -> u8 {
     if cargo_success && !cross_crate_failed {
-        0
+        // Deep audit 2026-07-09: cargo success with ZERO manifests means no
+        // analysis ran this invocation (warm cache). --strict must not call
+        // that verified; the default keeps exit 0 (prior runs' verdicts
+        // stand) with a loud warning printed by the caller.
+        if manifests_present || !strict {
+            0
+        } else {
+            2
+        }
     } else if !cargo_success && !manifests_present {
         2
     } else {
@@ -413,7 +464,11 @@ fn locate_wrapper() -> Result<PathBuf> {
 fn run_verify_stub(cli: &Cli) -> Result<ExitCode> {
     eprintln!("pitbull verify: v0.1 ships subset checking only; running `check` instead.");
     eprintln!("pitbull verify: translation + SMT dispatch land in v0.2.");
-    run_check(cli, false)
+    // Deep audit 2026-07-09 (LOW): `verify` is the highest-assurance
+    // command, so it runs the STRICT posture — pre-fix it hardwired
+    // `strict=false`, silently giving the weaker gate to the user asking
+    // for the strongest one.
+    run_check(cli, true)
 }
 /// Re-execute a proof certificate. Reads the bundle, rebuilds the
 /// solver pool from the bundle's recorded solver names, re-runs each
@@ -803,14 +858,22 @@ mod tests {
     /// to 1.
     #[test]
     fn check_exit_code_distinguishes_couldnt_run_from_violations() {
-        // Clean: cargo ok, no cross-crate failure (manifest presence moot).
-        assert_eq!(check_exit_code(true, false, true), 0);
-        assert_eq!(check_exit_code(true, false, false), 0);
+        // Clean: cargo ok, no cross-crate failure, analysis ran this run.
+        assert_eq!(check_exit_code(true, false, true, false), 0);
+        assert_eq!(check_exit_code(true, false, true, true), 0);
+        // Deep audit 2026-07-09: warm cache (cargo ok, ZERO manifests — no
+        // analysis ran this invocation). Default: exit 0 with a loud warning
+        // (prior runs' verdicts stand); --strict: fail closed (exit 2) —
+        // pre-fix the empty-manifest early return bypassed the strict gate.
+        assert_eq!(check_exit_code(true, false, false, false), 0);
+        assert_eq!(check_exit_code(true, false, false, true), 2);
         // A cross-crate gap even on a clean cargo build → not verified.
-        assert_eq!(check_exit_code(true, true, true), 1);
+        assert_eq!(check_exit_code(true, true, true, false), 1);
+        assert_eq!(check_exit_code(true, true, true, true), 1);
         // cargo failed but analysis ran (manifests present) → violations.
-        assert_eq!(check_exit_code(false, false, true), 1);
+        assert_eq!(check_exit_code(false, false, true, false), 1);
         // cargo failed AND no manifest emitted → analysis could not run.
-        assert_eq!(check_exit_code(false, false, false), 2);
+        assert_eq!(check_exit_code(false, false, false, false), 2);
+        assert_eq!(check_exit_code(false, false, false, true), 2);
     }
 }

@@ -438,6 +438,20 @@ impl PitbullCallbacks {
             trusted: hir_trusted,
             ensures: hir_ensures,
         } = collect_hir_pre_pass(tcx, &cfg.subset.allowed_proc_macros);
+        // Deep audit 2026-07-09 (HIGH): register every precondition-carrying
+        // function path (config keys ∪ attribute keys) with the visitor ONCE,
+        // so each CALL to one records a CoverageGap — v0.2 has no call-site
+        // precondition discharge, and a callee verified under an ASSUMED
+        // precondition must not be silently callable with arguments that
+        // violate it (the `oops(){safe_div(10,0)}` false discharge).
+        visitor.set_known_precondition_fns(
+            cfg.verification
+                .preconditions
+                .keys()
+                .chain(hir_preconditions.keys())
+                .cloned()
+                .collect(),
+        );
         // The HIR pre-pass finds BOTH PB001 (unsafe blocks) and PB003
         // (unsafe impl/trait). Count only PB001 for the "unsafe blocks"
         // summary line so the diagnostic stays accurate; PB003 still flows
@@ -530,17 +544,18 @@ impl PitbullCallbacks {
                     shadow_body.def_id =
                         pitbull_subset::mir_api::adapter::def_id(item.def_id());
                     // Task Q.1 audit-cleanup (2026-05-26): the
-                    // adapter's `body()` hardcodes `is_unsafe: false`
-                    // and `is_async: false` because the rustc_public
-                    // surface doesn't expose those flags. Extract
-                    // them via the rustc_internal bridge (same
+                    // adapter's `body()` defaults `is_unsafe: true`
+                    // and `is_async: true` (fail-closed placeholders
+                    // since the M1 adapter fix — an earlier revision
+                    // of this comment said "hardcodes false", which
+                    // was stale) because the rustc_public surface
+                    // doesn't expose those flags. Extract the REAL
+                    // values via the rustc_internal bridge (same
                     // pattern as PB018's `is_mutable_static` for
-                    // statics). Without this, PB002 (unsafe fn) and
-                    // PB026 (async fn) silently don't fire on real
-                    // MIR — only on shadow-IR unit tests. The Q.1
-                    // trust-test surfaced the gap; closing it here
-                    // is in scope because it's adjacent (signature-
-                    // level safety rules) to trust semantics.
+                    // statics) and overwrite. Without this overwrite
+                    // every safe fn would false-reject as PB002/PB026;
+                    // without the extraction PB002 (unsafe fn) and
+                    // PB026 (async fn) wouldn't fire on real MIR.
                     let internal_id = rustc_public::rustc_internal::internal(
                         tcx,
                         item.def_id(),
@@ -2093,9 +2108,11 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
         // F7 posture as PB001: a derive may emit an unsafe impl the user
         // didn't author; a non-allowlisted such macro is caught by PB059).
         let unsafe_item: Option<&str> = match &item.kind {
-            rustc_hir::ItemKind::Trait(_, _, safety, ..)
-                if matches!(safety, rustc_hir::Safety::Unsafe) =>
-            {
+            // Safety matched structurally in the pattern (clippy
+            // redundant_guards drift under the current toolchain, restored
+            // error-clean 2026-07-09 — same class as the earlier
+            // collapsible-if-let in reachability.rs).
+            rustc_hir::ItemKind::Trait(_, _, rustc_hir::Safety::Unsafe, ..) => {
                 Some("`unsafe trait`")
             }
             rustc_hir::ItemKind::Impl(imp) => match imp.of_trait {

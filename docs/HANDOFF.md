@@ -7,15 +7,17 @@ bottom on first sit-down; refer back to individual sections
 during work.
 
 Last known-good commit at hand-off: the latest on `main` — run
-`git log -1`. The most recent milestone is **Task S** (multi-solver
-2-of-N agreement gate); the prior one is **`51c99e5`** (Task R,
-division/over-shift obligation encoding). The v0.2 state ships the
+`git log -1`. The most recent milestone is the **2026-07-09 deep-audit
+second pass** (see the dated subsection at the end of §1: `Ord::clamp` /
+sort-family false discharges closed, call-site preconditions fail closed,
+`vote` threshold-0 + forged-replay hole closed, warm-cache `check`
+fail-open closed). The v0.2 state ships the
 deductive backend, full PB054 end-to-end discharge (P / P.1 / P.2),
 the Option-C attribute suite (Phase B grammar, Q.1 trusted, Q.2
 impl-methods, Q.3 expression-form, Q.4 ensures-MVP), the full
 arithmetic AoRTE family (Task R), the **multi-solver agreement gate**
-(Task S), and several deep-audit cleanup passes. Branch `main`, local
-repo only (no remote).
+(Task S), proof certificates + replay + signing (Task T), and several
+deep-audit cleanup passes. Branch `main`, with `origin` remote on GitHub.
 
 ## TL;DR
 
@@ -23,7 +25,7 @@ repo only (no remote).
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 343 tests passing (190 subset-lib + 77 vc + 54 integration + 11 aorte_proofs + 11 driver-bin),
+- **State:** 366 tests passing (192 subset-lib + 93 vc + 58 integration + 12 aorte_proofs + 11 driver-bin),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -166,16 +168,17 @@ d3682f6 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **343 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **366 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The **343** breaks down: 4 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 190
-(subset lib) + 54 (integration) + 11 (aorte_proofs) + 77 (vc) = 343 (the
-2026-06-15 re-audit added +10 over the prior 332; see the dated subsection at
-the end of §1). This supersedes the long
+The **366** breaks down: 4 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 192
+(subset lib) + 58 (integration) + 12 (aorte_proofs) + 93 (vc) = 366 (the
+2026-07-09 deep audit added +4 soundness-pinning tests over the interim 362,
+which itself grew from 343 via the red-team suite + trusted-total broadening
+commits; see the dated subsections at the end of §1). This supersedes the long
 Task-S-era narration that previously lived here (which still said "226" while
 the table said 277 — a drift caught and corrected in the 2026-06-14 deep
 audit). The lineage to today's number: the multi-solver agreement gate (Task
@@ -274,6 +277,44 @@ Residuals accepted as covered by the PB073 hermetic-build obligation:
 read-amplification, not a leak — the key is never echoed). Remaining (P2, LOW):
 the `Rvalue::Repeat` inert-count comment; a `capture_shift_amount`
 constant-mask pin test; intermediate-symlink / Windows-junction path notes.
+**CAVEAT (2026-07-09): the PB073 hermetic-build obligation named above as the
+compensating control is NOT implemented** (the config.rs comment claiming the
+driver checks PB072/073/074 was corrected this session) — those env-injection
+residuals are currently guarded only by `check_env_path` hygiene. See §7.
+
+### 2026-07-09 deep audit, second pass (this session)
+
+Four parallel adversarial audits (proof core; visitor + allow-lists;
+adapter + reachability; driver + config + predicate) over the whole codebase;
+every finding re-verified against source before fixing. Full detail in
+`docs/PSS-1.md` §17.1 (dated entry). Fixed, all fail-closed (+4 tests → 366):
+
+- **`Ord::clamp` false discharge (CRITICAL)** — trusted-as-total but panics on
+  `min > max`; confirmed exit-0 end-to-end on real MIR pre-fix. Evicted from
+  the allow-list; now a precise PB043 (pending). `sort`/`sort_unstable`
+  likewise de-trusted (panic on non-total `Ord`, Rust 1.81+); `min`/`max`/
+  `cmp`/`binary_search` stay trusted with negative controls pinned.
+- **Call-site preconditions unproven (HIGH)** — `#[pitbull::requires]` was
+  assumed in the callee but no call site ever proved it
+  (`oops(){safe_div(10,0)}` verified). Every call to a precondition-carrying
+  fn now records a fail-closed CoverageGap (`set_known_precondition_fns`),
+  verified e2e. Real call-site SMT discharge is the tracked follow-up.
+- **`vote(_, 0)` vacuous discharge + forged-certificate replay (HIGH)** —
+  `vote` now clamps `threshold.max(1)`; `from_json` refuses `threshold == 0`
+  at bundle and obligation level. A hand-forged unsigned `threshold:0` bundle
+  could previously replay to exit 0.
+- **Warm-cache `cargo pitbull check` fail-open (CRITICAL class)** — zero
+  manifests (nothing recompiled ⇒ no analysis ran) exited 0 even under
+  `--strict`, and a `pitbull.toml` change is never applied to cached crates.
+  `--strict` now exits 2 (could-not-confirm); default warns loudly;
+  `cargo pitbull verify` now runs strict.
+- **Empty solver-version pin fail-open (LOW)** — `version_matches("...", "")`
+  matched punctuation tokens; empty pins now refuse.
+- **Honesty pass** — corrected overclaiming comments/docs: PB072/073/074
+  "checked by the driver" (unimplemented), PB060 sha256 format-only,
+  mutation.rs "CI ground truth" (unwired), visitor `Unreachable` "obligation
+  emitted" (none exists), stale adapter is_unsafe contract note, README/
+  SAFETY-MANUAL allow-list examples naming `clamp`.
 
 ---
 
@@ -769,6 +810,13 @@ git commit -m "..."
 | Self-verification / dogfood (Frontier #6) | Pitbull cannot yet verify its own TCB: that code uses heap + collections (`Vec`/`String`/`HashMap`), serde, and `rustc_private` internals — all outside PSS-1, so the subset enforcer would (correctly) reject it. End-to-end verification of *real* code is instead demonstrated by the accept corpus + the fixed-point `scale_q` proof (Frontier #1, `aorte_proofs.rs`), now exercised on the Linux nightly-e2e lane. This is the honest scope: a "partial dogfood" via real external targets, not self-hosting. | whole TCB | True self-hosting awaits the subset covering heap/collections (v0.2+); the alternative (carving out a tiny pure subset of the TCB to verify) would be a contrived demo, not a real soundness signal. |
 | Bounds checks (PB054) | ✅ DONE in Tasks P / P.1 / P.2 + audit-cleanup. Visitor emits `IndexBound { idx_source_name: Option<String> }`; compile emits QF_BV with `__pb_idx`/`__pb_len` canonical names + `idx`/`len` aliases + optional source-name alias in quoted-symbol syntax for raw-ident safety. End-to-end discharge under Z3 verified by `wrapper_proves_bounded_index_safe_under_precondition`. | — | Closed. |
 | Z3 subprocess timeout / output cap | Z3 invocation can hang indefinitely on a pathological SMT problem; no captured-output size cap. | `pitbull-vc/src/solver.rs` | DoS vector flagged in audit finding N3 (2026-05-26). Mitigation requires spawning + try_wait + size-cap; bigger change than the audit-cleanup pass absorbed. |
+| Reachability path-matching cluster (2026-07-09 audit) | Under `verify_roots` NARROWING, the per-crate/#27 and cross-crate gates ignore referenced paths they can't match to a universe entry ("unmatched ⇒ ignore"): statically-dispatched trait-method impls (recorded under the trait path, never a walkable item), visible-vs-canonical re-export renderings, and `covered_analyzed_universe` inferring a crate "analyzed" from an impl-for-foreign-type path. Each can silently exempt a reachable function from the coverage requirement. NOT exploitable with default walk-all (`verify_roots = []`), where every local item is walked regardless. | `pitbull-subset/src/reachability.rs` (gates), `pitbull-driver/src/main.rs` (aggregation) | Fail-closed redesign ("unmatched workspace-owned referenced path ⇒ indeterminate") is a structural change to the path-keyed accounting; needs empirical probing of `name()` renderings on the pinned nightly first. Until then: treat `verify_roots` narrowing as weaker than walk-all. |
+| ADT generic args dropped by adapter (2026-07-09 audit) | The shadow `AdtDef` carries only `{path, is_union}`; `RigidTy::Adt(_, generic_args)` discards args, so `static S: Option<Cell<u32>>` (or a user struct with a `Cell` field) passes PB018/PB021's item-type check — the `Cell` is invisible at the item level. In-body USES still fire PB021 (materializing `&Cell` in a local); transport-only flows do not. | `pitbull-subset/src/mir_api/adapter.rs`, `mir_api.rs` | Threading args through the shadow IR ripples every AdtDef consumer; needs a deliberate design (render-into-path vs. structured args). |
+| PB060 build-script hash recorded, not verified (2026-07-09 audit) | `trusted_build_scripts[].sha256` is format-validated (64 hex chars) only; no code hashes the referenced build.rs and compares, so a changed build script stays trusted. | `pitbull-subset/src/config.rs::validate` | Requires resolving the build.rs path per crate + hashing at wrapper start; disclosed inline in config.rs. |
+| PB072/PB073/PB074 unimplemented (2026-07-09 audit) | Cargo.lock presence, hermetic-environment, and pitbull-spec version checks do not exist (a config.rs comment previously claimed the driver performs them — corrected). PB073 is the named compensating control for the `PITBULL_*` env-injection residuals (`PITBULL_TOML` redirect, `PITBULL_ALLOW_UNSAFE_PATHS` from a hostile build.rs), so those residuals are currently guarded only by `check_env_path` hygiene. | driver | Implementing PB073 (refuse or fingerprint suspicious `PITBULL_*` provenance, e.g. a sentinel set by the subcommand) is the highest-leverage of the three. |
+| Bang-macro `unsafe {}` HIR skip (2026-07-09 audit) | The PB001 HIR pre-pass skips blocks whose span `from_expansion()`, and PB059 provenance-checks only Derive/Attr macros — a local `macro_rules!` expanding to `unsafe { … }` evades both. MIR-level operation rules (PB004/PB007/PB009…) still fire on the operations INSIDE, so this is a PB001-reporting gap more than a free pass, but it is untested. | `pitbull-driver/src/bin/pitbull-rustc.rs` (HIR pre-pass), config PB059 | Needs a Bang-macro provenance policy (allowlist local macros?) without false-flagging std macros like `assert!`. |
+| Call-site precondition SMT discharge (2026-07-09 audit) | The fail-closed CoverageGap (this session) makes calls to precondition-carrying fns honest but CONSERVATIVE: a call that provably satisfies the callee's precondition (constant args, or caller preconditions implying it) still gaps. | visitor + `pitbull-vc` | The real fix — bind actual args to callee precondition vars, ask the solver — is the natural next VC feature (pairs with the PB043 path-condition work). |
+| `extract_arg_names` index-only binding (2026-07-09 audit) | Arg names bind by `argument_index` alone without checking the debug-info place; a destructured pattern arg could attach a binding's name to the tuple local. Neutralized TODAY by the VC layer's primitive-int filter, but becomes a wrong-variable-binding vector when multi-width support widens that filter. | `pitbull-subset/src/mir_api/adapter.rs::extract_arg_names` | Require `info.value` to be a projection-free place on exactly local `i+1` before trusting the name. |
 | PB049 silent skip on projected operands | ✅ DONE in audit-cleanup. `maybe_emit_overflow_obligation` now emits a `PB049: ... skipped` audit note when operand types can't be resolved (projected operands like `p.0 + p.1`, mismatched types). Pre-fix the obligation was silently dropped — auditors reading "0 obligations" would falsely conclude verified. | — | Closed (audit finding N1, 2026-05-26). |
 | SARIF / TOML symlink follow | ✅ DONE in audit-cleanup. `check_env_path` now refuses symlink leaf paths via `symlink_metadata().file_type().is_symlink()`. Pre-fix a build.rs could create a `.json`-extension symlink to overwrite `~/.config/.../settings.json` via `PITBULL_SARIF_OUT`. | — | Closed (audit finding N2, 2026-05-26). |
 

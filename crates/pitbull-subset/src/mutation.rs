@@ -72,7 +72,10 @@ pub struct MutationTarget {
 }
 /// The full manifest of mutation targets.
 ///
-/// CI uses this as ground truth: every entry must be killed; new mutants
+/// INTENDED CI contract — **not yet wired** (deep audit 2026-07-09: nothing
+/// outside this module's own tests consumes this manifest, so it provides
+/// ZERO assurance until the `cargo-mutants` integration lands; tracked in
+/// HANDOFF §7). Once wired: every entry must be killed; new mutants
 /// (introduced by `cargo-mutants` discovering additional sites in a
 /// refactor) must be added here or the test suite must be strengthened
 /// to kill them.

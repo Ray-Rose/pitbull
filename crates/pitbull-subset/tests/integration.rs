@@ -3476,6 +3476,15 @@ const NET_PANICKING: &[(&str, &str)] = &[
     ("char_to_digit", "pub fn f(c: char, r: u32) -> u32 { c.to_digit(r).unwrap_or(0) }"),
     ("char_from_digit", "pub fn f(n: u32, r: u32) -> Option<char> { core::char::from_digit(n, r) }"),
     ("char_encode_utf8", "pub fn f(c: char, b: &mut [u8]) { c.encode_utf8(b); }"),
+    // Deep audit 2026-07-09: evicted from the trusted-total allow-list.
+    // `Ord::clamp` panics on `min > max` — with DYNAMIC bounds this is a
+    // reachable panic in "verified" code, the false discharge the audit found.
+    ("ord_clamp", "pub fn f(x: u32, lo: u32, hi: u32) -> u32 { x.clamp(lo, hi) }"),
+    // The sort family panics on a non-total `Ord` (Rust 1.81+). On primitive
+    // elements it cannot actually panic — this is the deliberate family-level
+    // conservative reject (fail closed; the path string does not carry the
+    // element type, so the safe primitive case cannot be distinguished).
+    ("slice_sort_unstable", "pub fn f(s: &mut [u32]) { s.sort_unstable() }"),
 ];
 
 /// Each `(label, src)` MUST stay verified (exit 0): a TOTAL call adjacent to

@@ -255,14 +255,21 @@ fn crc16_ccitt_known_answer_and_never_panics() {
 
 /// Fixed-point (Q16.16) PID step with saturating integral and wrapping
 /// products widened to `i64` (so `i32 * i32` cannot overflow). Saturating /
-/// wrapping / shift / clamp are all total — AoRTE-safe on any input.
+/// wrapping / shift / `min`+`max` are all total — AoRTE-safe on any input.
 /// (PSS-1 §15 names a PID controller.)
+///
+/// Range-limiting uses the `min`/`max` chain, NOT `Ord::clamp`: `clamp`
+/// PANICS on `min > max`, so the 2026-07-09 deep audit evicted it from the
+/// trusted-total allow-list (it had been a false discharge) — a function
+/// calling `clamp` is no longer one Pitbull verifies. The bounds here are
+/// constants with `lo <= hi`, so `.min(hi).max(lo)` is exactly equivalent
+/// and panic-free by construction.
 fn pid_step(setpoint: i32, measured: i32, integral: &mut i32, kp: i32, ki: i32) -> i32 {
     let error = setpoint.wrapping_sub(measured);
     *integral = integral.saturating_add(error);
     let p = (kp as i64).wrapping_mul(error as i64) >> 16;
     let i_term = (ki as i64).wrapping_mul(*integral as i64) >> 16;
-    p.wrapping_add(i_term).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    p.wrapping_add(i_term).min(i32::MAX as i64).max(i32::MIN as i64) as i32
 }
 
 #[test]

@@ -2126,6 +2126,86 @@ the std form and now also matches. No shadow type changes.
   active-vs-planned, and the mutation-harness claim in §14 was corrected to
   "not yet active". No code behavior changed; the separation between what is
   verified and what is aspirational is now explicit.
+- ✅ Five-front deep audit + soundness fixes (2026-07-09, second pass). Four
+  parallel adversarial audits (proof core; visitor+allow-lists;
+  adapter+reachability; driver+config+predicate) over the whole codebase,
+  every finding verified against source before fixing. **Fixed, all
+  fail-closed:**
+  (1) **`Ord::clamp` false discharge (CRITICAL)** — `clamp` was on the
+  trusted-total allow-list but its default trait body asserts `min <= max`
+  and PANICS; `x.clamp(lo, hi)` with dynamic bounds verified (exit 0) yet
+  panics at runtime for `lo > hi`. Confirmed end-to-end on real MIR (running
+  the new `NET_PANICKING` entries against the stale wrapper reproduced the
+  exit-0). Evicted from the allow-list + added to
+  `is_panicking_library_call` (precise PB043 pending obligation);
+  `Ord::min`/`max`/`cmp` stay trusted (negative controls pinned).
+  (2) **Call-site preconditions unproven (HIGH — modular-verification false
+  discharge)** — a `#[pitbull::requires]` was consumed as an ASSUMPTION
+  discharging the callee's own obligations, but no call site was ever
+  obligated to prove it: `safe_div(a,b){a/b}` under `requires("b>0")`
+  verified AND `oops(){safe_div(10,0)}` verified — yet `oops()` panics.
+  Until real call-site discharge lands, every call to a
+  precondition-carrying function (config keys ∪ attribute keys, threaded
+  via `set_known_precondition_fns`) records a fail-closed CoverageGap —
+  verified e2e (`oops` now exits 1 with the call-site gap while
+  `safe_div`'s own obligation still discharges). Boundary functions with no
+  in-crate callers — the demo shapes — are unaffected; the PB050 corpus
+  file dropped its unnecessary (and unproven-at-call-site) `requires` on
+  `q16_mul`.
+  (3) **`vote` threshold-0 discharge hole (HIGH)** — `unsat.len() >= 0` is
+  vacuously true, so `vote(results, 0)` returned `Discharged` with ZERO
+  agreeing solvers. The live driver clamps its config value, but the REPLAY
+  path fed `vote` an attacker-controlled certificate threshold: a
+  hand-forged UNSIGNED bundle with `threshold:0` over all-`unknown` solver
+  results passed internal-consistency + ledger + replay-reproduction →
+  `cargo pitbull replay` exit 0 from a certificate proving nothing. `vote`
+  now clamps `threshold.max(1)` (defends itself) and `from_json` refuses
+  any bundle- or obligation-level `threshold == 0` at load.
+  (4) **Warm-cache `cargo pitbull check` exit-0-with-zero-analysis
+  (CRITICAL class: fail-open)** — a fully-warm cargo cache means the
+  wrapper never ran this invocation; the empty-manifest early return in
+  `run_cross_crate_gate` bypassed the `--strict` gate DESIGNED for
+  warm-cache incompleteness, and cargo's fingerprint excludes
+  `pitbull.toml` (a config change is silently never applied). Now:
+  `--strict` fails closed (exit 2, could-not-confirm) and the default
+  prints a loud no-analysis-ran warning naming the config-drift risk;
+  `cargo pitbull verify` (the highest-assurance command) now runs the
+  strict posture instead of hardwiring `strict=false`.
+  (5) **slice `sort`/`sort_unstable` de-trusted (MEDIUM)** — since Rust
+  1.81 they panic on a non-total `Ord` (a safe, in-subset hand-written
+  `Ord` can trigger it; `sort` additionally allocates); moved to
+  `is_panicking_index_or_slice_call` (family-level conservative reject —
+  the path string cannot distinguish the safe primitive-element case).
+  `binary_search` stays trusted (wrong result on a broken `Ord`, never a
+  panic); the aorte PID proof swapped its constant-bounds `.clamp(..)` for
+  the equivalent total `.min(..).max(..)` chain.
+  (6) **Empty solver-version pin fail-open (LOW)** — `version_matches`
+  matched an empty pin against punctuation-only banner tokens (the `-` in
+  the Z3 banner trims to `""`), silently accepting any solver version;
+  empty pins now refuse the match (solver dropped from the pool, loud).
+  (7) **Overclaiming comments corrected (honesty pass)** — config.rs
+  claimed PB072/PB073/PB074 are "checked by the driver" (none is
+  implemented; PB073 is the named compensating control for the `PITBULL_*`
+  env-injection residuals, so that gap is now disclosed inline); PB060's
+  `sha256` is validated for FORMAT only (nothing hashes the referenced
+  build.rs — disclosed inline); mutation.rs claimed "CI uses this as ground
+  truth" (the manifest is consumed by nothing outside its own tests); the
+  visitor's `Unreachable` arm claimed "the VC generator emits the
+  obligation" (no such obligation kind exists — the arm accepts unchecked,
+  with the safe-Rust/compiler-TCB rationale now stated); the wrapper's
+  adapter-contract comment still said the adapter "hardcodes
+  `is_unsafe: false`" (it defaults both flags `true` fail-closed since the
+  M1 fix); README's allow-list example listed `clamp`.
+  Tests: 343 → **366** (4 cargo-pitbull + 7 pitbull-rustc + 192 subset +
+  12 aorte + 58 integration + 93 vc); both clippy lanes error-clean;
+  nightly wrapper warning-clean. **Deferred with tracking (HANDOFF §7):**
+  the reachability path-matching cluster (trait-impl callees under
+  `verify_roots` narrowing; `covered_analyzed_universe` crate inference;
+  visible-vs-canonical re-export paths — all "unmatched ⇒ ignore" in the
+  aggregation layer), ADT generic-args dropped by the adapter
+  (`static S: Option<Cell<u32>>` passes PB021's type check), Bang-macro
+  `unsafe {}` HIR-span skip, `extract_arg_names` index-only binding, and
+  mutual-recursion SCC detection.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is a
@@ -2148,7 +2228,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 343 passing, 0 warnings, clippy clean
+# Stable: 366 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

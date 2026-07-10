@@ -124,8 +124,14 @@ a soundness-bearing tool. Users requiring higher assurance should:
 The Pitbull "prelude" today is the **trusted-total allow-list**
 (`visitor.rs::is_trusted_total_library_call`) — the enumerated `core`/`std`
 methods assumed panic-free and AoRTE-total (the `wrapping_*`/`checked_*`/
-`saturating_*` int methods, `Ord::min`/`max`/`clamp`, `From`/`TryFrom`, the
-total `char`/slice/`Option`/`Result` methods, …). Primitive integer arithmetic
+`saturating_*` int methods, `Ord::min`/`max`, `From`/`TryFrom`, the
+total `char`/slice/`Option`/`Result` methods, …). The 2026-07-09 deep audit
+found — and evicted — two panicking entries that had been wrongly trusted:
+`Ord::clamp` (panics on `min > max`) and slice `sort`/`sort_unstable`
+(panic on a non-total `Ord` since Rust 1.81); both now fail closed. That is
+exactly the "wrongly listing a panicking method" soundness-bug class named
+below, caught by review — treat every allow-list broadening as
+soundness-critical. Primitive integer arithmetic
 and slice-index semantics are not axiomatized separately; they are encoded
 **directly** as QF_BV SMT problems (`pitbull-vc/src/smt.rs`). This allow-list is
 part of the TCB: wrongly listing a panicking method as total would be a
@@ -212,9 +218,10 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
     allow-list** (`visitor.rs::is_trusted_total_library_call`): under
     `verification.strict_library_acceptance` (default **true**), a call into
     `core`/`std`/`alloc` is accepted only if it is on that allow-list (the
-    `wrapping_*`/`checked_*`/`saturating_*`/… int methods, `Ord::min`/`max`/
-    `clamp`, `From`/`TryFrom`, the total `char`/slice/`Option`/`Result`
-    methods, …); **any other stdlib call — enumerated-as-panicking or not —
+    `wrapping_*`/`checked_*`/`saturating_*`/… int methods, `Ord::min`/`max`,
+    `From`/`TryFrom`, the total `char`/slice/`Option`/`Result`
+    methods, …; `Ord::clamp` and the `sort` family were evicted 2026-07-09 —
+    both panic-bearing); **any other stdlib call — enumerated-as-panicking or not —
     emits an untrusted-stdlib coverage gap and fails closed (exit 1).** This
     inverts the historic fail-OPEN posture under which an un-enumerated
     panicking stdlib method was silently trusted as total (a latent false

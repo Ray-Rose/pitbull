@@ -230,6 +230,14 @@ pub enum AgreementVerdict {
 /// exists to close.
 #[must_use]
 pub fn vote(results: &[(String, SolverResult)], threshold: usize) -> AgreementVerdict {
+    // SOUNDNESS (deep audit 2026-07-09, HIGH): `threshold == 0` would make
+    // `unsat.len() >= threshold` vacuously true — `Discharged` with ZERO
+    // agreeing solvers (even an all-Unknown or empty result set), violating
+    // this function's own contract. The live driver clamps its config value,
+    // but `vote` is *the* exported soundness policy and the replay path feeds
+    // it an attacker-controlled certificate `threshold` — it must defend
+    // itself. A zero threshold is treated as 1 (fail closed, never fail open).
+    let threshold = threshold.max(1);
     // Count DISTINCT solver names per verdict, NOT raw result entries.
     // Soundness (audit 2026-05-29, Critical): if the pool ever contains
     // the same solver twice (e.g. `solvers = ["z3", "z3"]`), one binary's
@@ -704,6 +712,14 @@ pub fn probe_version(solver: &Solver) -> Option<String> {
 /// `1.0` matches none.
 #[must_use]
 pub fn version_matches(reported: &str, pinned: &str) -> bool {
+    // Deep audit 2026-07-09 (LOW, fail-open direction): an EMPTY pin would
+    // match any punctuation-only banner token (e.g. the `-` in
+    // `"Z3 version 4.13.4 - 64 bit"` trims to `""`), silently accepting any
+    // solver version. An empty pin is a misconfiguration; refuse the match so
+    // the solver is dropped from the pool (fail closed), surfacing the bad pin.
+    if pinned.is_empty() {
+        return false;
+    }
     reported.split_whitespace().any(|tok| {
         tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.') == pinned
     })
@@ -1071,6 +1087,46 @@ mod tests {
             vote(&results, 1),
             AgreementVerdict::Inconclusive { unsat_votes: 0, threshold: 1 },
         );
+    }
+    /// Deep audit 2026-07-09 (HIGH): `threshold == 0` must NOT discharge.
+    /// Pre-fix, `unsat.len() >= 0` was vacuously true, so a forged replay
+    /// certificate carrying `threshold: 0` turned two Unknown votes (or an
+    /// empty result set) into `Discharged` — defeating the internal-
+    /// consistency and replay-reproduction checks on unsigned bundles.
+    /// `vote` now clamps a zero threshold to 1 (fail closed).
+    #[test]
+    fn vote_zero_threshold_cannot_discharge() {
+        // No solver decided anything: must be Inconclusive, never Discharged.
+        let unknowns = [
+            ("z3".to_string(), SolverResult::Unknown),
+            ("cvc5".to_string(), SolverResult::Unknown),
+        ];
+        assert_eq!(
+            vote(&unknowns, 0),
+            AgreementVerdict::Inconclusive { unsat_votes: 0, threshold: 1 },
+            "threshold 0 with zero unsat votes must NOT discharge",
+        );
+        let empty: [(String, SolverResult); 0] = [];
+        assert_eq!(
+            vote(&empty, 0),
+            AgreementVerdict::Inconclusive { unsat_votes: 0, threshold: 1 },
+            "threshold 0 with an empty result set must NOT discharge",
+        );
+        // A single real unsat under the clamped threshold-1 still discharges
+        // (the clamp is a floor, not a behavior change for sane configs).
+        let one_unsat = [("z3".to_string(), SolverResult::Unsat)];
+        assert_eq!(
+            vote(&one_unsat, 0),
+            AgreementVerdict::Discharged { unsat_votes: 1 },
+        );
+    }
+    /// Deep audit 2026-07-09 (LOW): an EMPTY version pin must never match —
+    /// pre-fix the punctuation-only banner token `-` trimmed to `""` and
+    /// matched, silently accepting any solver version.
+    #[test]
+    fn version_matches_rejects_empty_pin() {
+        assert!(!version_matches("Z3 version 4.13.4 - 64 bit", ""));
+        assert!(!version_matches("", ""));
     }
     // ===== solver_versions pin matching (Task: version enforcement) ====
     // `version_matches` is the pure half of the

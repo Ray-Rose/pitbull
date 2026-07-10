@@ -7,9 +7,16 @@
 #![allow(dead_code)]
 /// Pi scaled by 2^16 ≈ 3.14159 * 65536 = 205887.
 const PI_Q16: i64 = 205_887;
-/// Q16.16 multiply: (a * b) >> 16, clamped to i64 range.
+/// Q16.16 multiply: (a * b) >> 16, wrapping (total on any input).
+///
+/// Deliberately carries NO `#[pitbull::requires]`: `wrapping_mul` + a
+/// constant shift are total, so none is needed — and as of the 2026-07-09
+/// deep audit a call to a precondition-carrying function records a
+/// fail-closed coverage gap (call-site discharge is unimplemented; a callee
+/// verified ASSUMING its preconditions must not be silently callable). This
+/// file's earlier `requires(a >= 0 && b >= 0)` on `q16_mul` was exactly that
+/// unproven-at-call-site shape.
 #[pitbull::pure]
-#[pitbull::requires(a >= 0 && b >= 0)]
 fn q16_mul(a: i64, b: i64) -> i64 {
     (a.wrapping_mul(b)) >> 16
 }

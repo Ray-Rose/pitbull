@@ -713,6 +713,31 @@ impl CertificateBundle {
                 bundle.format_version,
             ));
         }
+        // Deep audit 2026-07-09 (HIGH): a zero agreement threshold is never
+        // produced by the driver (it clamps config to >= 1) and would make
+        // every vote-derived check vacuous ("0 agreeing solvers meet the
+        // threshold") — the exact lever a hand-forged UNSIGNED bundle used to
+        // defeat `check_internal_consistency` and the replay reproduction
+        // check. `vote` now also clamps internally (defense in depth), but a
+        // zero threshold in the artifact is tampering/corruption by
+        // definition: refuse it at load.
+        if bundle.threshold == 0 {
+            return Err(
+                "certificate bundle records threshold 0 (no producer emits this; \
+                 a zero threshold would vacuously 'meet' agreement with zero \
+                 solvers) — refusing a tampered or corrupted bundle"
+                    .to_string(),
+            );
+        }
+        for ob in &bundle.obligations {
+            if ob.threshold == 0 {
+                return Err(format!(
+                    "certificate `{}` records threshold 0 (no producer emits \
+                     this) — refusing a tampered or corrupted bundle",
+                    ob.id,
+                ));
+            }
+        }
         // Reject a bundle whose certificates are internally inconsistent
         // (hand-forged or corrupted). Fail closed at load (audit
         // 2026-05-29) rather than silently replaying a self-contradictory
@@ -845,6 +870,43 @@ mod tests {
         let err = CertificateBundle::from_json(&json)
             .expect_err("must reject an internally inconsistent certificate");
         assert!(err.contains("internally inconsistent"), "got: {err}");
+    }
+
+    /// Deep audit 2026-07-09 (HIGH): a forged UNSIGNED bundle carrying
+    /// `threshold: 0` must be refused at load. Pre-fix, `vote(_, 0)` was
+    /// vacuously `Discharged`, so a hand-written bundle with
+    /// `verdict:"discharged"` over two `unknown` solver results passed
+    /// `check_internal_consistency`, `attests_full_verification`, AND the
+    /// replay reproduction check — `cargo pitbull replay` exit 0 ("crate
+    /// verified") from a certificate that proved nothing.
+    #[test]
+    fn from_json_rejects_zero_threshold_bundle() {
+        // Bundle-level threshold 0.
+        let json = format!(
+            "{{\"format_version\":{CERT_FORMAT_VERSION},\"tool_version\":\"x\",\
+             \"crate_name\":\"c\",\"threshold\":0,\"timeout_seconds\":60,\
+             \"solvers\":[\"z3\",\"cvc5\"],\"total_obligations\":1,\"obligations\":[{{\
+             \"id\":\"pb049-add-0\",\"rule\":\"PB049\",\"smt\":\"(check-sat)\",\
+             \"solver_results\":[{{\"solver\":\"z3\",\"verdict\":\"unknown\"}},\
+             {{\"solver\":\"cvc5\",\"verdict\":\"unknown\"}}],\
+             \"verdict\":\"discharged\",\"unsat_votes\":0,\"threshold\":0}}]}}",
+        );
+        let err = CertificateBundle::from_json(&json)
+            .expect_err("a zero-threshold bundle must be refused at load");
+        assert!(err.contains("threshold 0"), "got: {err}");
+        // Per-obligation threshold 0 under a sane bundle-level threshold.
+        let json2 = format!(
+            "{{\"format_version\":{CERT_FORMAT_VERSION},\"tool_version\":\"x\",\
+             \"crate_name\":\"c\",\"threshold\":2,\"timeout_seconds\":60,\
+             \"solvers\":[\"z3\",\"cvc5\"],\"total_obligations\":1,\"obligations\":[{{\
+             \"id\":\"pb049-add-0\",\"rule\":\"PB049\",\"smt\":\"(check-sat)\",\
+             \"solver_results\":[{{\"solver\":\"z3\",\"verdict\":\"unknown\"}},\
+             {{\"solver\":\"cvc5\",\"verdict\":\"unknown\"}}],\
+             \"verdict\":\"discharged\",\"unsat_votes\":0,\"threshold\":0}}]}}",
+        );
+        let err2 = CertificateBundle::from_json(&json2)
+            .expect_err("a zero-threshold obligation cert must be refused at load");
+        assert!(err2.contains("threshold 0"), "got: {err2}");
     }
 
     /// An honest producer's certificate always passes the internal

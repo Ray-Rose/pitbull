@@ -47,8 +47,11 @@ is caught at the call site. As of the **prelude flip** this boundary is
 **fail-closed by default** (`verification.strict_library_acceptance`): a call
 into `core`/`std`/`alloc` is accepted only if it is on the explicit
 *trusted-total* allow-list (`is_trusted_total_library_call` — the
-`wrapping_*`/`checked_*`/`saturating_*` int methods, `Ord::min`/`max`/`clamp`,
-`From`/`TryFrom`, the total `char`/slice/`Option`/`Result` methods, …);
+`wrapping_*`/`checked_*`/`saturating_*` int methods, `Ord::min`/`max`,
+`From`/`TryFrom`, the total `char`/slice/`Option`/`Result` methods, …;
+`Ord::clamp` and the slice `sort` family were evicted 2026-07-09 — `clamp`
+panics on `min > max` and `sort`/`sort_unstable` panic on a non-total `Ord`,
+so both now fail closed);
 **any other stdlib call fails closed as a coverage gap (exit 1)**, whether or
 not we have separately enumerated it as panicking. The enumerated panicking
 families — `unwrap`/`expect`; the panicking int methods

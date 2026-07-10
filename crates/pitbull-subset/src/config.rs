@@ -454,9 +454,19 @@ impl SubsetConfig {
                 });
             }
         }
-        // PB072: Cargo.lock presence is checked by the driver (filesystem).
-        // PB073: hermetic environment is checked by the driver.
-        // PB074: pitbull-spec version match is checked by the driver.
+        // PB072 (Cargo.lock presence) / PB073 (hermetic environment) /
+        // PB074 (pitbull-spec version match): NOT implemented — neither here
+        // nor in the driver (deep audit 2026-07-09 corrected this comment,
+        // which previously claimed all three were "checked by the driver";
+        // grep finds no such checks). PB073 matters most: it is the named
+        // compensating control for every PITBULL_* env-injection residual
+        // (PITBULL_TOML redirect, PITBULL_ALLOW_UNSAFE_PATHS from a hostile
+        // build.rs), so until it lands those residuals are guarded only by
+        // the check_env_path hygiene checks. Tracked in HANDOFF §7.
+        // PB060 residual (same audit): `trusted_build_scripts[].sha256` is
+        // validated for FORMAT only (64 hex chars) — no code hashes the
+        // referenced build.rs and compares. The trust mechanism records
+        // intent; it does not yet verify content. Tracked in HANDOFF §7.
         // PB075: cache signing key existence is checked at use time.
         // PB049 (overflow-checks): NOT yet enforced anywhere — neither here
         // nor in the driver, which does not yet inspect the build profile's

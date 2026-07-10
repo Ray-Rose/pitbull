@@ -180,6 +180,17 @@ pub struct SubsetVisitor<'cfg> {
     /// `Call` whose resolved callee `DefId` equals this is a recursive call,
     /// which emits a `RecursionDecreases` (PB041) termination obligation.
     current_body_def_id: Option<DefId>,
+    /// Full paths of every function known to carry preconditions — the union
+    /// of `pitbull.toml` `[verification.preconditions]` keys and the HIR
+    /// pre-pass's `#[pitbull::requires]` map keys. Installed once per crate
+    /// via `set_known_precondition_fns` (deep audit 2026-07-09): a callee's
+    /// preconditions are ASSUMED while walking the callee's own body, but
+    /// v0.2 has no call-site discharge — nothing proves a caller actually
+    /// satisfies them. Any call to a path in this set therefore records a
+    /// CoverageGap (fail closed) instead of being silently accepted, closing
+    /// the modular-verification false discharge (`safe_div(10, 0)` where
+    /// `safe_div` was verified under `requires("b > 0")`).
+    known_precondition_fns: std::collections::BTreeSet<String>,
 }
 impl<'cfg> SubsetVisitor<'cfg> {
     /// Construct a fresh visitor from project config.
@@ -200,7 +211,17 @@ impl<'cfg> SubsetVisitor<'cfg> {
             saw_return_with_ensures: false,
             in_spec_context: false,
             current_body_def_id: None,
+            known_precondition_fns: std::collections::BTreeSet::new(),
         }
+    }
+    /// Install the set of function paths known to carry preconditions
+    /// (config `[verification.preconditions]` keys ∪ HIR
+    /// `#[pitbull::requires]` keys). Called ONCE per crate before the item
+    /// walk — unlike the per-body `set_current_preconditions`, this is
+    /// crate-global state consulted at every CALL SITE (see
+    /// `maybe_gap_callsite_preconditions`).
+    pub fn set_known_precondition_fns(&mut self, fns: std::collections::BTreeSet<String>) {
+        self.known_precondition_fns = fns;
     }
     /// Install the precondition list for the next `visit_body`
     /// call. The wrapper looks up the item being walked in
@@ -596,10 +617,15 @@ impl<'cfg> SubsetVisitor<'cfg> {
             TerminatorKind::Return => {
                 self.emit_ensures_obligation(term.span);
             }
-            // Unreachable: the verifier's job is to *prove* that this point
-            // is dead. Reaching this terminator at runtime is UB; the v0.1
-            // AoRTE proof obligation enforces it. The subset visitor accepts
-            // the construct; the VC generator emits the obligation.
+            // Unreachable: reaching this terminator at runtime is UB. It is
+            // accepted UNCHECKED — no obligation is emitted for it (deep
+            // audit 2026-07-09 corrected this comment, which previously
+            // claimed "the VC generator emits the obligation"; no
+            // `Unreachable` obligation kind exists). Soundness rationale: in
+            // SAFE Rust, rustc emits `Unreachable` only where control
+            // provably cannot flow (the compiler is already in the TCB); the
+            // one way to lie to it — `unreachable_unchecked` — is `unsafe`,
+            // rejected by PB002 before this arm matters.
             TerminatorKind::Unreachable => {}
             // Drop: implicit drop call. We visit the place; the visit_call
             // path is not taken here because drop is a special MIR
@@ -689,6 +715,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 // a PB041 termination obligation (pending) — recursion is no
                 // longer silently accepted.
                 self.maybe_emit_recursion_obligation(c, span);
+                // Deep audit 2026-07-09: a call to a function that carries
+                // preconditions is a coverage gap until call-site discharge
+                // exists — the callee was verified ASSUMING them; nothing
+                // proves this call satisfies them.
+                self.maybe_gap_callsite_preconditions(c, span);
             }
             Operand::Copy(p) | Operand::Move(p) => {
                 // Calling through a local of `fn` type: PB032 (function
@@ -733,6 +764,36 @@ impl<'cfg> SubsetVisitor<'cfg> {
             kind: crate::vc::VcObligationKind::RecursionDecreases,
             assumptions: Vec::new(),
         });
+    }
+    /// Deep audit 2026-07-09 (HIGH): close the MODULAR-VERIFICATION false
+    /// discharge. A `#[pitbull::requires]` / `[verification.preconditions]`
+    /// clause is consumed as an ASSUMPTION while walking the callee's own
+    /// body — it is what discharges the callee's internal obligations — but
+    /// v0.2 implements no call-site discharge: no obligation is emitted that
+    /// a CALLER actually satisfies the callee's precondition. Pre-fix,
+    /// `safe_div(a,b){a/b}` under `requires("b > 0")` verified AND
+    /// `oops(){safe_div(10,0)}` verified — yet `oops()` panics (divide by
+    /// zero). Until real call-site discharge lands (binding actual arguments
+    /// to the callee's precondition variables and asking the solver), every
+    /// call to a precondition-carrying function records a CoverageGap, which
+    /// folds into the exit code (fail closed). Boundary-API functions with no
+    /// in-crate callers — the demo shapes — are unaffected.
+    fn maybe_gap_callsite_preconditions(&mut self, c: &ConstOperand, span: Span) {
+        let Some(p) = self.path_of_const(c) else {
+            return;
+        };
+        if self.known_precondition_fns.contains(&p) {
+            self.audit_note(
+                span,
+                format!(
+                    "call to `{p}`, which carries precondition(s): call-site \
+                     precondition discharge is not implemented in v0.2, so this \
+                     call is UNPROVEN (the callee was verified assuming its \
+                     preconditions; nothing proves this call satisfies them) — \
+                     fails closed as a coverage gap"
+                ),
+            );
+        }
     }
     /// Classify a call by its callee's `DefId` path.
     ///
@@ -2984,6 +3045,15 @@ pub fn is_panic_call_path(p: &str) -> bool {
 /// without the full visitor machinery, mirroring `is_panic_call_path`.
 #[must_use]
 pub fn is_panicking_library_call(p: &str) -> bool {
+    // `Ord::clamp` — the ONE panic-bearing method in the cmp family: its
+    // default trait body asserts `min <= max` and PANICS on violation. It sat
+    // on the trusted-total allow-list until the 2026-07-09 deep audit found it
+    // there — a genuine false discharge (`x.clamp(lo, hi)` with dynamic bounds
+    // reported `verified`, panics at runtime for any call with `lo > hi`).
+    // `ends_with` is exact: `Ord::min`/`max`/`cmp` (total) do not match.
+    if p.ends_with("::cmp::Ord::clamp") {
+        return true;
+    }
     if !(p.contains("option::Option") || p.contains("result::Result")) {
         return false;
     }
@@ -3191,6 +3261,15 @@ pub fn is_panicking_index_or_slice_call(p: &str) -> bool {
         || p.ends_with("::select_nth_unstable")
         || p.ends_with("::select_nth_unstable_by")
         || p.ends_with("::select_nth_unstable_by_key")
+        // Sort family: since Rust 1.81 `sort`/`sort_unstable` PANIC when the
+        // element's `Ord` is not a total order — a hand-written (safe, in-
+        // subset) buggy `Ord` impl makes a "verified" `v.sort()` panic inside
+        // un-walked core/alloc. Trusted-as-total until the 2026-07-09 deep
+        // audit (a false discharge; `sort` additionally allocates, which the
+        // subset forbids). Exact `ends_with`: the `_by`/`_by_key` closure
+        // forms are separate suffixes (closures are rejected upstream anyway).
+        || p.ends_with("::sort")
+        || p.ends_with("::sort_unstable")
         // `as_chunks::<N>` / `as_rchunks::<N>` panic when `N == 0` (completeness
         // net 2026-06-14 #2). `N` is a const generic NOT carried in the post-
         // mono path (`as_chunks::<0>` and `as_chunks::<4>` both render
@@ -3346,9 +3425,11 @@ pub fn is_trusted_total_library_call(p: &str) -> bool {
             || (p.ends_with("::isqrt") && p.contains("num::<impl u"));
     }
     // --- cmp / Ord (primitive receivers render as the trait path) ---
+    // `Ord::clamp` is DELIBERATELY absent: it panics on `min > max` (caught
+    // by `is_panicking_library_call`; audit 2026-07-09 — it was wrongly
+    // trusted here, a false discharge).
     if p.ends_with("::cmp::Ord::min")
         || p.ends_with("::cmp::Ord::max")
-        || p.ends_with("::cmp::Ord::clamp")
         || p.ends_with("::cmp::Ord::cmp")
         || p.ends_with("::cmp::min")
         || p.ends_with("::cmp::max")
@@ -3409,8 +3490,11 @@ pub fn is_trusted_total_library_call(p: &str) -> bool {
             || p.ends_with("::starts_with")
             || p.ends_with("::ends_with")
             || p.ends_with("::fill")
-            || p.ends_with("::sort")
-            || p.ends_with("::sort_unstable")
+            // `::sort` / `::sort_unstable` are DELIBERATELY absent: since Rust
+            // 1.81 they PANIC when the element `Ord` is not a total order
+            // (caught by `is_panicking_index_or_slice_call`; audit 2026-07-09
+            // — they were wrongly trusted here). `binary_search` above is
+            // different: a broken `Ord` gives a WRONG result but never panics.
             || p.ends_with("::reverse");
     }
     false
@@ -5087,6 +5171,10 @@ mod tests {
             "core::result::Result::<u8, E>::unwrap",
             "core::result::Result::<T, E>::unwrap_err",
             "std::result::Result::<T, E>::expect_err",
+            // Deep audit 2026-07-09: `Ord::clamp` panics on `min > max` — was
+            // wrongly on the trusted-total allow-list (a false discharge).
+            "std::cmp::Ord::clamp",
+            "core::cmp::Ord::clamp",
         ];
         for p in positive {
             assert!(is_panicking_library_call(p), "should be a panicking lib call: {p}");
@@ -5099,6 +5187,10 @@ mod tests {
             "core::option::Option::<u32>::map",
             "my_crate::Thing::unwrap_widget", // user fn, not Option/Result
             "core::result::Result::<T, E>::is_ok",
+            // clamp's total cmp siblings must NOT ride in on the new match.
+            "std::cmp::Ord::min",
+            "std::cmp::Ord::max",
+            "std::cmp::Ord::cmp",
             "",
         ];
         for p in negative {
@@ -5287,7 +5379,6 @@ mod tests {
             "core::num::<impl u32>::count_ones",
             "std::cmp::Ord::min",
             "std::cmp::Ord::max",
-            "std::cmp::Ord::clamp",
             "std::convert::From::from",
             "core::convert::TryFrom::try_from",
             "std::char::methods::<impl char>::is_alphabetic",
@@ -5319,6 +5410,11 @@ mod tests {
             "core::mem::replace",       // unlisted
             "core::ptr::read",          // unlisted
             "core::hint::black_box",    // unlisted
+            // PANICKING methods evicted from the allow-list by the 2026-07-09
+            // deep audit (each was a false discharge while trusted):
+            "std::cmp::Ord::clamp",     // panics on `min > max`
+            "core::slice::<impl [T]>::sort", // panics on non-total Ord (1.81+) + allocates
+            "core::slice::<impl [T]>::sort_unstable", // panics on non-total Ord (1.81+)
             "core::num::<impl i32>::isqrt", // SIGNED isqrt PANICS (not total)
             "core::num::<impl u32>::pow",   // panicking (not on the allow-list)
             "core::num::<impl u32>::next_multiple_of", // panicking
@@ -5510,6 +5606,11 @@ mod tests {
             "core::slice::<impl [T]>::as_chunks_mut",
             "core::slice::<impl [T]>::as_rchunks",
             "core::slice::<impl [T]>::as_rchunks_mut",
+            // Deep audit 2026-07-09: sort family panics on a non-total `Ord`
+            // (Rust 1.81+) — was wrongly on the trusted-total allow-list.
+            "core::slice::<impl [T]>::sort",
+            "alloc::slice::<impl [T]>::sort",
+            "core::slice::<impl [T]>::sort_unstable",
             // str panicking methods (anchored on `::str::<impl`).
             "core::str::<impl str>::split_at",
             "core::str::<impl str>::split_at_mut",
@@ -5526,7 +5627,7 @@ mod tests {
             "core::slice::<impl [T]>::first_chunk",  // returns Option (total)
             "core::slice::<impl [T]>::split_first_chunk", // returns Option (total)
             "core::slice::<impl [T]>::fill",         // does not panic
-            "core::slice::<impl [T]>::sort_unstable", // does not panic
+            "core::slice::<impl [T]>::binary_search", // wrong result on broken Ord, but never panics
             "my_crate::MyIndex::index",             // user trait named index, not ops::Index
             "core::slice::<impl [T]>::as_ptr",
             "core::mem::swap",                       // free fn `swap`, not a slice method
@@ -5536,6 +5637,45 @@ mod tests {
         for p in negative {
             assert!(!is_panicking_index_or_slice_call(p), "should NOT be flagged: {p}");
         }
+    }
+    /// Deep audit 2026-07-09 (HIGH — modular-verification false discharge):
+    /// a call to a function registered as precondition-carrying records a
+    /// CoverageGap (fail closed), because v0.2 has no call-site discharge —
+    /// the callee was verified ASSUMING its preconditions, and nothing proves
+    /// the caller satisfies them. A call to an unregistered function records
+    /// no such gap (boundary demos stay verified).
+    #[test]
+    fn call_to_precondition_carrying_fn_fails_closed_as_coverage_gap() {
+        let cfg = SubsetConfig::default_for_test();
+        // Positive: callee registered → CoverageGap.
+        let mut v = SubsetVisitor::new(&cfg);
+        let mut known = std::collections::BTreeSet::new();
+        known.insert("my_crate::safe_div".to_string());
+        v.set_known_precondition_fns(known);
+        v.visit_body(&body_calling("my_crate::safe_div"), false);
+        let report = v.into_report();
+        assert_eq!(
+            report.coverage_gap_count(),
+            1,
+            "a call to a precondition-carrying fn must record exactly one \
+             coverage gap (call-site discharge is unimplemented); notes: {:?}",
+            report.audit_notes,
+        );
+        assert!(
+            report.audit_notes.iter().any(|n| n.message.contains("call-site")),
+            "the gap must name the call-site-precondition cause: {:?}",
+            report.audit_notes,
+        );
+        // Negative: same call, callee NOT registered → no gap.
+        let mut v2 = SubsetVisitor::new(&cfg);
+        v2.visit_body(&body_calling("my_crate::safe_div"), false);
+        let report2 = v2.into_report();
+        assert_eq!(
+            report2.coverage_gap_count(),
+            0,
+            "an unregistered in-crate callee must NOT gap: {:?}",
+            report2.audit_notes,
+        );
     }
     /// Default mode: range-index (`Index::index`) and `split_at`/`chunks`
     /// emit a PanicReachability obligation (honest "cannot prove in-bounds /
