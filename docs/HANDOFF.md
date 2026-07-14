@@ -28,7 +28,7 @@ deep-audit cleanup passes. Branch `main`, with `origin` remote on GitHub.
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 366 tests passing (192 subset-lib + 93 vc + 58 integration + 12 aorte_proofs + 11 driver-bin),
+- **State:** 368 tests passing (192 subset-lib + 93 vc + 58 integration + 12 aorte_proofs + 2 allowlist-exhaustiveness + 11 driver-bin),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -171,14 +171,15 @@ d3682f6 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **366 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **368 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The **366** breaks down: 4 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 192
-(subset lib) + 58 (integration) + 12 (aorte_proofs) + 93 (vc) = 366 (the
+The **368** breaks down: 4 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 192
+(subset lib) + 58 (integration) + 12 (aorte_proofs) + 2 (allowlist_exhaustiveness)
++ 93 (vc) = 368 (the 2026-07-13 exhaustiveness gate added +2 over 366; the
 2026-07-09 deep audit added +4 soundness-pinning tests over the interim 362,
 which itself grew from 343 via the red-team suite + trusted-total broadening
 commits; see the dated subsections at the end of §1). This supersedes the long
@@ -353,6 +354,37 @@ reject/accept corpus pair added):
   this session and did not clear on re-run; the 308 non-e2e tests + the direct
   wrapper smoke above are the local evidence, with the corpus files carrying
   the CI e2e proof.
+
+### 2026-07-13 integer allow-list exhaustiveness gate (this session)
+
+The 2026-07-12 div/rem fix was the **second consecutive** audit to evict a
+CRITICAL false discharge of one shape from `is_trusted_total_library_call`
+(after 2026-07-09 `clamp`/`sort`): a broad allow-list glob trusting a panicking
+member of a family it globs. Rather than wait for a third to surface live, this
+session added a **structural regression gate** that ends the class for the
+integer surface. New file `crates/pitbull-subset/tests/allowlist_exhaustiveness.rs`
+(+2 tests → **368**):
+
+- Enumerates **every member of each trust-granting integer family glob**
+  (`::wrapping_`/`::checked_`/`::saturating_`/`::overflowing_`/`::unbounded_`/
+  `::from_`/`::to_`, reviewed against the Rust 1.94 stdlib) plus the panicking
+  plain-method families (`pow`/`abs`/`div_euclid`/`ilog*`/signed-`isqrt`/…).
+- For each, asserts the classifier's verdict against a **runtime-anchored ground
+  truth** — a probe that calls the method on an adversarial witness and observes
+  whether it panics (`black_box`-ing the panic driver so it is a runtime event,
+  not a const-eval one the deny-by-default `unconditional_panic` lint rejects).
+  28 witnessed panics fire per run, so a *mislabel* (the exact misconception
+  that plants these bugs) cannot pass silently.
+- Per-entry invariant: `Panics ⟹ is_panicking_int_method` true AND
+  `is_trusted_total_library_call` false (the soundness guard); `Total ⟹` the
+  converse (no false reject). A future stdlib member added to a globbed family,
+  or a widened glob, now fails this test instead of shipping as a false
+  discharge.
+
+Scope/limitation: the gate covers the **integer** allow-list families only. The
+slice / `char` / `Option` / `Result` surfaces are enumerated by exact
+`ends_with` (lower glob-risk) and are the natural follow-up to fold into the
+same runtime-anchored harness. Stable suite green (368), clippy error-clean.
 
 ---
 

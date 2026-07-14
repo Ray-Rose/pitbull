@@ -2246,6 +2246,30 @@ the std form and now also matches. No shadow type changes.
   per-method adversarial sweep of the allow-list — a holistic re-read (and the
   code's own comment) had accepted the whole `wrapping_/saturating_/overflowing_`
   family as "non-panicking," which is the misconception that planted the bug.
+- ✅ Integer allow-list **exhaustiveness gate** (2026-07-13). The div/rem fix
+  above was the *second* consecutive audit to evict a CRITICAL false discharge
+  of one shape from `is_trusted_total_library_call` (2026-07-09 `clamp`/`sort`;
+  2026-07-12 div/rem) — a **broad allow-list glob trusting a panicking member of
+  a family it globs**. Rather than wait for a third to be found live, this adds
+  a structural regression gate that ends the class for the integer surface:
+  `tests/allowlist_exhaustiveness.rs` enumerates **every member of each
+  trust-granting integer family glob** (`::wrapping_`/`::checked_`/
+  `::saturating_`/`::overflowing_`/`::unbounded_`/`::from_`/`::to_`, reviewed
+  against the Rust 1.94 stdlib) plus the panicking plain-method families, and
+  for each asserts the classifier's decision against a **runtime-anchored ground
+  truth** — a probe that actually calls the method on an adversarial witness and
+  observes whether it panics (`black_box`-ing the panic driver so it is a
+  runtime event, not a const-eval one the `unconditional_panic` lint rejects).
+  The per-entry invariant: `Panics ⟹ is_panicking_int_method` true AND
+  `is_trusted_total_library_call` false (**the soundness guard**); `Total ⟹`
+  the converse (no false reject). 28 witnessed panics fire on each run, so a
+  mislabel — the exact failure mode that plants these bugs ("I assumed the whole
+  family was total") — cannot pass silently. A future stdlib bump that adds a
+  panicking family member, or a refactor that widens a glob, now fails this test
+  instead of surfacing as a live false discharge. Tests **366 → 368** (the gate
+  + a well-formedness sanity check); clippy error-clean. This gate covers the
+  integer families only; the slice/`char`/`Option`/`Result` allow-list surfaces
+  (enumerated by exact `ends_with`, lower glob-risk) are the natural follow-up.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is a

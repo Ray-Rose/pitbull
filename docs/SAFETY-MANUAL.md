@@ -136,13 +136,21 @@ family globs had swallowed even though every one panics on a **zero divisor**
 (the wrap/saturate/overflow only tames `iN::MIN / -1`, never divide-by-zero).
 All now fail closed. That is exactly the "wrongly listing a panicking method"
 soundness-bug class named below, caught by review — treat every allow-list
-broadening as soundness-critical. Primitive integer arithmetic
+broadening as soundness-critical. Because that class recurred twice, the
+**integer** allow-list surface now carries a structural regression gate
+(`tests/allowlist_exhaustiveness.rs`, 2026-07-13): it enumerates every member
+of each trust-granting integer family glob and asserts — against a runtime
+panic-probe of each method on an adversarial witness — that no panicking member
+is trusted and no total member is falsely rejected, so a future stdlib member
+or a widened glob fails the test instead of shipping as a false discharge.
+Primitive integer arithmetic
 and slice-index semantics are not axiomatized separately; they are encoded
 **directly** as QF_BV SMT problems (`pitbull-vc/src/smt.rs`). This allow-list is
 part of the TCB: wrongly listing a panicking method as total would be a
 soundness bug. A **formal axiomatization checked offline against Coq/Lean is
 planned (v0.2+) but not yet implemented**; today the allow-list's correctness
-rests on review plus the corpus/regression tests.
+rests on review plus the corpus/regression tests — and, for the integer
+families, the runtime-anchored exhaustiveness gate named above.
 ### 3.5 The user-supplied spec
 - `#[pitbull::trusted]` items are user assertions. The justification
   attribute is required (PB067) and the trust budget is bounded
