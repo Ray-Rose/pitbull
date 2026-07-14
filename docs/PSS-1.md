@@ -2206,6 +2206,46 @@ the std form and now also matches. No shadow type changes.
   (`static S: Option<Cell<u32>>` passes PB021's type check), Bang-macro
   `unsafe {}` HIR-span skip, `extract_arg_names` index-only binding, and
   mutual-recursion SCC detection.
+- ✅ Allow-list div/rem false-discharge fix (2026-07-12). A follow-up
+  adversarial pass over `is_trusted_total_library_call` (the same TCB allow-list
+  the 2026-07-09 second pass evicted `clamp`/`sort` from) found a **CRITICAL
+  false discharge the prior pass missed**: the integer
+  `wrapping_`/`overflowing_`/`saturating_` **division and remainder** methods
+  were trusted-as-total via the broad `contains("::wrapping_")` /
+  `contains("::saturating_")` / `contains("::overflowing_")` family globs, yet
+  every one PANICS on a **zero divisor** (`wrapping_div`, `wrapping_rem`,
+  `overflowing_div`, `overflowing_rem`, `saturating_div`, and the
+  `wrapping_/overflowing_*_euclid` kin — the wrap/saturate/overflow semantics
+  only tame the `iN::MIN / -1` overflow, never divide-by-zero). So
+  `fn f(x:i32,y:i32)->i32 { x.wrapping_div(y) }` verified (exit 0, "0
+  obligations") while the operator form `x / y` was correctly obligated by
+  PB049 — a silent contradiction of the README's "no division by zero"
+  guarantee, and the exact sibling of the `Ord::clamp` class. The deny matcher
+  `is_panicking_int_method` missed them because it enumerated only the *plain*
+  `::div_euclid`/`::div_ceil`/… suffixes (which `..._div_euclid` does not end
+  with) and `::strict_`. **Fixed, fail-closed:** (a) the deny matcher now
+  catches any `wrapping_/overflowing_/saturating_` method ending in
+  `_div`/`_rem`/`_div_euclid`/`_rem_euclid`, routing them to a precise PB043
+  pending obligation; (b) that was the whole fix — `is_trusted_total_library_call`
+  already opens with a top-of-function deny guard (`return false` for anything
+  the four `is_panicking_*` matchers flag), so extending the deny matcher makes
+  the trust matcher automatically stop trusting these too (verified: no
+  trust-matcher logic change was needed; the guard predates this fix). The total
+  `checked_div`/`checked_rem` forms (which return `Option` and carry no
+  wrapping/overflowing/saturating segment) stay trusted — pinned as negative
+  controls. Verified end-to-end on real MIR with the rebuilt nightly wrapper:
+  `x.wrapping_div(y)` now emits `pb043-panic-0 (PB043): pending` → exit 1,
+  while `x.checked_div(y).unwrap_or(0)` emits zero obligations. Tests: **366**
+  (unchanged count — the fix extended the two existing classification tests
+  `is_panicking_int_method_classification` /
+  `is_trusted_total_library_call_classification` with the 9 panicking forms +
+  4 total-`checked_` negative controls, and added the
+  `reject/PB043_div_rem_method_panic.rs` + `accept/PB043_div_rem_method_total.rs`
+  corpus pair); subset lib + vc + driver + aorte lanes green, clippy
+  error-clean, nightly wrapper warning-clean. **How it was found:** a
+  per-method adversarial sweep of the allow-list — a holistic re-read (and the
+  code's own comment) had accepted the whole `wrapping_/saturating_/overflowing_`
+  family as "non-panicking," which is the misconception that planted the bug.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is a

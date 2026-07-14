@@ -7,11 +7,14 @@ bottom on first sit-down; refer back to individual sections
 during work.
 
 Last known-good commit at hand-off: the latest on `main` — run
-`git log -1`. The most recent milestone is the **2026-07-09 deep-audit
-second pass** (see the dated subsection at the end of §1: `Ord::clamp` /
-sort-family false discharges closed, call-site preconditions fail closed,
-`vote` threshold-0 + forged-replay hole closed, warm-cache `check`
-fail-open closed). The v0.2 state ships the
+`git log -1`. The most recent milestone is the **2026-07-12 allow-list
+div/rem false-discharge fix** (see the dated subsection at the end of §1:
+the `wrapping_`/`overflowing_`/`saturating_` div/rem methods were
+trusted-as-total but panic on a zero divisor — evicted, now PB043 pending;
+the sibling of the 2026-07-09 `clamp`/`sort` class). The prior milestone was
+the **2026-07-09 deep-audit second pass** (`Ord::clamp` / sort-family false
+discharges closed, call-site preconditions fail closed, `vote` threshold-0 +
+forged-replay hole closed, warm-cache `check` fail-open closed). The v0.2 state ships the
 deductive backend, full PB054 end-to-end discharge (P / P.1 / P.2),
 the Option-C attribute suite (Phase B grammar, Q.1 trusted, Q.2
 impl-methods, Q.3 expression-form, Q.4 ensures-MVP), the full
@@ -315,6 +318,41 @@ every finding re-verified against source before fixing. Full detail in
   mutation.rs "CI ground truth" (unwired), visitor `Unreachable` "obligation
   emitted" (none exists), stale adapter is_unsafe contract note, README/
   SAFETY-MANUAL allow-list examples naming `clamp`.
+
+### 2026-07-12 allow-list div/rem false-discharge fix (this session)
+
+A follow-up per-method adversarial sweep of the `is_trusted_total_library_call`
+allow-list — the same TCB surface the 2026-07-09 second pass evicted
+`clamp`/`sort` from — found a **CRITICAL false discharge that pass missed**.
+Full detail in `docs/PSS-1.md` §17.1 (dated entry). Fixed, fail-closed (test
+count unchanged at 366; the two classification unit tests were extended and a
+reject/accept corpus pair added):
+
+- **Integer `wrapping_`/`overflowing_`/`saturating_` div & rem trusted-as-total
+  (CRITICAL)** — `wrapping_div`, `wrapping_rem`, `overflowing_div`,
+  `overflowing_rem`, `saturating_div`, and the `_euclid` kin all PANIC on a
+  zero divisor (the wrap/saturate/overflow only tames `iN::MIN / -1`), but the
+  broad `contains("::wrapping_")` / `::saturating_` / `::overflowing_` family
+  globs swallowed them, so `x.wrapping_div(y)` verified (exit 0) while the
+  operator form `x / y` was correctly obligated by PB049. The deny matcher
+  `is_panicking_int_method` missed them (it enumerated only the plain
+  `::div_euclid`/`::div_ceil`/… suffixes + `::strict_`). Now: deny matcher
+  catches any of these three families ending in `_div`/`_rem`/`_div_euclid`/
+  `_rem_euclid` → precise PB043 pending. That is the whole fix: the trust
+  matcher already opens with a deny guard (`return false` for anything the four
+  `is_panicking_*` matchers flag), so it stops trusting these automatically —
+  no trust-matcher logic change needed. Total `checked_div`/`checked_rem` stay
+  trusted (negative controls pinned).
+- **Verified end-to-end on real MIR** with the rebuilt nightly wrapper:
+  `x.wrapping_div(y)` → `pb043-panic-0 (PB043): pending` → exit 1;
+  `x.checked_div(y).unwrap_or(0)` → zero obligations. Corpus pair
+  `reject/PB043_div_rem_method_panic.rs` + `accept/PB043_div_rem_method_total.rs`
+  pins both on the (SAC-free) CI Linux e2e lane.
+- **Method note (Windows dev env):** the stable e2e integration lane (55
+  wrapper-spawning tests) is blocked by Smart App Control (`os error 4551`) in
+  this session and did not clear on re-run; the 308 non-e2e tests + the direct
+  wrapper smoke above are the local evidence, with the corpus files carrying
+  the CI e2e proof.
 
 ---
 

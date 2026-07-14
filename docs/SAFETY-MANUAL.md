@@ -123,15 +123,20 @@ a soundness-bearing tool. Users requiring higher assurance should:
 ### 3.4 The prelude
 The Pitbull "prelude" today is the **trusted-total allow-list**
 (`visitor.rs::is_trusted_total_library_call`) — the enumerated `core`/`std`
-methods assumed panic-free and AoRTE-total (the `wrapping_*`/`checked_*`/
-`saturating_*` int methods, `Ord::min`/`max`, `From`/`TryFrom`, the
-total `char`/slice/`Option`/`Result` methods, …). The 2026-07-09 deep audit
-found — and evicted — two panicking entries that had been wrongly trusted:
+methods assumed panic-free and AoRTE-total (the non-div/rem `wrapping_*`/
+`checked_*`/`saturating_*` int methods, `Ord::min`/`max`, `From`/`TryFrom`, the
+total `char`/slice/`Option`/`Result` methods, …). Successive deep audits
+found — and evicted — panicking entries that had been wrongly trusted:
 `Ord::clamp` (panics on `min > max`) and slice `sort`/`sort_unstable`
-(panic on a non-total `Ord` since Rust 1.81); both now fail closed. That is
-exactly the "wrongly listing a panicking method" soundness-bug class named
-below, caught by review — treat every allow-list broadening as
-soundness-critical. Primitive integer arithmetic
+(panic on a non-total `Ord` since Rust 1.81) on 2026-07-09; and on 2026-07-12
+the `wrapping_`/`overflowing_`/`saturating_` **div/rem** members
+(`wrapping_div`, `wrapping_rem`, `overflowing_div`, `overflowing_rem`,
+`saturating_div`, and the `_euclid` kin), which the broad `contains("::wrapping_")`
+family globs had swallowed even though every one panics on a **zero divisor**
+(the wrap/saturate/overflow only tames `iN::MIN / -1`, never divide-by-zero).
+All now fail closed. That is exactly the "wrongly listing a panicking method"
+soundness-bug class named below, caught by review — treat every allow-list
+broadening as soundness-critical. Primitive integer arithmetic
 and slice-index semantics are not axiomatized separately; they are encoded
 **directly** as QF_BV SMT problems (`pitbull-vc/src/smt.rs`). This allow-list is
 part of the TCB: wrongly listing a panicking method as total would be a
@@ -218,10 +223,11 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
     allow-list** (`visitor.rs::is_trusted_total_library_call`): under
     `verification.strict_library_acceptance` (default **true**), a call into
     `core`/`std`/`alloc` is accepted only if it is on that allow-list (the
-    `wrapping_*`/`checked_*`/`saturating_*`/… int methods, `Ord::min`/`max`,
-    `From`/`TryFrom`, the total `char`/slice/`Option`/`Result`
-    methods, …; `Ord::clamp` and the `sort` family were evicted 2026-07-09 —
-    both panic-bearing); **any other stdlib call — enumerated-as-panicking or not —
+    non-div/rem `wrapping_*`/`checked_*`/`saturating_*`/… int methods,
+    `Ord::min`/`max`, `From`/`TryFrom`, the total `char`/slice/`Option`/`Result`
+    methods, …; `Ord::clamp` and the `sort` family were evicted 2026-07-09, and
+    the `wrapping_`/`overflowing_`/`saturating_` div/rem forms 2026-07-12 — all
+    panic-bearing); **any other stdlib call — enumerated-as-panicking or not —
     emits an untrusted-stdlib coverage gap and fails closed (exit 1).** This
     inverts the historic fail-OPEN posture under which an un-enumerated
     panicking stdlib method was silently trusted as total (a latent false

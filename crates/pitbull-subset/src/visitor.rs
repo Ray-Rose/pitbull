@@ -3155,9 +3155,30 @@ pub fn is_panicking_int_method(p: &str) -> bool {
         // The whole `strict_*` family panics on overflow ALWAYS (not just
         // under overflow-checks): strict_{add,sub,mul,div,rem,neg,pow,shl,shr}
         // and the strict_{add,sub}_{signed,unsigned} / strict_*_euclid kin.
-        // None of the non-panicking families (`checked_`/`wrapping_`/
-        // `saturating_`/`overflowing_`/`unbounded_`) contain `::strict_`.
+        // `checked_`/`unbounded_` never contain `::strict_`; `wrapping_`/
+        // `saturating_`/`overflowing_` contain it in no member either — but
+        // their div/rem members ARE panicking, caught by the clause below.
         || p.contains("::strict_")
+        // Division / remainder in the `wrapping_`/`overflowing_`/`saturating_`
+        // families STILL panic on a zero divisor. The wrap/saturate/overflow
+        // semantics only tame the `iN::MIN / -1` overflow; the divide-by-zero
+        // panic is untouched (`5i32.wrapping_div(0)` panics; so do
+        // `overflowing_rem`, `saturating_div`, and the `_euclid` kin). Only
+        // `checked_div`/`checked_rem` are total here — they return `Option`
+        // and are excluded because they carry no `wrapping_/overflowing_/
+        // saturating_` segment. CRITICAL false-discharge fix (audit
+        // 2026-07-12): these method forms were trusted-as-total via the broad
+        // `contains("::wrapping_")` allow-list globs, so `x.wrapping_div(0)`
+        // was silently "verified" while the operator form `x / 0` was
+        // correctly obligated by PB049. Same defect class as the 2026-07-09
+        // `Ord::clamp` / slice-`sort` eviction, missed by that pass.
+        || ((p.contains("::wrapping_")
+                || p.contains("::overflowing_")
+                || p.contains("::saturating_"))
+            && (p.ends_with("_div")
+                || p.ends_with("_rem")
+                || p.ends_with("_div_euclid")
+                || p.ends_with("_rem_euclid")))
 }
 /// Whether `p` names a `char` inherent method (or the `char::from_digit` free
 /// fn) that PANICS — on a `radix` outside `2..=36`, or an undersized output
@@ -3393,6 +3414,15 @@ pub fn is_trusted_total_library_call(p: &str) -> bool {
     }
     // --- Integer inherent total methods: `core::num::<impl {int}>::M` ---
     if p.contains("num::<impl") {
+        // NB (audit 2026-07-12): any known-panicking int method has ALREADY
+        // returned `false` at the top-of-function deny guard, so the broad
+        // `contains("::wrapping_")` / `::saturating_` / `::overflowing_` globs
+        // below cannot re-trust a panicking member. That guard is what closes
+        // the `wrapping_div`/`overflowing_rem`/`saturating_div` divide-by-zero
+        // false discharge, now that `is_panicking_int_method` recognizes the
+        // div/rem members of those families (the wrap/saturate/overflow only
+        // tames `iN::MIN / -1`, never divide-by-zero). Keep new entries here
+        // total-only; a panicking one must go to the deny matcher, not here.
         // Total method-name families (the `::` anchor pins the method segment).
         if p.contains("::wrapping_")
             || p.contains("::checked_")
@@ -5302,6 +5332,18 @@ mod tests {
             "core::num::<impl u32>::strict_shl",
             "core::num::<impl i32>::strict_add_unsigned",
             "core::num::<impl i32>::from_str_radix", // panics radix ∉ 2..=36
+            // CRITICAL false-discharge fix (audit 2026-07-12): wrapping_/
+            // overflowing_/saturating_ div & rem panic on a ZERO divisor (the
+            // wrap/saturate/overflow only tames iN::MIN/-1, never divide-by-zero).
+            "core::num::<impl i32>::wrapping_div",
+            "core::num::<impl u32>::wrapping_rem",
+            "core::num::<impl i64>::wrapping_div_euclid",
+            "core::num::<impl i32>::wrapping_rem_euclid",
+            "core::num::<impl u32>::overflowing_div",
+            "core::num::<impl i32>::overflowing_rem",
+            "core::num::<impl i32>::overflowing_div_euclid",
+            "core::num::<impl i64>::overflowing_rem_euclid",
+            "core::num::<impl i32>::saturating_div",
             // Iterator adapters/folds that panic (trait method, not num::<impl).
             "std::iter::Iterator::sum",
             "core::iter::Iterator::product",
@@ -5323,6 +5365,14 @@ mod tests {
             "core::num::<impl u32>::midpoint", // total
             "core::num::<impl u32>::checked_div_ceil", // Option, no panic
             "core::num::<impl u32>::checked_next_multiple_of", // Option, no panic
+            // Negative controls for the 2026-07-12 div/rem fix: `checked_*`
+            // div/rem return `Option` (total) and carry no wrapping_/
+            // overflowing_/saturating_ segment, so the new panicking-div/rem
+            // clause must NOT catch them.
+            "core::num::<impl i32>::checked_div",
+            "core::num::<impl u32>::checked_rem",
+            "core::num::<impl i32>::checked_div_euclid",
+            "core::num::<impl i64>::checked_rem_euclid",
             "core::num::<impl u32>::unbounded_shl", // total (no `::strict_`)
             "core::num::<impl u32>::count_ones",
             "my_crate::Widget::pow", // a user method named pow, not num::<impl>
@@ -5377,6 +5427,11 @@ mod tests {
             "core::num::<impl u32>::to_le_bytes",
             "core::num::<impl u32>::from_le_bytes",
             "core::num::<impl u32>::count_ones",
+            // Negative controls for the 2026-07-12 div/rem fix: `checked_*`
+            // div/rem stay trusted-total (they return `Option`, never panic).
+            "core::num::<impl i32>::checked_div",
+            "core::num::<impl u32>::checked_rem",
+            "core::num::<impl i32>::checked_div_euclid",
             "std::cmp::Ord::min",
             "std::cmp::Ord::max",
             "std::convert::From::from",
@@ -5418,6 +5473,18 @@ mod tests {
             "core::num::<impl i32>::isqrt", // SIGNED isqrt PANICS (not total)
             "core::num::<impl u32>::pow",   // panicking (not on the allow-list)
             "core::num::<impl u32>::next_multiple_of", // panicking
+            // Divide-by-zero panics trusted-as-total via the broad
+            // `contains("::wrapping_/overflowing_/saturating_")` globs, evicted
+            // by the 2026-07-12 audit (the sibling of the clamp/sort class):
+            "core::num::<impl i32>::wrapping_div",       // panics on rhs == 0
+            "core::num::<impl u32>::wrapping_rem",       // panics on rhs == 0
+            "core::num::<impl i64>::wrapping_div_euclid",
+            "core::num::<impl i32>::wrapping_rem_euclid",
+            "core::num::<impl u32>::overflowing_div",
+            "core::num::<impl i32>::overflowing_rem",
+            "core::num::<impl i32>::overflowing_div_euclid",
+            "core::num::<impl i64>::overflowing_rem_euclid",
+            "core::num::<impl i32>::saturating_div",     // panics on rhs == 0
             "core::slice::<impl [T]>::swap",           // panicking slice method
             "std::char::methods::<impl char>::to_digit", // panicking
             "std::iter::Iterator::sum",                  // panicking

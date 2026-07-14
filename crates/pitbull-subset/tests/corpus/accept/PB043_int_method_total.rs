@@ -7,7 +7,10 @@
 //!   - UNSIGNED `isqrt` is total (only the SIGNED impls panic, on `self < 0`),
 //!     so the signedness discrimination in `is_panicking_int_method` must let
 //!     it through.
-//!   - `wrapping_*` / `checked_*` / `saturating_*` never panic.
+//!   - `wrapping_add` / `checked_*` / `saturating_mul` are total. (NB: the
+//!     div/rem members `wrapping_div` / `overflowing_rem` / `saturating_div`
+//!     do PANIC on a zero divisor — see `reject/PB043_div_rem_method_panic.rs`;
+//!     only the non-div/rem members of these families are total.)
 //!   - `midpoint` and `abs_diff` are total.
 //!
 //! Expectation: PB043 does NOT appear in the wrapper's diagnostics (the

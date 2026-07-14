@@ -438,6 +438,30 @@ fn control_panicking_int_methods_do_panic_safe_ones_do_not() {
     assert!(p(|| { let _ = u32::MAX.strict_mul(2); }), "strict_mul overflow must panic");
     assert!(p(|| { let _ = i32::MIN.strict_neg(); }), "strict_neg(MIN) must panic");
     assert!(p(|| { let _ = 1u32.strict_shl(32); }), "strict_shl over-shift must panic");
+    // 2026-07-12 div/rem ground truth: the `wrapping_`/`overflowing_`/
+    // `saturating_` division & remainder members panic on a ZERO divisor — the
+    // wrap/saturate/overflow semantics only tame `iN::MIN / -1`, never
+    // divide-by-zero. `black_box` the `0` so each is a RUNTIME panic, not a
+    // const-evaluable one the deny-by-default `unconditional_panic` lint would
+    // reject at compile time; each closure stays non-capturing (coerces to
+    // `fn()`). Anchors the new `is_panicking_int_method` div/rem clause to
+    // runtime reality — if any ever stops panicking, that matcher arm is dead
+    // and this flags it (see `is_panicking_int_method_classification`).
+    assert!(p(|| { let _ = 5i32.wrapping_div(std::hint::black_box(0)); }), "wrapping_div(_,0) must panic");
+    assert!(p(|| { let _ = 5u32.wrapping_rem(std::hint::black_box(0)); }), "wrapping_rem(_,0) must panic");
+    assert!(p(|| { let _ = 5i64.wrapping_div_euclid(std::hint::black_box(0)); }), "wrapping_div_euclid(_,0) must panic");
+    assert!(p(|| { let _ = 5i32.wrapping_rem_euclid(std::hint::black_box(0)); }), "wrapping_rem_euclid(_,0) must panic");
+    assert!(p(|| { let _ = 5u32.overflowing_div(std::hint::black_box(0)); }), "overflowing_div(_,0) must panic");
+    assert!(p(|| { let _ = 5i32.overflowing_rem(std::hint::black_box(0)); }), "overflowing_rem(_,0) must panic");
+    assert!(p(|| { let _ = 5i32.overflowing_div_euclid(std::hint::black_box(0)); }), "overflowing_div_euclid(_,0) must panic");
+    assert!(p(|| { let _ = 5i64.overflowing_rem_euclid(std::hint::black_box(0)); }), "overflowing_rem_euclid(_,0) must panic");
+    assert!(p(|| { let _ = 5i32.saturating_div(std::hint::black_box(0)); }), "saturating_div(_,0) must panic");
+    // Total `checked_` div/rem negative controls: return `None` on a zero
+    // divisor, never panic — the fix must NOT flag these (a false REJECT of
+    // provably-safe code). Pins the `checked_`-stays-total boundary at runtime.
+    assert!(!p(|| { let _ = 5i32.checked_div(std::hint::black_box(0)); }), "checked_div(_,0) is total (None)");
+    assert!(!p(|| { let _ = 5u32.checked_rem(std::hint::black_box(0)); }), "checked_rem(_,0) is total (None)");
+    assert!(!p(|| { let _ = 5i64.checked_div_euclid(std::hint::black_box(0)); }), "checked_div_euclid(_,0) is total (None)");
     // `black_box` the step so the panic is a RUNTIME event (which is what we
     // assert) rather than a const-evaluable one clippy rejects at compile time
     // (`clippy::iterator_step_by_zero` is deny-by-default — it AGREES this

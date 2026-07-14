@@ -47,16 +47,20 @@ is caught at the call site. As of the **prelude flip** this boundary is
 **fail-closed by default** (`verification.strict_library_acceptance`): a call
 into `core`/`std`/`alloc` is accepted only if it is on the explicit
 *trusted-total* allow-list (`is_trusted_total_library_call` — the
-`wrapping_*`/`checked_*`/`saturating_*` int methods, `Ord::min`/`max`,
+non-div/rem `wrapping_*`/`checked_*`/`saturating_*` int methods, `Ord::min`/`max`,
 `From`/`TryFrom`, the total `char`/slice/`Option`/`Result` methods, …;
-`Ord::clamp` and the slice `sort` family were evicted 2026-07-09 — `clamp`
-panics on `min > max` and `sort`/`sort_unstable` panic on a non-total `Ord`,
-so both now fail closed);
+`Ord::clamp` and the slice `sort` family were evicted 2026-07-09, and the
+`wrapping_`/`overflowing_`/`saturating_` **div/rem** forms
+(`wrapping_div`, `overflowing_rem`, `saturating_div`, the `_euclid` kin)
+2026-07-12 — `clamp` panics on `min > max`, `sort`/`sort_unstable` panic on a
+non-total `Ord`, and the div/rem forms panic on a zero divisor, so all now
+fail closed);
 **any other stdlib call fails closed as a coverage gap (exit 1)**, whether or
 not we have separately enumerated it as panicking. The enumerated panicking
 families — `unwrap`/`expect`; the panicking int methods
 `pow`/`abs`/`div_euclid`/`div_ceil`/`next_multiple_of`/`from_str_radix`/signed
-`isqrt`/the `strict_*` family; `Iterator::sum`/`product`/`step_by`; the `char`
+`isqrt`/the `strict_*` family/the `wrapping_`/`overflowing_`/`saturating_`
+div-rem forms; `Iterator::sum`/`product`/`step_by`; the `char`
 radix/encode methods; `str`/slice range indexing and
 `split_at`/`swap`/`copy_from_slice`/`chunks`/`as_chunks`/… — still produce a
 precise `(PB043)` diagnostic, but they are now an *optimization over* the
