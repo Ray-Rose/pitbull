@@ -555,10 +555,75 @@ pub fn invoke_solver_with_timeout(
         .filter(|l| matches!(*l, "sat" | "unsat" | "unknown" | "timeout"))
         .collect();
     match verdict_lines.as_slice() {
-        ["sat"] => SolverResult::Sat,
-        ["unsat"] => SolverResult::Unsat,
-        ["unknown"] => SolverResult::Unknown,
-        ["timeout"] => SolverResult::Timeout,
+        [verdict] => {
+            // Audit hardening (2026-07-15): a verdict is only PROOF if the
+            // solver answered the problem we actually sent, cleanly. Two
+            // signals say it didn't — and both were previously ignored on
+            // this arm (the pre-fix code matched the verdict directly and
+            // consulted `exit_status` / the error text only when NO verdict
+            // was present):
+            //
+            //  (a) An SMT-LIB `(error ...)` response. Z3 does NOT abort on a
+            //      malformed directive — it reports the error, DROPS that
+            //      directive, and answers the REST of the problem. Verified
+            //      empirically on z3 4.16.0: a problem whose middle `(assert
+            //      ...)` is malformed prints `(error "…")` then `unsat` and
+            //      exits 1 — i.e. a hypothesis silently vanished and the
+            //      truncated problem's `unsat` would have counted as a full
+            //      DISCHARGE vote. (cvc5 1.3.4 is stricter: it emits no
+            //      verdict at all, so the default 2-of-2 pool degraded to
+            //      Inconclusive rather than a false discharge — but that is
+            //      cvc5 being conservative, not a property we should depend
+            //      on. Under `threshold = 1`, or a pool of two z3-like
+            //      solvers, the same input WOULD have falsely discharged.)
+            //
+            //  (b) A non-zero exit status. A solver that prints a verdict and
+            //      then dies (internal error, assertion failure, abort) has
+            //      not proven anything; its verdict must not cast a vote.
+            //
+            // Refusing here is strictly fail-closed: Error => undischarged.
+            // It costs nothing on the healthy path — z3 4.16.0 and cvc5 1.3.4
+            // both exit 0 with error-free stdout on ordinary sat/unsat/unknown
+            // (z3's `timeout` verdict also exits 0), verified empirically, and
+            // the whole discharge suite passes unchanged.
+            //
+            // NB the upstream `validate_assertion_form` (F2 lex validation) is
+            // what normally keeps a malformed assert out of the SMT text; this
+            // is the defense-in-depth layer for when it doesn't, and it removes
+            // the structural assumption that "a dropped directive always
+            // weakens the problem toward `sat`" (true for the shapes we emit
+            // today, but not a property any future encoding is obliged to
+            // preserve).
+            let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+            if stdout.contains("(error ") || stderr_str.contains("(error ") {
+                return SolverResult::Error(format!(
+                    "{name} reported an SMT-LIB error AND a `{verdict}` verdict; \
+                     refusing to interpret the verdict — the solver answered a \
+                     problem we did not send (a malformed directive is dropped, \
+                     not fatal). stdout: {stdout:?}, stderr: {stderr_str:?}",
+                ));
+            }
+            if exit_status.is_some_and(|s| !s.success()) {
+                return SolverResult::Error(format!(
+                    "{name} emitted a `{verdict}` verdict but exited {:?}; \
+                     refusing to interpret a verdict from a solver that did not \
+                     exit cleanly. stdout: {stdout:?}, stderr: {stderr_str:?}",
+                    exit_status.and_then(|s| s.code()),
+                ));
+            }
+            match *verdict {
+                "sat" => SolverResult::Sat,
+                "unsat" => SolverResult::Unsat,
+                "unknown" => SolverResult::Unknown,
+                "timeout" => SolverResult::Timeout,
+                // Unreachable: the filter above admits only the four
+                // literals matched. `&str` can't be matched exhaustively, so
+                // fail CLOSED (Error => undischarged) rather than guess.
+                other => SolverResult::Error(format!(
+                    "{name}: internal — unrecognized verdict literal {other:?}",
+                )),
+            }
+        }
         [] => {
             // No verdict line at all. Inspect the rest of the
             // output to characterize the failure for the auditor.
@@ -720,6 +785,25 @@ pub fn version_matches(reported: &str, pinned: &str) -> bool {
     if pinned.is_empty() {
         return false;
     }
+    // Audit 2026-07-15 (LOW, same fail-open family as the empty pin): the pin
+    // must have the SHAPE of a version — start with a digit and contain a dot.
+    //
+    // Without a shape check, a pin that happens to name a CONSTANT token of the
+    // banner matches every build the vendor ever shipped: `z3 = "Z3"`,
+    // `"version"`, `"bit"`, or `"64"` all match `"Z3 version 4.13.4 - 64 bit"`
+    // forever, and `cvc5 = "cvc5"` matches every cvc5. The pin then looks
+    // configured while pinning nothing — the precise opposite of its purpose,
+    // and the same fail-open family as the empty pin above. (A digit test alone
+    // is NOT enough: `"Z3"` contains one.)
+    //
+    // Every version this can usefully pin is dotted — z3 `4.13.4`, cvc5
+    // `1.2.0`, alt-ergo `2.6.0` — and the token match means a dotless pin could
+    // only ever match banner boilerplate anyway. So a pin failing this shape is
+    // a misconfiguration: refuse it (the solver drops from the pool and the bad
+    // pin surfaces) instead of silently admitting every binary.
+    if !pinned.starts_with(|c: char| c.is_ascii_digit()) || !pinned.contains('.') {
+        return false;
+    }
     reported.split_whitespace().any(|tok| {
         tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.') == pinned
     })
@@ -846,6 +930,78 @@ mod tests {
             "contradictory preconditions must make the vacuity check unsat \
              (so the caller fails closed instead of vacuously discharging)",
         );
+    }
+    /// Audit hardening (2026-07-15) — the CRITICAL-shaped one: a solver that
+    /// reports an SMT-LIB `(error ...)` AND a verdict must be REFUSED, never
+    /// counted as a vote.
+    ///
+    /// Z3 does not treat a malformed directive as fatal: it reports the error,
+    /// DROPS that directive, and answers the REST of the problem. Here the
+    /// middle `(assert ...)` — a hypothesis — is malformed, so z3 4.16.0
+    /// prints `(error "…")`, then `unsat` for the truncated problem, and exits
+    /// non-zero. Pre-fix, the parser saw exactly one verdict line and returned
+    /// `Unsat`: a full DISCHARGE vote derived from a problem we never sent,
+    /// with the error and the unclean exit both ignored.
+    ///
+    /// That was not live-exploitable in the default pool (cvc5 is stricter —
+    /// it emits no verdict at all, so 2-of-2 agreement degraded to
+    /// Inconclusive), but the safety of the whole tool must not rest on "one
+    /// vendor happens to be more conservative than the other": under
+    /// `threshold = 1`, or a pool of two z3-like solvers, the same input would
+    /// have falsely discharged. `validate_assertion_form` is the upstream
+    /// defense; this pins the solver-layer one.
+    #[test]
+    fn verdict_alongside_smt_error_refused() {
+        // `(bogus)` is dropped by z3; the surviving `x < 5 AND x > 10` is
+        // unsat — i.e. the shape where a vanished hypothesis manufactures a
+        // discharge vote.
+        let problem = "(set-logic QF_BV)\n\
+                       (declare-const x (_ BitVec 32))\n\
+                       (assert (bvult x #x00000005))\n\
+                       (assert (bogus))\n\
+                       (assert (bvugt x #x0000000a))\n\
+                       (check-sat)\n";
+        match invoke_z3_with_timeout(problem, Duration::from_secs(5)) {
+            SolverResult::Error(msg) => {
+                assert!(
+                    msg.contains("SMT-LIB error") || msg.contains("did not exit cleanly"),
+                    "Error should name the error-response or unclean-exit cause; got {msg}",
+                );
+            }
+            SolverResult::NotInstalled => {
+                eprintln!("verdict_alongside_smt_error_refused: SKIPPED — z3 not installed.");
+            }
+            other => panic!(
+                "SOUNDNESS: a verdict emitted alongside an SMT-LIB error must be \
+                 refused (Error), never interpreted. A `sat`/`unsat` here means a \
+                 dropped directive's verdict is being trusted as proof; got {other:?}",
+            ),
+        }
+    }
+    /// The healthy path is untouched by the guard above: an ordinary,
+    /// error-free problem still yields its verdict. Guards against the
+    /// hardening over-reaching into a false REJECT of every real discharge
+    /// (z3 4.16.0 / cvc5 1.3.4 both exit 0 with clean stdout here).
+    #[test]
+    fn clean_problem_still_yields_verdict_after_error_guard() {
+        let sat_problem = "(set-logic QF_BV)\n\
+                           (declare-const x (_ BitVec 32))\n\
+                           (assert (bvult x #x00000005))\n\
+                           (check-sat)\n";
+        let unsat_problem = "(set-logic QF_BV)\n\
+                             (declare-const x (_ BitVec 32))\n\
+                             (assert (bvult x #x00000005))\n\
+                             (assert (bvugt x #x0000000a))\n\
+                             (check-sat)\n";
+        let t = Duration::from_secs(5);
+        match invoke_z3_with_timeout(sat_problem, t) {
+            SolverResult::Sat | SolverResult::NotInstalled => {}
+            other => panic!("clean satisfiable problem must still report Sat; got {other:?}"),
+        }
+        match invoke_z3_with_timeout(unsat_problem, t) {
+            SolverResult::Unsat | SolverResult::NotInstalled => {}
+            other => panic!("clean unsatisfiable problem must still report Unsat; got {other:?}"),
+        }
     }
     /// Audit hardening (red-team F9): a problem with TWO check-sat
     /// directives (which can happen if a multi-directive injection
@@ -1164,5 +1320,31 @@ mod tests {
     fn version_matches_mismatch_is_false() {
         assert!(!version_matches("Z3 version 4.13.4 - 64 bit", "4.13.3"));
         assert!(!version_matches("", "4.13.4"));
+    }
+    /// Audit 2026-07-15 (fail-open family of the empty-pin fix): a pin that
+    /// isn't SHAPED like a version matches a CONSTANT token of the banner, so
+    /// it looks configured while admitting every version of that solver — the
+    /// exact opposite of pinning. Refuse it (the solver drops from the pool and
+    /// the misconfiguration surfaces) rather than silently accept any binary.
+    ///
+    /// NB `"Z3"` is why a mere digit test is insufficient — it contains one.
+    #[test]
+    fn version_matches_refuses_unshaped_pin() {
+        let z3 = "Z3 version 4.13.4 - 64 bit";
+        // Every one of these is a real token of the banner above, so an
+        // unshaped token match returns true and pins nothing — `"Z3"` and
+        // `"64"` would both survive a naive digit check.
+        for bad in ["Z3", "version", "bit", "-", "64"] {
+            assert!(
+                !version_matches(z3, bad),
+                "unshaped pin {bad:?} must not match (it pins nothing — it is a \
+                 constant token of every Z3 banner)",
+            );
+        }
+        assert!(!version_matches("This is cvc5 version 1.2.0", "cvc5"));
+        // The real pins still work — the guard must not over-reach.
+        assert!(version_matches(z3, "4.13.4"));
+        assert!(version_matches("This is cvc5 version 1.2.0", "1.2.0"));
+        assert!(version_matches("alt-ergo (2.6.0)", "2.6.0"));
     }
 }

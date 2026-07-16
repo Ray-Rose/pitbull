@@ -1363,6 +1363,33 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// This is the dictionary that maps standard-library types to the rules
     /// they trigger. It is the second-most-audited part of the crate after
     /// the dispatch tables above.
+    ///
+    /// ## Root-agnostic matching (audit 2026-07-15 — a HIGH false-accept)
+    ///
+    /// Every arm below matches through [`stdlib_type_matches`], which tests the
+    /// path under ANY stdlib root (`core::` / `std::` / `alloc::`) rather than
+    /// naming one. This is not cosmetic — it closes a real hole:
+    ///
+    /// rustc renders a type by the path it was REACHED through, so on a
+    /// std-linked crate (the typical case) `Cell` arrives as `std::cell::Cell`,
+    /// NOT `core::cell::Cell` — regardless of whether the source wrote
+    /// `core::cell::Cell` or `use std::cell::Cell` (verified empirically on the
+    /// pinned nightly: both spellings render `std::`). The adapter documents
+    /// this ("when an item is reachable through the std prelude … `name()`
+    /// returns the `std::*` re-export path"), and PB011/PB012/PB015 were given
+    /// dual `alloc::`+`std::` spellings for exactly that reason — but
+    /// PB008/PB021/PB022/PB023 were left `core::`-only, so they were DEAD on
+    /// every std-linked crate: `fn f(c: Cell<u32>)` reported 0 violations.
+    /// Under the default config the prelude's fail-closed coverage gap still
+    /// caught any *call* into the type (exit 1), but with the documented
+    /// `strict_library_acceptance = false` migration opt-out it was a live
+    /// false accept — verified: `Box` (dual-listed) rejected while `Cell`
+    /// (core-only) exited 0 under the identical config.
+    ///
+    /// Matching on the root-stripped suffix removes the per-arm spelling
+    /// bookkeeping that caused this, so a new arm cannot reintroduce it. The
+    /// three roots are interchangeable here because `std` merely RE-EXPORTS the
+    /// `core`/`alloc` types — same type, same rule, different rendering.
     fn classify_adt(&mut self, adt: &AdtDef, span: Span) {
         let path = adt.path.as_str();
         // PB005: union.
@@ -1371,86 +1398,76 @@ impl<'cfg> SubsetVisitor<'cfg> {
             return;
         }
         // PB008: MaybeUninit.
-        if path == "core::mem::MaybeUninit" || path == "core::mem::maybe_uninit::MaybeUninit" {
+        if stdlib_type_matches(path, &["mem::MaybeUninit", "mem::maybe_uninit::MaybeUninit"]) {
             self.reject(rules::PB008, span, "`MaybeUninit`");
             return;
         }
         // PB011, PB012: heap allocation.
-        //
-        // NOTE: rustc resolves these types through whichever prelude
-        // brought them into scope. For std-using crates (the typical
-        // case), `Box` is `std::boxed::Box`, not `alloc::boxed::Box`,
-        // because std re-exports the alloc primitives. We accept both
-        // forms — the alloc path is the canonical definition site,
-        // the std path is the user-facing re-export. The shadow tests
-        // construct the alloc form; the rustc_public adapter typically
-        // produces the std form on real code.
-        if path == "alloc::boxed::Box" || path == "std::boxed::Box" {
+        if stdlib_type_matches(path, &["boxed::Box"]) {
             self.reject(rules::PB011, span, "`Box<_>`");
             return;
         }
-        if matches!(
+        if stdlib_type_matches(
             path,
-            "alloc::vec::Vec"
-                | "std::vec::Vec"
-                | "alloc::string::String"
-                | "std::string::String"
-                | "alloc::collections::VecDeque"
-                | "alloc::collections::vec_deque::VecDeque"
-                | "std::collections::VecDeque"
-                | "std::collections::vec_deque::VecDeque"
-                | "alloc::collections::BTreeMap"
-                | "alloc::collections::btree_map::BTreeMap"
-                | "std::collections::BTreeMap"
-                | "std::collections::btree_map::BTreeMap"
-                | "alloc::collections::BTreeSet"
-                | "alloc::collections::btree_set::BTreeSet"
-                | "std::collections::BTreeSet"
-                | "std::collections::btree_set::BTreeSet"
-                | "std::collections::HashMap"
-                | "std::collections::hash_map::HashMap"
-                | "std::collections::HashSet"
-                | "std::collections::hash_set::HashSet"
-                | "alloc::collections::LinkedList"
-                | "std::collections::LinkedList"
+            &[
+                "vec::Vec",
+                "string::String",
+                "collections::VecDeque",
+                "collections::vec_deque::VecDeque",
+                "collections::BTreeMap",
+                "collections::btree_map::BTreeMap",
+                "collections::BTreeSet",
+                "collections::btree_set::BTreeSet",
+                "collections::HashMap",
+                "collections::hash_map::HashMap",
+                "collections::HashSet",
+                "collections::hash_set::HashSet",
+                "collections::LinkedList",
+                "collections::linked_list::LinkedList",
+                // Allocating types the pre-2026-07-15 enumeration omitted
+                // entirely (same audit). Each owns a heap buffer, so each is
+                // PB012 by the same rationale as `Vec`/`String`.
+                "collections::BinaryHeap",
+                "collections::binary_heap::BinaryHeap",
+                "borrow::Cow",
+                "ffi::CString",
+                "ffi::c_str::CString",
+                "ffi::OsString",
+                "ffi::os_str::OsString",
+                "path::PathBuf",
+            ],
         ) {
             self.reject(rules::PB012, span, format!("collection type `{path}`"));
             return;
         }
-        // PB015: reference counting. Same alloc/std split.
-        if matches!(
-            path,
-            "alloc::rc::Rc"
-                | "std::rc::Rc"
-                | "alloc::rc::Weak"
-                | "std::rc::Weak"
-                | "alloc::sync::Arc"
-                | "std::sync::Arc"
-                | "alloc::sync::Weak"
-                | "std::sync::Weak"
-        ) {
+        // PB015: reference counting.
+        if stdlib_type_matches(path, &["rc::Rc", "rc::Weak", "sync::Arc", "sync::Weak"]) {
             self.reject(rules::PB015, span, format!("reference-counted type `{path}`"));
             return;
         }
         // PB021: cell family.
-        if matches!(
+        if stdlib_type_matches(
             path,
-            "core::cell::Cell"
-                | "core::cell::RefCell"
-                | "core::cell::OnceCell"
-                | "core::cell::LazyCell"
-                | "core::cell::SyncUnsafeCell"
+            &[
+                "cell::Cell",
+                "cell::RefCell",
+                "cell::OnceCell",
+                "cell::LazyCell",
+                "cell::SyncUnsafeCell",
+            ],
         ) {
             self.reject(rules::PB021, span, format!("cell type `{path}`"));
             return;
         }
         // PB022: UnsafeCell itself.
-        if path == "core::cell::UnsafeCell" {
+        if stdlib_type_matches(path, &["cell::UnsafeCell"]) {
             self.reject(rules::PB022, span, "`UnsafeCell`");
             return;
         }
-        // PB023: atomics.
-        if path.starts_with("core::sync::atomic::Atomic") {
+        // PB023: atomics. Prefix-matched (one arm per width would be 12
+        // entries), so it strips the root itself rather than using the
+        // exact-suffix helper.
+        if stdlib_root_suffix(path).is_some_and(|s| s.starts_with("sync::atomic::Atomic")) {
             self.reject(rules::PB023, span, format!("atomic type `{path}`"));
             return;
         }
@@ -1463,12 +1480,27 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 | "std::sync::OnceLock"
                 | "std::sync::Barrier"
                 | "std::sync::Condvar"
+        ) || stdlib_type_matches(
+            path,
+            &[
+                "sync::Mutex",
+                "sync::RwLock",
+                "sync::Once",
+                "sync::OnceLock",
+                "sync::Barrier",
+                "sync::Condvar",
+                "sync::poison::Mutex",
+                "sync::poison::RwLock",
+                "sync::poison::Once",
+            ],
         ) {
             self.reject(rules::PB024, span, format!("synchronization primitive `{path}`"));
             return;
         }
         // PB030: channels.
-        if path.starts_with("std::sync::mpsc::") || path.starts_with("std::sync::mpmc::") {
+        if stdlib_root_suffix(path)
+            .is_some_and(|s| s.starts_with("sync::mpsc::") || s.starts_with("sync::mpmc::"))
+        {
             self.reject(rules::PB030, span, format!("channel type `{path}`"));
             return;
         }
@@ -3306,6 +3338,33 @@ pub fn is_panicking_index_or_slice_call(p: &str) -> bool {
         || p.ends_with("::as_rchunks")
         || p.ends_with("::as_rchunks_mut")
 }
+/// Strip a stdlib root (`core::` / `std::` / `alloc::`) off `path`, returning
+/// the remainder — `Some("cell::Cell")` for `std::cell::Cell`. `None` when
+/// `path` is not rooted in the standard library (a user type).
+///
+/// The three roots are interchangeable for TYPE identity because `std` merely
+/// re-exports the `core`/`alloc` types: `std::cell::Cell` and
+/// `core::cell::Cell` are the same type, and which one rustc renders depends
+/// only on the path the item was reached through. See [`SubsetVisitor::classify_adt`]
+/// for the false-accept this closes.
+#[must_use]
+fn stdlib_root_suffix(path: &str) -> Option<&str> {
+    path.strip_prefix("core::")
+        .or_else(|| path.strip_prefix("std::"))
+        .or_else(|| path.strip_prefix("alloc::"))
+}
+/// Whether `path` names one of the stdlib types in `suffixes`, under ANY
+/// stdlib root. Each suffix is the root-stripped type path (`"cell::Cell"`,
+/// `"boxed::Box"`), matched EXACTLY — so `cell::Cell` does not match
+/// `cell::Cell2` or the inherent-impl rendering of a method on it.
+///
+/// Callers list every MODULE spelling a type can render under (e.g. both
+/// `collections::VecDeque` and `collections::vec_deque::VecDeque`) but never
+/// the root, which is what [`stdlib_root_suffix`] absorbs.
+#[must_use]
+fn stdlib_type_matches(path: &str, suffixes: &[&str]) -> bool {
+    stdlib_root_suffix(path).is_some_and(|rest| suffixes.contains(&rest))
+}
 /// Whether `p` is a call INTO the standard library (`core` / `std` / `alloc`)
 /// — the surface the prelude fail-closed default governs.
 ///
@@ -3819,6 +3878,83 @@ mod tests {
             !v.errors.iter().any(|e| e.rule == rules::PB020),
             "PB020 must not fire on unknown-size types"
         );
+    }
+    /// SOUNDNESS (audit 2026-07-15 — a HIGH false accept, confirmed on real
+    /// MIR): the type-level rules must fire on the `std::` RE-EXPORT rendering,
+    /// which is what the adapter actually emits.
+    ///
+    /// rustc renders a type by the path it was REACHED through, so on a
+    /// std-linked crate `Cell` arrives as `std::cell::Cell` — even when the
+    /// source writes `core::cell::Cell` (verified: both spellings render
+    /// `std::`). PB011/PB012/PB015 were given dual `alloc::`+`std::` spellings
+    /// for exactly this reason; PB008/PB021/PB022/PB023 were left `core::`-only
+    /// and were therefore DEAD on every std-linked crate. Confirmed with a
+    /// clean control under `strict_library_acceptance = false`: `Box` (dual-
+    /// listed) rejected, `Cell` (core-only) exited 0 with zero violations.
+    ///
+    /// Every rule is asserted under EVERY stdlib root here, so a future arm
+    /// cannot reintroduce the spelling asymmetry that caused this.
+    #[test]
+    fn type_rules_fire_under_every_stdlib_root() {
+        // (rule, the module-qualified type path, roots it can really render
+        //  under). `std::` is listed for all: it re-exports core and alloc.
+        let cases: &[(rules::RuleId, &str)] = &[
+            (rules::PB008, "mem::MaybeUninit"),
+            (rules::PB008, "mem::maybe_uninit::MaybeUninit"),
+            (rules::PB011, "boxed::Box"),
+            (rules::PB012, "vec::Vec"),
+            (rules::PB012, "string::String"),
+            (rules::PB012, "collections::VecDeque"),
+            (rules::PB012, "collections::BTreeMap"),
+            (rules::PB012, "collections::BinaryHeap"),
+            (rules::PB012, "borrow::Cow"),
+            (rules::PB015, "rc::Rc"),
+            (rules::PB015, "sync::Arc"),
+            (rules::PB021, "cell::Cell"),
+            (rules::PB021, "cell::RefCell"),
+            (rules::PB021, "cell::OnceCell"),
+            (rules::PB022, "cell::UnsafeCell"),
+            (rules::PB023, "sync::atomic::AtomicU32"),
+            (rules::PB023, "sync::atomic::AtomicBool"),
+            (rules::PB024, "sync::Mutex"),
+            (rules::PB024, "sync::RwLock"),
+        ];
+        for (rule, suffix) in cases {
+            for root in ["core::", "std::", "alloc::"] {
+                let path = format!("{root}{suffix}");
+                let cfg = SubsetConfig::default_for_test();
+                let mut v = SubsetVisitor::new(&cfg);
+                v.visit_body(&body_returning_synthetic(&path), false);
+                assert!(
+                    v.errors.iter().any(|e| e.rule == *rule),
+                    "SOUNDNESS: `{path}` must trigger {rule} under EVERY stdlib root — \
+                     rustc renders a type by the path it was reached through, so a \
+                     rule spelled under only one root is dead on real code",
+                );
+            }
+        }
+    }
+    /// The root-agnostic matching above must not become match-anything: a user
+    /// type whose path merely resembles a stdlib one is still accepted, and a
+    /// near-miss suffix does not ride in.
+    #[test]
+    fn type_rules_do_not_over_match() {
+        for path in [
+            "mycrate::cell::Cell",   // user module named `cell`
+            "mycrate::boxed::Box",   // user `Box`
+            "core::cell::CellPhone", // near-miss suffix
+            "std::cell::Cell2",
+            "user_crate::MyStruct",
+        ] {
+            let cfg = SubsetConfig::default_for_test();
+            let mut v = SubsetVisitor::new(&cfg);
+            v.visit_body(&body_returning_synthetic(path), false);
+            assert!(
+                v.errors.is_empty(),
+                "`{path}` is not a stdlib type — it must not be rejected; got {:?}",
+                v.errors,
+            );
+        }
     }
     // ----- adapter synthetic-ADT accept-on-unknown closure -------------
     // The rustc_public adapter maps real RigidTy variants with no shadow

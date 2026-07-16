@@ -74,10 +74,21 @@ pub fn compile_with_index_bits(obligation: &VcObligation, index_bits: u32) -> Op
             // Only generate a consistency-check problem when there
             // are assumptions to check. Zero assumptions is
             // trivially consistent — no extra solver call needed.
+            //
+            // When there ARE assumptions, consistency emission failing is
+            // FAIL-CLOSED (`?` ⇒ `compile` returns None ⇒ the obligation is
+            // reported pending). Silently storing `None` here would make the
+            // dispatcher read "no consistency problem to run" and skip the F1
+            // vacuity guard for an obligation that HAS hypotheses — the
+            // fail-OPEN direction (audit 2026-07-15). Unreachable today (both
+            // emitters gate on the same `IntInfo::from_name`, so a successful
+            // main emission implies this succeeds), but nothing in the types
+            // enforces that coupling; a future divergence must not silently
+            // disable the guard.
             let consistency = if obligation.assumptions.is_empty() {
                 None
             } else {
-                crate::smt::emit_consistency_check(ty_name, &obligation.assumptions)
+                Some(crate::smt::emit_consistency_check(ty_name, &obligation.assumptions)?)
             };
             (main, consistency)
         }

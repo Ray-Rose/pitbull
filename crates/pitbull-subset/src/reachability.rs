@@ -239,11 +239,98 @@ impl<'cfg, P: BodyProvider> ReachabilityDriver<'cfg, P> {
 /// prefix. Patterns without the wildcard match exactly. We deliberately do
 /// not support deeper glob semantics in v0.1 — simpler patterns make the
 /// audit story for "what got verified" trivial.
-fn pattern_matches(pattern: &str, path: &str) -> bool {
+///
+/// ## Trait-impl normalization (audit 2026-07-15 — a CRITICAL false discharge)
+///
+/// `rustc_public`'s `item.name()` renders a TRAIT-impl method as
+/// `<demo::Calc as demo::Div2>::div2` — a LEADING `<`. A naive
+/// `starts_with("demo::")` therefore matches NO trait-impl method, so a
+/// `verify_roots = ["demo::*"]` that reads as "verify my whole crate" silently
+/// walked NOTHING and exited 0. Verified end-to-end on real MIR pre-fix:
+/// `impl Div2 for Calc { fn div2(&self, a: u32, b: u32) -> u32 { a / b } }`
+/// reported "walked 0 item(s), filtered 1" and exit 0 — a false discharge of a
+/// division by zero — while the same crate at the default full walk correctly
+/// emitted the PB049 obligation and exited 1.
+///
+/// The #27 gate could not backstop it: that gate flags `referenced ∩
+/// local_universe`, and a public trait impl with no in-crate caller is never
+/// `referenced`. `crate_of_path` already understood this rendering (with
+/// tests); the MATCHER never did, and the `Drop`-glue special case in the
+/// wrapper is the tell — the one trait the authors tripped over was patched
+/// individually rather than the matcher underneath it.
+///
+/// So a trait-impl path is ALSO matched in its normalized `Self::method`
+/// rendering ([`normalize_impl_path`]): `<demo::Calc as demo::Div2>::div2`
+/// matches `demo::*` and `demo::Calc::*`, which is what the user means. The
+/// raw path is tried first, so nothing that matched before stops matching —
+/// this only ever ADDS matches, which for `verify_roots` is the fail-SAFE
+/// direction (a matched item is WALKED, i.e. verified). For `exclude` the same
+/// widening is intent-faithful: `exclude = ["demo::tests::*"]` should exclude a
+/// trait impl on a type in that module.
+#[must_use]
+pub fn pattern_matches(pattern: &str, path: &str) -> bool {
+    if pattern_matches_literal(pattern, path) {
+        return true;
+    }
+    normalize_impl_path(path).is_some_and(|n| pattern_matches_literal(pattern, &n))
+}
+/// The literal (pre-normalization) matcher — the historic behavior.
+fn pattern_matches_literal(pattern: &str, path: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix("::*") {
         path == prefix || path.starts_with(&format!("{prefix}::"))
     } else {
         pattern == path
+    }
+}
+/// Rewrite a trait-impl path `<Self as Trait>::method` into the `Self::method`
+/// rendering a user's `verify_roots` / `exclude` pattern is written against.
+/// `None` for a path that is not in trait-impl form (already matchable).
+///
+/// - `<demo::Calc as demo::Div2>::div2` → `demo::Calc::div2`
+/// - `<demo::Foo<u32> as core::ops::Add>::add` → `demo::Foo::add` (generic args
+///   dropped: a user writes `demo::Foo::*`, not `demo::Foo<u32>::*`)
+/// - `<&demo::Foo as core::ops::Add>::add` → `demo::Foo::add` (reference sigils
+///   stripped — `impl Add for &Matrix` is idiomatic, and the sigil would
+///   otherwise make the Self type unmatchable)
+///
+/// Keying on the SELF type (not the trait) is what the user means by "verify
+/// everything in my crate/module": the impl belongs where its type lives, which
+/// is also how [`crate_of_path`] assigns ownership.
+#[must_use]
+fn normalize_impl_path(path: &str) -> Option<String> {
+    if !path.starts_with('<') {
+        return None;
+    }
+    // The method tail follows the LAST `>::` (the outermost close), so the
+    // doubly-qualified `<<A as T1>::Assoc as T2>::m` yields `m`.
+    let (head, method) = path.rsplit_once(">::")?;
+    // `trim_start_matches('<')` peels every leading `<` (mirroring
+    // `crate_of_path`), then the Self type is everything before ` as `.
+    let inner = head.trim_start_matches('<');
+    let self_ty = inner.split(" as ").next().unwrap_or(inner);
+    let self_ty = strip_self_ty_sigils(self_ty);
+    // Drop generic args: `demo::Foo<u32>` → `demo::Foo`.
+    let self_ty = self_ty.split_once('<').map_or(self_ty, |(base, _)| base);
+    let self_ty = self_ty.trim_end_matches("::");
+    if self_ty.is_empty() || method.is_empty() {
+        return None;
+    }
+    Some(format!("{self_ty}::{method}"))
+}
+/// Strip the type sigils rustc renders around a Self type — `&`, `&mut`,
+/// `*const`, `*mut`, and slice/tuple brackets — exposing the nominal path
+/// inside. `&demo::Foo` → `demo::Foo`.
+fn strip_self_ty_sigils(s: &str) -> &str {
+    let mut t = s.trim();
+    loop {
+        let before = t;
+        t = t.trim_start_matches(['&', '[', '(', '*']).trim_start();
+        for kw in ["mut ", "const ", "dyn ", "impl "] {
+            t = t.strip_prefix(kw).unwrap_or(t).trim_start();
+        }
+        if t == before {
+            return t;
+        }
     }
 }
 /// Extract the fully-qualified paths of the functions DIRECTLY called by
@@ -274,6 +361,29 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 ///      impossible whenever an indirect dispatch is reachable — the
 ///      indirect target need not be in this set for soundness.
 ///
+/// ## Fn-item ARGUMENTS (audit 2026-07-15 — a confirmed false discharge)
+///
+/// Step (2) above enumerated three ways to name a callable — fn-ptr, `dyn`,
+/// closure — and MISSED the fourth: a `FnDef` item passed directly as a value.
+/// `o.map(panicky)` coerces nothing, so no fn-ptr local is created and PB032
+/// never fires; `panicky` is a ZST constant in the ARGUMENT list, not the
+/// `func`, so the direct-call scan never saw it; and `Option::map` is
+/// (correctly) trusted-total, so the call site raises no gap. The invocation
+/// happens inside un-walked `core`. Verified end-to-end on real MIR pre-fix:
+/// with `verify_roots = ["demo::caller"]`, `fn caller(o: Option<u32>) ->
+/// Option<u32> { o.map(panicky) }` reported "walked 1 item(s), filtered 1" and
+/// exit 0 while `panicky` (`x.pow(x)`, overflow-panicking) was never walked —
+/// the same crate at the default full walk correctly exits 1.
+///
+/// The bug was never that `map` is wrongly trusted — `map` genuinely never
+/// panics. It is that "this function is total" was read as "this call site is
+/// safe", which holds only if everything the callee INVOKES is separately
+/// verified. So fn-item arguments are collected too: `panicky` becomes a
+/// referenced callee, and the #27 gate fails closed on it exactly as it would
+/// for a direct call. Only `FnDef`-typed constants carry a `path` (the adapter
+/// sets it solely for `RigidTy::FnDef`), so this cannot false-flag an integer
+/// or aggregate constant argument.
+///
 /// Drop glue (`TerminatorKind::Drop`) is not a `Call`, so it is not here;
 /// the wrapper separately injects every LOCAL `Drop::drop` impl into the
 /// referenced-callee set (#27 drop-glue, 2026-06-14) to close that path.
@@ -289,14 +399,22 @@ pub fn callee_paths(body: &Body) -> Vec<String> {
     use crate::mir_api::{ConstOperand, Operand, TerminatorKind};
     let mut paths = Vec::new();
     for block in &body.blocks {
+        let TerminatorKind::Call { func, args, .. } = &block.terminator.kind else {
+            continue;
+        };
         // Direct call with a statically-known callee path: the callee
         // operand is a function constant carrying a resolved path.
-        if let TerminatorKind::Call {
-            func: Operand::Constant(ConstOperand { path: Some(p), .. }),
-            ..
-        } = &block.terminator.kind
-        {
+        if let Operand::Constant(ConstOperand { path: Some(p), .. }) = func {
             paths.push(p.clone());
+        }
+        // Fn ITEMS passed as arguments (`o.map(panicky)`) — see the
+        // "Fn-item ARGUMENTS" section above. The callee invokes these inside
+        // un-walked library code, so they are reachable in exactly the sense
+        // the #27 gate exists to enforce.
+        for arg in args {
+            if let Operand::Constant(ConstOperand { path: Some(p), .. }) = arg {
+                paths.push(p.clone());
+            }
         }
     }
     paths
@@ -396,6 +514,13 @@ pub fn crate_of_path(path: &str) -> &str {
     // `A`'s crate rather than the fail-open `<crate` (deep audit 2026-06-14).
     let inner = path.trim_start_matches('<');
     let self_ty = inner.split(" as ").next().unwrap_or(inner);
+    // Audit 2026-07-15: strip reference / pointer / slice sigils before taking
+    // the crate segment. `impl Add for &Matrix` is idiomatic and renders
+    // `<&crate_b::Foo as core::ops::Add>::add`, which without this yielded the
+    // crate `"&crate_b"` — a name no manifest carries, so the crate could fail
+    // to register as analyzed in `covered_analyzed_universe` and its uncovered
+    // callees would silently downgrade from a hard flag to INDETERMINATE.
+    let self_ty = strip_self_ty_sigils(self_ty);
     match self_ty.split_once("::") {
         Some((krate, _)) => krate,
         None => self_ty,
@@ -664,6 +789,61 @@ mod tests {
         assert!(pattern_matches("exact::path", "exact::path"));
         assert!(!pattern_matches("exact::path", "exact::path::child"));
     }
+    /// SOUNDNESS (audit 2026-07-15 — a CRITICAL false discharge, reproduced
+    /// end-to-end on real MIR before the fix): a `verify_roots` glob MUST match
+    /// trait-impl methods, which `item.name()` renders as
+    /// `<demo::Calc as demo::Div2>::div2`.
+    ///
+    /// Pre-fix the naive `starts_with("demo::")` matched none of these, so
+    /// `verify_roots = ["demo::*"]` — which reads as "verify my whole crate" —
+    /// walked NOTHING and exited 0 on a body containing `a / b`. The #27 gate
+    /// cannot backstop it: a public trait impl with no in-crate caller is never
+    /// in `referenced`.
+    #[test]
+    fn pattern_matches_trait_impl_renderings() {
+        let div2 = "<demo::Calc as demo::Div2>::div2";
+        assert!(
+            pattern_matches("demo::*", div2),
+            "SOUNDNESS: a crate-wide root must match a trait-impl method — else \
+             the impl is silently never walked and the crate falsely verifies",
+        );
+        assert!(pattern_matches("demo::Calc::*", div2), "the Self type's own glob must match");
+        assert!(pattern_matches("demo::Calc::div2", div2), "the exact Self::method form matches");
+        // Generic args on the Self type are dropped: a user writes
+        // `demo::Foo::*`, never `demo::Foo<u32>::*`.
+        let add = "<demo::Foo<u32> as core::ops::Add>::add";
+        assert!(pattern_matches("demo::*", add));
+        assert!(pattern_matches("demo::Foo::*", add));
+        // Reference Self types (`impl Add for &Matrix`) are idiomatic and must
+        // not be made unmatchable by the `&` sigil.
+        assert!(pattern_matches("demo::*", "<&demo::Matrix as core::ops::Add>::add"));
+        assert!(pattern_matches("demo::*", "<&mut demo::Matrix as demo::T>::m"));
+        // Module-level narrowing still DISCRIMINATES — normalization must not
+        // turn every root into a match-anything.
+        assert!(pattern_matches("demo::api::*", "<demo::api::Calc as demo::Div2>::div2"));
+        assert!(!pattern_matches("demo::api::*", "<demo::internal::Calc as demo::Div2>::div2"));
+        // A trait impl for a FOREIGN type belongs to the foreign type's path,
+        // not ours — matching is keyed on Self, mirroring `crate_of_path`.
+        assert!(!pattern_matches("demo::*", "<other::Thing as demo::Div2>::div2"));
+        // Near-miss prefixes must not match (the `::` anchor still holds).
+        assert!(!pattern_matches("demo::Calc::*", "<demo::CalcOther as demo::T>::m"));
+    }
+    /// `crate_of_path` must see through reference/pointer sigils on the Self
+    /// type (audit 2026-07-15): `impl Add for &Matrix` renders
+    /// `<&crate_b::Foo as core::ops::Add>::add`, which previously yielded the
+    /// crate `"&crate_b"` — a name no manifest carries, so the crate could fail
+    /// to register as analyzed and its uncovered callees would silently
+    /// downgrade from a hard flag to INDETERMINATE.
+    #[test]
+    fn crate_of_path_strips_self_ty_sigils() {
+        assert_eq!(crate_of_path("<&crate_b::Foo as core::ops::Add>::add"), "crate_b");
+        assert_eq!(crate_of_path("<&mut crate_b::Foo as core::ops::Add>::add"), "crate_b");
+        assert_eq!(crate_of_path("<[crate_b::Foo] as core::ops::Index>::index"), "crate_b");
+        assert_eq!(crate_of_path("<*const crate_b::Foo as crate_b::T>::m"), "crate_b");
+        // The un-sigiled forms still work.
+        assert_eq!(crate_of_path("<crate_b::Foo as some::Trait>::method"), "crate_b");
+        assert_eq!(crate_of_path("crate_b::module::foo"), "crate_b");
+    }
     /// PSS-1 PB018 closure: a `static mut X: u32` declaration reached
     /// through the reachability graph triggers PB018.
     #[test]
@@ -830,6 +1010,61 @@ mod tests {
             },
         ];
         assert_eq!(callee_paths(&body), vec!["crate::helper".to_string()]);
+    }
+    /// SOUNDNESS (audit 2026-07-15 — a false discharge confirmed on real MIR):
+    /// a fn ITEM passed as an ARGUMENT is a reachable callee.
+    ///
+    /// `o.map(panicky)` coerces nothing — no fn-ptr local exists, so PB032
+    /// never fires; `panicky` rides in the argument list, not `func`, so the
+    /// direct-call scan missed it; and `Option::map` is correctly trusted-total,
+    /// so the call site raises no gap. The invocation happens inside un-walked
+    /// `core`. Pre-fix, `verify_roots = ["demo::caller"]` over
+    /// `fn caller(o: Option<u32>) -> Option<u32> { o.map(panicky) }` reported
+    /// "walked 1, filtered 1" and exit 0 while `panicky` (`x.pow(x)`) was never
+    /// verified. Post-fix the #27 gate flags `demo::panicky` (verified e2e).
+    ///
+    /// Only `FnDef`-typed constants carry a `path` (the adapter sets it solely
+    /// for `RigidTy::FnDef`), so a `None`-path argument constant — an integer
+    /// literal, an aggregate — must NOT be flagged.
+    #[test]
+    fn callee_paths_captures_fn_item_arguments() {
+        use crate::mir_api::{
+            BasicBlock, BasicBlockData, ConstOperand, Local, Operand, Place, Terminator,
+            TerminatorKind,
+        };
+        let konst = |path: Option<&str>| {
+            Operand::Constant(ConstOperand {
+                ty: Ty { kind: TyKind::RigidTy(RigidTy::Bool) },
+                def_id: None,
+                path: path.map(str::to_string),
+                value: None,
+            })
+        };
+        let mut body = empty_body(DefId(1));
+        body.blocks = vec![BasicBlockData {
+            statements: vec![],
+            terminator: Terminator {
+                kind: TerminatorKind::Call {
+                    // The trusted-total combinator...
+                    func: konst(Some("core::option::Option::<u32>::map")),
+                    // ...handed a panicking in-crate fn ITEM, plus a plain
+                    // value constant that must not be mistaken for a callee.
+                    args: vec![konst(Some("demo::panicky")), konst(None)],
+                    destination: Place { local: Local(0), projection: vec![] },
+                    target: Some(BasicBlock(0)),
+                },
+                span: Span::default(),
+            },
+        }];
+        let paths = callee_paths(&body);
+        assert!(
+            paths.contains(&"demo::panicky".to_string()),
+            "SOUNDNESS: a fn item passed as an argument is invoked inside un-walked \
+             library code — it must be a referenced callee so the #27 gate can fail \
+             closed on it. Got {paths:?}",
+        );
+        assert!(paths.contains(&"core::option::Option::<u32>::map".to_string()));
+        assert_eq!(paths.len(), 2, "the path-less value constant must not be flagged: {paths:?}");
     }
     /// `unverified_reachable_callees` flags exactly the in-crate callees
     /// reachable from a root but neither walked, trusted, nor out-of-crate.

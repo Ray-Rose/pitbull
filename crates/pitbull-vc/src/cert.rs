@@ -737,6 +737,23 @@ impl CertificateBundle {
                     ob.id,
                 ));
             }
+            // Audit 2026-07-15: the bundle header's `threshold` is what the
+            // human-readable replay transcript prints ("agreement threshold
+            // N"), but `replay_bundle` votes with each certificate's OWN
+            // threshold. A producer always writes the same value to both, so a
+            // divergence means a tampered or corrupted bundle — and in an
+            // UNSIGNED one it is free to construct: header 2 (what the auditor
+            // reads) with per-obligation 1 (what replay actually enforces).
+            // Pin them together at load so the printed gate is the gate.
+            if ob.threshold != bundle.threshold {
+                return Err(format!(
+                    "certificate `{}` records threshold {} but the bundle header \
+                     records {} (a producer always writes both from the same \
+                     config) — refusing a tampered or corrupted bundle whose \
+                     reported agreement gate is not the one replay would apply",
+                    ob.id, ob.threshold, bundle.threshold,
+                ));
+            }
         }
         // Reject a bundle whose certificates are internally inconsistent
         // (hand-forged or corrupted). Fail closed at load (audit
@@ -909,6 +926,56 @@ mod tests {
         assert!(err2.contains("threshold 0"), "got: {err2}");
     }
 
+    /// Audit 2026-07-15: a bundle whose header threshold disagrees with a
+    /// certificate's own threshold is refused at load.
+    ///
+    /// `replay_bundle` votes with each cert's OWN threshold, while the replay
+    /// transcript prints the BUNDLE header's ("agreement threshold N"). In an
+    /// unsigned bundle those are independently forgeable, so the pre-fix
+    /// artifact could advertise a 2-of-2 gate to the auditor reading the
+    /// output while replay actually applied 1-of-2 — the reported gate not
+    /// being the enforced one. (Signed bundles were already safe: both fields
+    /// are under the MAC.)
+    #[test]
+    fn from_json_rejects_threshold_header_mismatch() {
+        // Header says 2 (what an auditor reads); the cert says 1 (what replay
+        // would enforce). One `unsat` vote at threshold 1 is a real
+        // `discharged`, so this bundle is internally consistent — the header
+        // cross-check is the only thing that catches it.
+        let json = format!(
+            "{{\"format_version\":{CERT_FORMAT_VERSION},\"tool_version\":\"x\",\
+             \"crate_name\":\"c\",\"threshold\":2,\"timeout_seconds\":60,\
+             \"solvers\":[\"z3\",\"cvc5\"],\"total_obligations\":1,\"obligations\":[{{\
+             \"id\":\"pb049-add-0\",\"rule\":\"PB049\",\"smt\":\"(check-sat)\",\
+             \"solver_results\":[{{\"solver\":\"z3\",\"verdict\":\"unsat\"}}],\
+             \"verdict\":\"discharged\",\"unsat_votes\":1,\"threshold\":1}}]}}",
+        );
+        let err = CertificateBundle::from_json(&json)
+            .expect_err("a bundle whose header threshold != cert threshold must be refused");
+        assert!(
+            err.contains("threshold") && err.contains("bundle header"),
+            "error should name the header/cert threshold divergence; got: {err}",
+        );
+    }
+    /// The honest producer's bundle (header and certs written from the same
+    /// config) still loads — the cross-check above must not reject real
+    /// artifacts.
+    #[test]
+    fn from_json_accepts_matching_thresholds() {
+        let json = format!(
+            "{{\"format_version\":{CERT_FORMAT_VERSION},\"tool_version\":\"x\",\
+             \"crate_name\":\"c\",\"threshold\":2,\"timeout_seconds\":60,\
+             \"solvers\":[\"z3\",\"cvc5\"],\"total_obligations\":1,\"obligations\":[{{\
+             \"id\":\"pb049-add-0\",\"rule\":\"PB049\",\"smt\":\"(check-sat)\",\
+             \"solver_results\":[{{\"solver\":\"z3\",\"verdict\":\"unsat\"}},\
+             {{\"solver\":\"cvc5\",\"verdict\":\"unsat\"}}],\
+             \"verdict\":\"discharged\",\"unsat_votes\":2,\"threshold\":2}}]}}",
+        );
+        let bundle = CertificateBundle::from_json(&json)
+            .expect("an honest matching-threshold bundle must load");
+        assert_eq!(bundle.threshold, 2);
+        assert_eq!(bundle.obligations.len(), 1);
+    }
     /// An honest producer's certificate always passes the internal
     /// consistency check (it is built by the same `vote`).
     #[test]

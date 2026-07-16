@@ -265,7 +265,12 @@ fn main() {
         callbacks.violations,
         callbacks.undischarged_obligations,
         callbacks.unverified_reachable_callees,
-        callbacks.coverage_gap_notes,
+        // A root pattern that matched NOTHING is a coverage gap in the same
+        // sense as a check that could not run: the narrowing the user
+        // configured covers no code, so a clean verdict attests to nothing.
+        // Folded here (rather than into `violations`) so the existing
+        // `fail_on_coverage_gaps` opt-out governs it uniformly.
+        callbacks.coverage_gap_notes + callbacks.unmatched_root_patterns,
         callbacks.fail_on_coverage_gaps,
         callbacks.bridge_failed,
     ));
@@ -314,6 +319,16 @@ struct PitbullCallbacks {
     /// Mirror of `verification.fail_on_coverage_gaps` (default true). Gates
     /// whether `coverage_gap_notes` affects the exit code.
     fail_on_coverage_gaps: bool,
+    /// Count of `[reachability] verify_roots` patterns that matched NO item in
+    /// the crate's fn universe (audit 2026-07-15). Folded into the coverage-gap
+    /// exit code: a root that covers nothing means the run verified nothing it
+    /// claimed to, whether the cause is a typo (`demo::verifed_api::*`) or a
+    /// MATCHER gap — which is exactly how the `<Self as Trait>::method`
+    /// false discharge stayed invisible: `verify_roots = ["demo::*"]` matched
+    /// zero items, walked zero bodies, and exited 0. A structural backstop for
+    /// the whole class, independent of the specific rendering bug fixed
+    /// alongside it.
+    unmatched_root_patterns: usize,
 }
 #[cfg(rustc_public_real)]
 impl rustc_driver::Callbacks for PitbullCallbacks {
@@ -407,6 +422,10 @@ impl PitbullCallbacks {
         let mut visitor = pitbull_subset::SubsetVisitor::new(&cfg);
         let mut walked = 0usize;
         let mut filtered_out = 0usize;
+        // Items dropped by `[reachability] exclude`, tracked apart from
+        // root-narrowing (see the exclude arm for why the two must not be
+        // conflated).
+        let mut excluded_out = 0usize;
         // Track which function paths were actually walked, so we can warn
         // about `[verification.preconditions]` keys that matched nothing
         // (a typo, or a function filtered out by verify_roots) — those
@@ -468,7 +487,15 @@ impl PitbullCallbacks {
             self.items_seen += 1;
             let item_path = item.name();
             if exclude.iter().any(|p| pattern_matches(p, &item_path)) {
-                filtered_out += 1;
+                // Counted SEPARATELY from root-narrowing (audit 2026-07-15).
+                // The two are not the same risk: a root-filtered callee is
+                // still owned by the #27 gate, but an EXCLUDED item is dropped
+                // before `local_fn_universe` and is therefore invisible to that
+                // gate by construction — it has no exit-code consequence at
+                // all. Conflating them under one `filtered N` hid that, and the
+                // exclude-specific warning below was unreachable whenever
+                // `verify_roots` was also set.
+                excluded_out += 1;
                 continue;
             }
             match item.kind() {
@@ -735,7 +762,31 @@ impl PitbullCallbacks {
                 );
             }
             self.unverified_reachable_callees = unverified.len();
-        } else if filtered_out > 0 {
+            // Fail closed on a root pattern that matched NOTHING (audit
+            // 2026-07-15). A root covering zero functions means this run
+            // verified nothing it claimed to — and the cause may be a silent
+            // MATCHER gap rather than a typo, which is how the
+            // `<Self as Trait>::method` false discharge hid: the pattern simply
+            // matched nothing, the walk did nothing, and the run exited 0. The
+            // universe is checked (not `walked`) because it holds every
+            // body-carrying in-crate fn before narrowing.
+            if !local_fn_universe.is_empty() {
+                for pat in &verify_roots {
+                    if !local_fn_universe.iter().any(|p| pattern_matches(pat, p.as_str())) {
+                        eprintln!(
+                            "pitbull-rustc: PB-reachability: [reachability] verify_roots \
+                             pattern `{pat}` matched NO function in this crate ({} \
+                             candidate(s) available) — nothing it names was verified. \
+                             Check for a typo or an over-narrow glob; treating as a \
+                             coverage gap (fail-closed).",
+                            local_fn_universe.len(),
+                        );
+                        self.unmatched_root_patterns += 1;
+                    }
+                }
+            }
+        }
+        if excluded_out > 0 {
             // Audit finding (2026-05-26 full-codebase sweep): when
             // `verify_roots` is empty but `exclude` patterns dropped
             // items, the count was previously NOT surfaced — items
@@ -744,11 +795,18 @@ impl PitbullCallbacks {
             // (intentionally or by a too-broad glob like
             // `mycrate::*`) must make the dropped count VISIBLE so an
             // auditor cannot mistake "excluded" for "verified clean".
+            //
+            // Audit 2026-07-15: this was an `else if` on the verify-roots
+            // branch, so setting BOTH `verify_roots` and `exclude` silenced it
+            // — the configuration where it matters MOST, since an excluded item
+            // is invisible to the #27 gate while a root-filtered one is not.
+            // Now unconditional, and counted apart from root narrowing.
             eprintln!(
-                "pitbull-rustc: {} item(s) excluded by `[reachability] exclude` \
+                "pitbull-rustc: {excluded_out} item(s) excluded by `[reachability] exclude` \
                  patterns and NOT verified — confirm this is intended; an \
-                 over-broad exclude glob can silently skip the whole crate.",
-                filtered_out,
+                 over-broad exclude glob can silently skip the whole crate. \
+                 NOTE: excluded items are dropped BEFORE the reachability gate, \
+                 so a call to one is NOT flagged as an unverified callee.",
             );
         }
         // Warn about precondition keys that matched no walked function
@@ -1288,6 +1346,10 @@ fn dispatch_vc_obligations(
         // Erring toward detecting contradictions is the safe
         // direction (a false refusal rejects safe code; a missed
         // contradiction is unsound).
+        // Set when the consistency check was SKIPPED because no solver was
+        // installed at that moment. The main check below must then observe the
+        // SAME "no solver" world, or we refuse (see the enforcement site).
+        let mut consistency_skipped_no_solver = false;
         if let Some(cs_smt) = &goal.consistency_check {
             let cs_results = run_solvers(solvers, cs_smt, timeout);
             // (1) Refuse if ANY solver proves the assumptions
@@ -1328,11 +1390,18 @@ fn dispatch_vc_obligations(
             // discharge). The all-not-installed case is exempt: there
             // is no solver at all, so we fall through and let the main
             // check emit the canonical "no solver" verdict (also
-            // undischarged — still fail-closed).
+            // undischarged — still fail-closed). That exemption is a
+            // TEMPORAL claim ("no solver during the consistency check ⇒ no
+            // solver during the main check, milliseconds later"), not an
+            // invariant: a PATH mutation or an install completing in that
+            // window would let the main check run with REAL solvers whose
+            // `unsat` was never vacuity-guarded. So the claim is ENFORCED at
+            // the main check rather than assumed (audit 2026-07-15).
             let all_not_installed = !cs_results.is_empty()
                 && cs_results
                     .iter()
                     .all(|(_, r)| *r == pitbull_vc::SolverResult::NotInstalled);
+            consistency_skipped_no_solver = all_not_installed;
             if !all_not_installed {
                 let mut sat_voters: Vec<&str> = cs_results
                     .iter()
@@ -1378,6 +1447,37 @@ fn dispatch_vc_obligations(
         // Main check through the agreement gate.
         let results = run_solvers(solvers, &goal.smt, timeout);
         let breakdown = solver_breakdown(&results);
+        // ENFORCE the consistency check's all-not-installed exemption
+        // (audit 2026-07-15). The exemption above skipped the F1 vacuity
+        // guard on the grounds that no solver existed to run it; that is only
+        // sound if the main check is equally solver-less. If a solver DID
+        // answer here, the world changed mid-obligation (PATH mutation, an
+        // install completing, a network-mounted binary reappearing) and this
+        // obligation's hypotheses were never proven jointly satisfiable — a
+        // vacuous `unsat` would discharge unsafe code with entirely honest
+        // solvers. Refuse: fail closed, loudly.
+        if consistency_skipped_no_solver
+            && !results.is_empty()
+            && !results
+                .iter()
+                .all(|(_, r)| *r == pitbull_vc::SolverResult::NotInstalled)
+        {
+            eprintln!(
+                "pitbull-rustc: vc {} ({rule}): undischarged — the precondition \
+                 consistency check found NO solver installed, but the main check \
+                 then reached one ([{breakdown}]); the solver environment changed \
+                 mid-obligation, so the preconditions were never proven jointly \
+                 satisfiable. Refusing to risk a vacuous discharge.",
+                obligation.id,
+            );
+            uncertified.push(pitbull_vc::cert::UncertifiedObligation {
+                id: obligation.id.clone(),
+                rule: rule.to_string(),
+                status: "consistency-unconfirmed".to_string(),
+            });
+            undischarged += 1;
+            continue;
+        }
         // Record a replayable proof certificate for this obligation
         // (Task T.2). Built from the SAME results the verdict below is
         // derived from, so the certificate's recorded decision exactly
@@ -1668,17 +1768,17 @@ fn load_config() -> pitbull_subset::SubsetConfig {
         }
     }
 }
-/// Pattern matcher mirroring `pitbull_subset::reachability::pattern_matches`.
-/// Patterns ending with `::*` match any item whose path starts with
-/// the prefix; other patterns match exactly. v0.1 deliberately keeps
-/// the matching simple — see `reachability.rs` for the rationale.
+/// Pattern matcher for `verify_roots` / `exclude`.
+///
+/// Delegates to `pitbull_subset::reachability::pattern_matches` — the SINGLE
+/// source of truth. This was previously a hand-copied mirror of that function,
+/// and the two drifted apart in the way duplicated soundness logic always does:
+/// the 2026-07-15 audit found BOTH copies blind to the `<Self as Trait>::method`
+/// rendering (a CRITICAL false discharge — see the callee's docs), which had to
+/// be fixed twice. Delegating makes that structurally impossible.
 #[cfg(rustc_public_real)]
 fn pattern_matches(pattern: &str, path: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix("::*") {
-        path == prefix || path.starts_with(&format!("{prefix}::"))
-    } else {
-        pattern == path
-    }
+    pitbull_subset::reachability::pattern_matches(pattern, path)
 }
 /// HIR pre-pass: a single walk over the crate's HIR that
 /// extracts:
