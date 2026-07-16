@@ -2270,6 +2270,72 @@ the std form and now also matches. No shadow type changes.
   + a well-formedness sanity check); clippy error-clean. This gate covers the
   integer families only; the slice/`char`/`Option`/`Result` allow-list surfaces
   (enumerated by exact `ends_with`, lower glob-risk) are the natural follow-up.
+  *(Landed 2026-07-15 — see below.)*
+- ✅ **Four-front deep audit** (2026-07-15). Four parallel adversarial audits
+  (proof core; visitor + allow-lists; adapter + reachability; driver + config +
+  predicate); every finding re-verified against source and, where it concerned
+  real MIR, **reproduced end-to-end with the nightly wrapper before any fix**.
+  Tests **368 → 381**; both clippy lanes error-clean; full suite green under
+  `PITBULL_REQUIRE_E2E=1` with z3 4.16.0 + cvc5 1.3.4.
+
+  **The allow-list was clean; the false discharges had moved.** After two
+  consecutive audits evicted CRITICALs from `is_trusted_total_library_call` and
+  a structural gate was built for it, this session's sweep of that surface (an
+  agent's, plus independent probing of every trusted entry against adversarial
+  witnesses — broken `Ord`, zero divisors, OOB indices, non-char-boundaries)
+  found **no third instance**. All three confirmed false discharges were in the
+  **reachability / path-rendering layer**:
+  1. **`verify_roots` glob never matched trait impls (CRITICAL).**
+     `item.name()` renders a trait-impl method `<demo::Calc as demo::Div2>::div2`
+     — leading `<` — so `starts_with("demo::")` matched none, and
+     `verify_roots = ["demo::*"]` walked NOTHING and exited 0 on `a / b`. The
+     #27 gate can't backstop it (a public trait impl with no in-crate caller is
+     never `referenced`). `crate_of_path` already handled this rendering *with
+     tests*; the matcher didn't — the Drop-glue special case was the tell.
+     `pattern_matches` now also matches the normalized `Self::method` form; the
+     driver's copy DELEGATES to the subset one so they cannot drift again.
+  2. **Fn items passed as ARGUMENTS escaped the reachability gate (CRITICAL
+     under narrowing).** `o.map(panicky)` coerces nothing (no fn-ptr ⇒ no
+     PB032), rides in the argument list not `func` (⇒ direct-call scan misses
+     it), and `Option::map` is correctly trusted (⇒ no gap) — the invocation
+     happens inside un-walked `core`. `callee_paths`'s soundness argument
+     enumerated three ways to name a callable and missed the fourth. The bug was
+     never that `map` is wrongly trusted: **"this function is total" was read as
+     "this call site is safe"**, which holds only if everything the callee
+     invokes is separately verified.
+  3. **Type rules dead on real std code (HIGH).** rustc renders a type by the
+     path it was REACHED through, so `Cell` arrives as `std::cell::Cell` even
+     when the source writes `core::cell::Cell`. PB011/PB012/PB015 had dual
+     `alloc::`+`std::` spellings; PB008/PB021/PB022/PB023 were `core::`-only ⇒
+     dead on every std-linked crate (control: under
+     `strict_library_acceptance = false`, `Box` rejected, `Cell` exit 0). All
+     arms now match the root-stripped suffix. Corpus:
+     `reject/PB021_std_cell_reexport.rs` — every prior test for these rules
+     hand-built the `core::` path the adapter never emits.
+
+  **Proof core** (no CRITICAL found): a verdict emitted alongside an SMT-LIB
+  `(error ...)` or a non-zero exit is now REFUSED — z3 does not treat a
+  malformed directive as fatal, it reports, DROPS it, and answers the REST
+  (verified: a malformed *hypothesis* → `(error …)` + `unsat` + exit 1, counted
+  as a full discharge vote pre-fix). Not live-exploitable in the default pool
+  (cvc5 is stricter), **but safety must not rest on one vendor being more
+  conservative than the other** — at `threshold = 1` it falsely discharges. Plus:
+  the vacuity guard's all-not-installed exemption is now enforced rather than
+  assumed; `compile` fails closed when assumptions exist but consistency
+  emission fails; version pins must be shaped like versions; `from_json` pins
+  the bundle header threshold to each cert's.
+
+  **Class-level backstops:** a `verify_roots` pattern matching zero functions
+  now fails closed (this is how bug 1 hid); `exclude` is counted and warned
+  separately from root-narrowing (its warning was an `else if`, silenced by
+  setting both — the config where it matters most). The **exhaustiveness gate
+  now covers the non-integer surfaces** (+~90 entries; 62 witnessed panics/run,
+  up from 28) and is **mutation-tested**: re-introducing the 2026-07-09 `sort`
+  eviction makes it fail. Note the sort witness: 1.81+ order-violation detection
+  is *opportunistic* — an "always Less" comparator looks pre-sorted and does NOT
+  panic (n = 8…5000), while a stateful one panics from n ≈ 50. The naive witness
+  would have "proven" `sort` total and argued to un-evict it; both facts are
+  pinned so the trap is an executable assertion.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is a

@@ -171,8 +171,27 @@ entry point**. What the v0.2 scaffold actually *analyzes* versus what it
   (`dyn`/fn-ptr/closure) inside any walked body is a hard subset
   rejection (PB031/PB032/PB033), so it cannot route reachable code around
   the walk (see `reachability.rs::callee_paths` for the soundness
-  argument). Local `Drop::drop` impls are injected into the gate so
-  implicit drop glue is covered too.
+  argument). A fn ITEM passed as a value (`o.map(helper)`) is not any of
+  those three — it coerces to nothing and fires no rule — so such
+  arguments are collected as referenced callees and owned by the same
+  gate (audit 2026-07-15). Local `Drop::drop` impls are injected into the
+  gate so implicit drop glue is covered too.
+
+  > **`verify_roots` narrowing is weaker than the default walk-all, and
+  > this is a load-bearing caveat.** Narrowing is enforced by matching
+  > path STRINGS against `rustc_public`'s `item.name()` renderings, and
+  > that layer has produced real false discharges: until 2026-07-15 no
+  > `::*` glob matched a trait-impl method at all (they render
+  > `<Type as Trait>::method`), so `verify_roots = ["mycrate::*"]` —
+  > which reads as "verify my whole crate" — walked **nothing** and
+  > exited 0. That instance is fixed and a root pattern matching zero
+  > functions now fails closed, but the residual documented in
+  > `HANDOFF.md` §7 is real: a statically-dispatched trait-method CALL is
+  > recorded under the trait path while the walkable ITEM carries the
+  > impl rendering, so `referenced ∩ universe` can still miss it. **If
+  > you want the strongest guarantee this tool offers, leave
+  > `verify_roots` empty.** Every local item is then walked regardless of
+  > how its path renders, and none of this class applies.
 - **Trusted, NOT analyzed.** Code in **other crates** —
   `core`/`std`/`alloc`, registry dependencies, and any crate not compiled
   through the wrapper (`RUSTC_WORKSPACE_WRAPPER` wraps workspace members,

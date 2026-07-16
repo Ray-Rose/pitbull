@@ -7,12 +7,18 @@ bottom on first sit-down; refer back to individual sections
 during work.
 
 Last known-good commit at hand-off: the latest on `main` — run
-`git log -1`. The most recent milestone is the **2026-07-12 allow-list
-div/rem false-discharge fix** (see the dated subsection at the end of §1:
-the `wrapping_`/`overflowing_`/`saturating_` div/rem methods were
-trusted-as-total but panic on a zero divisor — evicted, now PB043 pending;
-the sibling of the 2026-07-09 `clamp`/`sort` class). The prior milestone was
-the **2026-07-09 deep-audit second pass** (`Ord::clamp` / sort-family false
+`git log -1`. The most recent milestone is the **2026-07-15 four-front deep
+audit** (see the dated subsection at the end of §1), which found and closed
+**three confirmed false discharges outside the allow-list** — the
+`verify_roots` trait-impl matcher blindness (CRITICAL), fn-items passed as
+arguments escaping the reachability gate (CRITICAL under narrowing), and the
+type-level rules being dead on real std code (HIGH) — plus a solver-verdict
+hole where z3 reports an error, drops the offending directive, and answers the
+REST of the problem. The prior milestone was the **2026-07-12 allow-list
+div/rem false-discharge fix** (the `wrapping_`/`overflowing_`/`saturating_`
+div/rem methods were trusted-as-total but panic on a zero divisor — evicted,
+now PB043 pending; the sibling of the 2026-07-09 `clamp`/`sort` class), and
+before that the **2026-07-09 deep-audit second pass** (`Ord::clamp` / sort-family false
 discharges closed, call-site preconditions fail closed, `vote` threshold-0 +
 forged-replay hole closed, warm-cache `check` fail-open closed). The v0.2 state ships the
 deductive backend, full PB054 end-to-end discharge (P / P.1 / P.2),
@@ -28,7 +34,7 @@ deep-audit cleanup passes. Branch `main`, with `origin` remote on GitHub.
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 368 tests passing (192 subset-lib + 93 vc + 58 integration + 12 aorte_proofs + 2 allowlist-exhaustiveness + 11 driver-bin),
+- **State:** 381 tests passing (197 subset-lib + 98 vc + 58 integration + 12 aorte_proofs + 5 allowlist-exhaustiveness + 11 driver-bin),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -78,11 +84,24 @@ deep-audit cleanup passes. Branch `main`, with `origin` remote on GitHub.
   and confirms the agreement verdict reproduces — on STABLE Rust (no
   nightly needed). This is the differentiator no competing Rust
   verifier ships. The remaining highest-leverage moves:
-  1. **Task T.3 — cryptographic signing** of certificates (the
-     "signed solver outputs" provenance layer; deliberately deferred —
-     no crypto dep today), plus certifying the consistency-refused /
-     pending obligations (currently only main-check decisions get a
-     cert).
+  1. ✅ **Task T.3 — cryptographic signing** of certificates — DONE.
+     HMAC-SHA256 (`d0d3062`, symmetric, tamper-resistant within a
+     trust domain holding the key) plus **Ed25519** (`2711f67`,
+     frontier #2, asymmetric — a third party verifies with only the
+     PUBLIC key, the "don't-trust-the-verifier" story), and
+     `PITBULL_REQUIRE_SIGNED` makes an unsigned/unverifiable
+     certificate fail closed at replay. (This bullet claimed
+     "deliberately deferred — no crypto dep today" long after both
+     landed; corrected 2026-07-15. The deps are real: `sha2`, `hmac`,
+     `ed25519-dalek` in `pitbull-vc/Cargo.toml`.) **Still open:**
+     certifying the consistency-refused / pending obligations —
+     today only main-check decisions get a per-obligation cert, and
+     the certificate records neither the consistency-check problem
+     nor its verdicts, so replay cannot re-validate the vacuity
+     guard (a bundle whose F1 check was wrongly answered `sat` at
+     certification time replays as MATCH forever). LOW: it needs a
+     threshold-wide sat-side solver bug, but it is the honest gap in
+     "the certificate is a complete coverage ledger".
   2. ✅ **Q.4a–Q.4d ensures SMT discharge** — DONE (2026-05-29 →
      2026-05-31): PB076 discharges copy/constant bodies (Q.4a), wrapping
      `Add`/`Sub`/`Mul` through the checked-add MIR (Q.4b), and `Div`/`Rem`
@@ -171,15 +190,17 @@ d3682f6 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **368 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **381 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The **368** breaks down: 4 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 192
-(subset lib) + 58 (integration) + 12 (aorte_proofs) + 2 (allowlist_exhaustiveness)
-+ 93 (vc) = 368 (the 2026-07-13 exhaustiveness gate added +2 over 366; the
+The **381** breaks down: 4 (cargo-pitbull bin) + 7 (pitbull-rustc bin) + 197
+(subset lib) + 58 (integration) + 12 (aorte_proofs) + 5 (allowlist_exhaustiveness)
++ 98 (vc) = 381 (the 2026-07-15 four-front audit added +13 over 368: 5 subset
+soundness pins, 5 vc proof-core pins, 3 exhaustiveness-gate tests for the
+non-integer surfaces; the 2026-07-13 exhaustiveness gate added +2 over 366; the
 2026-07-09 deep audit added +4 soundness-pinning tests over the interim 362,
 which itself grew from 343 via the red-team suite + trusted-total broadening
 commits; see the dated subsections at the end of §1). This supersedes the long
@@ -385,6 +406,113 @@ Scope/limitation: the gate covers the **integer** allow-list families only. The
 slice / `char` / `Option` / `Result` surfaces are enumerated by exact
 `ends_with` (lower glob-risk) and are the natural follow-up to fold into the
 same runtime-anchored harness. Stable suite green (368), clippy error-clean.
+**(That follow-up landed 2026-07-15 — see below.)**
+
+### 2026-07-15 four-front deep audit (this session)
+
+Four parallel adversarial audits (proof core; visitor + allow-lists; adapter +
+reachability; driver + config + predicate). Every finding was re-verified
+against source AND, where the claim concerned real MIR, **reproduced end-to-end
+with the nightly wrapper before any fix** — several agent claims died on that
+check (see "Refuted"). Fixed, all fail-closed (+13 tests → **381**).
+
+**The headline: the allow-list was clean; the false discharges were elsewhere.**
+Two consecutive prior audits had evicted CRITICALs from
+`is_trusted_total_library_call`, so that surface got a structural gate and this
+session's sweep of it (both an agent's and my own independent probing of every
+trusted entry against adversarial witnesses) found **no third instance**. The
+three confirmed false discharges were all in the *reachability / rendering*
+layer — the path-string plumbing around the proof core, not the proof core:
+
+- **`verify_roots` glob never matched trait impls (CRITICAL).** `item.name()`
+  renders a trait-impl method as `<demo::Calc as demo::Div2>::div2` — a leading
+  `<` — so `starts_with("demo::")` matched none. `verify_roots = ["demo::*"]`,
+  which reads as "verify my whole crate", walked NOTHING and **exited 0** on
+  `fn div2(&self, a: u32, b: u32) -> u32 { a / b }`. The #27 gate cannot
+  backstop it: a public trait impl with no in-crate caller is never
+  `referenced`. `crate_of_path` already understood this rendering *with tests*;
+  the matcher never did — the Drop-glue special case was the tell (the one
+  trait the authors tripped over got patched, not the matcher under it).
+  Fixed by normalizing `<Self as Trait>::m` → `Self::m` (generics + `&`/`*`
+  sigils stripped); the driver's hand-copied mirror now DELEGATES to the subset
+  copy so the two cannot drift again.
+- **Fn ITEMS passed as arguments escaped the reachability gate (CRITICAL under
+  narrowing).** `o.map(panicky)` coerces nothing (no fn-ptr local ⇒ PB032 never
+  fires), rides in the ARGUMENT list not `func` (⇒ the direct-call scan missed
+  it), and `Option::map` is correctly trusted-total (⇒ no gap). The invocation
+  happens inside un-walked `core`. `callee_paths`'s soundness argument
+  enumerated three ways to name a callable and missed the fourth. **The bug was
+  never that `map` is wrongly trusted** — it is that "this function is total"
+  was read as "this call site is safe", which holds only if everything the
+  callee *invokes* is separately verified.
+- **Type rules dead on real std code (HIGH).** rustc renders a type by the path
+  it was REACHED through, so `Cell` arrives as `std::cell::Cell` **even when the
+  source writes `core::cell::Cell`**. PB011/PB012/PB015 carried dual
+  `alloc::`+`std::` spellings; PB008/PB021/PB022/PB023 were `core::`-only and
+  thus dead on every std-linked crate. Confirmed with a clean control under the
+  documented `strict_library_acceptance = false` opt-out: `Box` rejected,
+  `Cell` exit 0. All arms now match the root-stripped suffix. Corpus:
+  `reject/PB021_std_cell_reexport.rs` — the coverage that was missing, since
+  every prior test for these rules hand-built the `core::` path the adapter
+  never emits.
+
+**Proof-core hardening** (no CRITICAL found there; these are defense-in-depth):
+
+- **A verdict alongside an SMT-LIB `(error ...)` or a non-zero exit is now
+  REFUSED.** Z3 does not treat a malformed directive as fatal — it reports the
+  error, DROPS it, and answers the REST. Verified on z3 4.16.0: a problem whose
+  middle `(assert ...)` (a *hypothesis*) is malformed prints `(error "…")` then
+  `unsat` and exits 1, and the parser counted that as a full discharge vote.
+  Not live-exploitable in the default pool (cvc5 is stricter, emitting no
+  verdict, so 2-of-2 degraded to Inconclusive) — **but safety must not rest on
+  one vendor being more conservative than the other**: at `threshold = 1` or
+  with two z3-like solvers the same input falsely discharges. Also retires the
+  structural assumption that a dropped directive always weakens toward `sat`.
+- Vacuity guard's all-not-installed exemption is now **enforced** at the main
+  check, not assumed (it was a temporal claim: "no solver now ⇒ none in 3ms").
+- `compile` fails closed when assumptions exist but consistency emission fails.
+- Version pins must be SHAPED like a version (`z3 = "Z3"`/`"64"`/`"bit"` each
+  matched a constant token of every Z3 banner — configured-looking, pinning
+  nothing; a digit test alone is insufficient, "Z3" contains one).
+- `from_json` pins the bundle header threshold to each cert's, so the gate an
+  auditor reads is the gate replay enforces.
+- `crate_of_path` strips `&`/`*`/`[` sigils (`impl Add for &Matrix` yielded the
+  crate `"&crate_b"`, which no manifest carries).
+
+**Structural backstops** (close the class, not the instance):
+
+- A `verify_roots` pattern matching **zero** functions now fails closed —
+  whether from a typo or a silent matcher gap, which is exactly how the
+  trait-impl bug hid. (It earned its keep immediately: it caught a wrong crate
+  name in one of my own probes.)
+- `exclude` is counted apart from root-narrowing, and its warning is
+  unconditional (it was an `else if` on the verify-roots branch, so setting BOTH
+  silenced it — the config where it matters most, since an excluded item is
+  dropped *before* the universe and is invisible to the #27 gate).
+- **Exhaustiveness gate extended to the non-integer surfaces** (+~90 entries,
+  62 witnessed panics/run, up from 28). **Mutation-tested**: re-introducing the
+  2026-07-09 `sort` eviction makes it fail, so it demonstrably catches the class
+  it exists for.
+  - *The sort witness is subtle and worth reading before touching:* 1.81+
+    order-violation detection is **opportunistic**. An "always return Less"
+    comparator makes the input look already-sorted and does **not** panic
+    (verified n = 8…5000); a **stateful** comparator panics deterministically
+    from n ≈ 50. The naive witness would have "proven" `sort` total and argued
+    to un-evict it — a mislabel that reads as evidence. Both facts are pinned by
+    `sort_order_violation_witness_is_genuine`.
+
+**Refuted by verification (claims NOT acted on).** The adapter agent's
+`std::`-vs-`core::` finding was real in *mechanism* but its proposed repro was
+wrong: BOTH spellings render `std::`, so its "control" case failed identically
+and proved nothing — the Box-vs-Cell control is what establishes it. Its
+"`covered_analyzed_universe` mis-parse" and the visitor agent's float-glob and
+`From::from` items were confirmed non-exploitable (PB050 / type-level rejects
+already dominate) and left alone rather than churned.
+
+**Method note:** unlike 2026-07-12, the stable e2e lane ran clean on Windows
+this session — all 58 wrapper-spawning tests executed under
+`PITBULL_REQUIRE_E2E=1` with z3 4.16.0 + cvc5 1.3.4 on PATH (no Smart App
+Control block), so the local evidence is complete rather than corpus-deferred.
 
 ---
 
@@ -516,11 +644,11 @@ git log --oneline -1
 # not pin a specific hash here). See the recent-commit-log block in §1.
 ```
 
-### Step 4.2 — Stable test suite (the 332-test baseline)
+### Step 4.2 — Stable test suite (the 381-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
-# Expected: "test result: ok" lines totaling 332 passing, 0 failed, 0 ignored
+# Expected: "test result: ok" lines totaling 381 passing, 0 failed, 0 ignored
 ```
 
 If you see `Application Control policy has blocked this file` on Windows: that's Smart App Control quarantining a fresh test binary. Run again — usually clears on the second try. If persistent, run `cargo +stable test --workspace --all-features` (without the -p flag) to use the workspace-mode binary path which SAC tends to accept.
@@ -595,7 +723,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 332 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 381 passing.
 # Note: the 2-of-N agreement capstone additionally requires BOTH z3 and
 # cvc5 on PATH; with PITBULL_REQUIRE_E2E set it panics if either is missing.
 ```
@@ -652,7 +780,7 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 332 passing (same as without Z3 — the new tests
+# Expected: 381 passing (same as without Z3 — the new tests
 # also pass via graceful-skip if no solver is present, but with
 # z3 they exercise the real `unsat` verdict path).
 ```
@@ -880,7 +1008,9 @@ git commit -m "..."
 | Self-verification / dogfood (Frontier #6) | Pitbull cannot yet verify its own TCB: that code uses heap + collections (`Vec`/`String`/`HashMap`), serde, and `rustc_private` internals — all outside PSS-1, so the subset enforcer would (correctly) reject it. End-to-end verification of *real* code is instead demonstrated by the accept corpus + the fixed-point `scale_q` proof (Frontier #1, `aorte_proofs.rs`), now exercised on the Linux nightly-e2e lane. This is the honest scope: a "partial dogfood" via real external targets, not self-hosting. | whole TCB | True self-hosting awaits the subset covering heap/collections (v0.2+); the alternative (carving out a tiny pure subset of the TCB to verify) would be a contrived demo, not a real soundness signal. |
 | Bounds checks (PB054) | ✅ DONE in Tasks P / P.1 / P.2 + audit-cleanup. Visitor emits `IndexBound { idx_source_name: Option<String> }`; compile emits QF_BV with `__pb_idx`/`__pb_len` canonical names + `idx`/`len` aliases + optional source-name alias in quoted-symbol syntax for raw-ident safety. End-to-end discharge under Z3 verified by `wrapper_proves_bounded_index_safe_under_precondition`. | — | Closed. |
 | Z3 subprocess timeout / output cap | Z3 invocation can hang indefinitely on a pathological SMT problem; no captured-output size cap. | `pitbull-vc/src/solver.rs` | DoS vector flagged in audit finding N3 (2026-05-26). Mitigation requires spawning + try_wait + size-cap; bigger change than the audit-cleanup pass absorbed. |
-| Reachability path-matching cluster (2026-07-09 audit) | Under `verify_roots` NARROWING, the per-crate/#27 and cross-crate gates ignore referenced paths they can't match to a universe entry ("unmatched ⇒ ignore"): statically-dispatched trait-method impls (recorded under the trait path, never a walkable item), visible-vs-canonical re-export renderings, and `covered_analyzed_universe` inferring a crate "analyzed" from an impl-for-foreign-type path. Each can silently exempt a reachable function from the coverage requirement. NOT exploitable with default walk-all (`verify_roots = []`), where every local item is walked regardless. | `pitbull-subset/src/reachability.rs` (gates), `pitbull-driver/src/main.rs` (aggregation) | Fail-closed redesign ("unmatched workspace-owned referenced path ⇒ indeterminate") is a structural change to the path-keyed accounting; needs empirical probing of `name()` renderings on the pinned nightly first. Until then: treat `verify_roots` narrowing as weaker than walk-all. |
+| Reachability path-matching cluster (2026-07-09 audit; **partly closed 2026-07-15**) | Under `verify_roots` NARROWING, the per-crate/#27 and cross-crate gates ignore referenced paths they can't match to a universe entry ("unmatched ⇒ ignore"). **CLOSED this session:** the `<Self as Trait>::method` rendering is now matched by `pattern_matches` (it was a live CRITICAL false discharge, not a theoretical gap — see §1), fn-item arguments are now referenced callees, `crate_of_path` handles sigiled Self types, and a root pattern matching zero items fails closed. **STILL OPEN:** a statically-dispatched trait-method CALL is recorded under the trait path (`demo::Div2::div2`) while the walkable item is `<demo::Calc as demo::Div2>::div2`, so `referenced ∩ universe` can still miss it; visible-vs-canonical re-export renderings; `covered_analyzed_universe` inferring "analyzed" from an impl-for-foreign-type path. NOT exploitable with default walk-all (`verify_roots = []`). | `pitbull-subset/src/reachability.rs` (gates), `pitbull-driver/src/main.rs` (aggregation) | The residual is the CALL-side normalization (this session fixed the ITEM side): resolving a trait-path call to its impl needs the trait-impl map, not a string rewrite. Until then: treat `verify_roots` narrowing as weaker than walk-all. |
+| Certificates omit the consistency (vacuity) evidence (2026-07-15 audit) | An `ObligationCertificate` records the main-check SMT + verdicts but neither the consistency-check problem nor its verdicts, so `replay` cannot re-validate the F1 vacuity guard: if `threshold` solvers wrongly answered `sat` on a contradictory assumption set at certification time, the resulting vacuous "discharged" cert replays as MATCH forever. | `pitbull-vc/src/cert.rs`, `pitbull-rustc.rs` dispatch | LOW (needs a threshold-wide sat-side solver bug), but it is the honest gap in the "complete coverage ledger" claim. Recording `consistency_check` + its verdicts is a `CERT_FORMAT_VERSION` → 3 change. |
+| Trait-impl methods don't bind `#[pitbull::requires/ensures/trusted]` (2026-07-15 audit) | The HIR pre-pass keys specs as `crate::<Foo as Trait>::bar` (`tcx.def_path_str`) but every lookup uses `item.name()`'s `<crate::Foo as crate::Trait>::bar` — they differ, so specs on TRAIT-impl methods silently don't bind (inherent impls match and are pinned by tests). Mostly fail-SAFE: `requires` not binding = fewer assumptions; `trusted` not binding = the body IS walked; and `set_known_precondition_fns` uses the same HIR keys so the call-site gap fails together with it (the `oops(){safe_div(10,0)}` hole does not reopen). **The real gap is `ensures`:** a non-binding one emits no PB076 at all — a silently unchecked postcondition. | `pitbull-driver/src/bin/pitbull-rustc.rs` (HIR pre-pass keys) | Normalize both sides to one rendering, and add an unmatched-key warning for ATTRIBUTE-sourced specs (today `unmatched_precondition_keys` warns only for `pitbull.toml` keys). |
 | ADT generic args dropped by adapter (2026-07-09 audit) | The shadow `AdtDef` carries only `{path, is_union}`; `RigidTy::Adt(_, generic_args)` discards args, so `static S: Option<Cell<u32>>` (or a user struct with a `Cell` field) passes PB018/PB021's item-type check — the `Cell` is invisible at the item level. In-body USES still fire PB021 (materializing `&Cell` in a local); transport-only flows do not. | `pitbull-subset/src/mir_api/adapter.rs`, `mir_api.rs` | Threading args through the shadow IR ripples every AdtDef consumer; needs a deliberate design (render-into-path vs. structured args). |
 | PB060 build-script hash recorded, not verified (2026-07-09 audit) | `trusted_build_scripts[].sha256` is format-validated (64 hex chars) only; no code hashes the referenced build.rs and compares, so a changed build script stays trusted. | `pitbull-subset/src/config.rs::validate` | Requires resolving the build.rs path per crate + hashing at wrapper start; disclosed inline in config.rs. |
 | PB072/PB073/PB074 unimplemented (2026-07-09 audit) | Cargo.lock presence, hermetic-environment, and pitbull-spec version checks do not exist (a config.rs comment previously claimed the driver performs them — corrected). PB073 is the named compensating control for the `PITBULL_*` env-injection residuals (`PITBULL_TOML` redirect, `PITBULL_ALLOW_UNSAFE_PATHS` from a hostile build.rs), so those residuals are currently guarded only by `check_env_path` hygiene. | driver | Implementing PB073 (refuse or fingerprint suspicious `PITBULL_*` provenance, e.g. a sentinel set by the subcommand) is the highest-leverage of the three. |
