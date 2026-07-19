@@ -333,6 +333,59 @@ fn strip_self_ty_sigils(s: &str) -> &str {
         }
     }
 }
+/// The TRAIT-method rendering of a trait-impl path: `<Type as Trait>::method`
+/// → `Trait::method`. `None` for a path not in trait-impl form.
+///
+/// This is the SIBLING of [`normalize_impl_path`] but keeps the OPPOSITE half:
+/// `normalize_impl_path` keys on the Self type (dropping the trait) for
+/// `verify_roots`/`exclude` matching; this keeps the TRAIT (dropping the Self
+/// type). The reason is the reachability gate's blind spot (audit 2026-07-18, a
+/// CONFIRMED false discharge — see [`unverified_reachable_callees`]): rustc
+/// renders a statically-dispatched trait-method CALL by its bare trait path
+/// (`demo::Div2::div2`), while the walkable impl ITEM is `<demo::Calc as
+/// demo::Div2>::div2`. The two never intersect, so a call to a trait-impl method
+/// that `verify_roots` narrowing left unwalked escaped the #27 gate (exit 0 on
+/// an unproven body). Folding this form into the walked/universe/trusted sets
+/// lets the trait-path call match the impl that provides it.
+///
+/// - `<demo::Calc as demo::Div2>::div2` → `demo::Div2::div2`
+/// - `<demo::Matrix<u32> as core::ops::Add>::add` → `core::ops::Add::add`
+///   (generic args on the trait dropped, mirroring the call rendering)
+/// - `<<A as T1>::Assoc as demo::T2>::m` → `demo::T2::m` (outermost trait, via
+///   the LAST `>::` / LAST ` as `)
+#[must_use]
+fn trait_method_form(path: &str) -> Option<String> {
+    if !path.starts_with('<') {
+        return None;
+    }
+    // Method tail follows the LAST `>::` (the outermost close).
+    let (head, method) = path.rsplit_once(">::")?;
+    let inner = head.trim_start_matches('<');
+    // The outermost trait is after the LAST ` as ` (a doubly-qualified
+    // `<<A as T1>::Assoc as T2>::m` picks T2, the trait actually dispatched).
+    let (_self_ty, trait_path) = inner.rsplit_once(" as ")?;
+    // Drop generic args on the trait: `Tr<u32>` → `Tr` (the call is rendered
+    // without them, so the forms must agree).
+    let trait_path = trait_path.split_once('<').map_or(trait_path, |(b, _)| b);
+    let trait_path = trait_path.trim();
+    if trait_path.is_empty() || method.is_empty() {
+        return None;
+    }
+    Some(format!("{trait_path}::{method}"))
+}
+/// A copy of `set` augmented with the [`trait_method_form`] of every trait-impl
+/// path it contains, so a bare-trait-path callee matches the impl item that
+/// provides it. A no-op on a set with no `<.. as ..>::` entries.
+#[must_use]
+fn with_trait_method_forms(set: &HashSet<String>) -> HashSet<String> {
+    let mut out = set.clone();
+    for p in set {
+        if let Some(tm) = trait_method_form(p) {
+            out.insert(tm);
+        }
+    }
+    out
+}
 /// Extract the fully-qualified paths of the functions DIRECTLY called by
 /// this body — the targets of `TerminatorKind::Call` whose callee operand
 /// is a resolved function constant. Used by the wrapper's fail-closed
@@ -442,6 +495,20 @@ pub fn unverified_reachable_callees(
     walked: &HashSet<String>,
     trusted: &HashSet<String>,
 ) -> Vec<String> {
+    // Augment each set with the TRAIT-method form of its trait-impl entries
+    // (audit 2026-07-18). A statically-dispatched trait-method CALL is
+    // referenced under its bare trait path `crate::Tr::m`, while the walkable
+    // impl item is `<crate::Type as crate::Tr>::m` — the two never intersect,
+    // so before this the gate silently ignored the call (`local_universe`
+    // contained only the impl path) and an unproven trait-impl body reachable
+    // from a verified root escaped under `verify_roots` narrowing (a CONFIRMED
+    // false discharge). Folding the impl item's trait-method form into the
+    // universe makes the call match it; folding it into `walked`/`trusted`
+    // means a WALKED (or user-trusted) impl still clears the gate. `referenced`
+    // needs no augmentation — the call is already the bare trait path.
+    let local_universe = with_trait_method_forms(local_universe);
+    let walked = with_trait_method_forms(walked);
+    let trusted = with_trait_method_forms(trusted);
     let mut out: Vec<String> = referenced
         .iter()
         .filter(|c| {
@@ -634,25 +701,46 @@ pub fn cross_crate_indeterminate(
 /// - `universe`: every in-crate fn-with-body any crate enumerated — the
 ///   "is this a walkable item?" set that filters out trait-paths / non-items.
 struct CrossCrateSets<'a> {
-    covered: HashSet<&'a str>,
+    covered: HashSet<String>,
     analyzed: HashSet<&'a str>,
-    universe: HashSet<&'a str>,
+    universe: HashSet<String>,
 }
 fn covered_analyzed_universe(manifests: &[ReachManifest]) -> CrossCrateSets<'_> {
-    let mut covered: HashSet<&str> = HashSet::new();
+    let mut covered: HashSet<String> = HashSet::new();
     let mut analyzed: HashSet<&str> = HashSet::new();
-    let mut universe: HashSet<&str> = HashSet::new();
+    let mut universe: HashSet<String> = HashSet::new();
+    // `covered`/`universe` also carry the TRAIT-method form of every trait-impl
+    // path (audit 2026-07-18), so a statically-dispatched trait-method call
+    // (referenced by its bare trait path `crate::Tr::m`) matches the impl item
+    // `<crate::Type as crate::Tr>::m`: a WALKED impl clears the gate via
+    // `covered`, an UNWALKED-but-in-universe impl is flagged via `universe`.
+    // The per-crate `#27` gate ([`unverified_reachable_callees`]) does the same
+    // augmentation for the single-crate case. `analyzed` (crate ownership) is
+    // unaffected — a trait's crate is already analyzed via its real items.
+    let mut add_covered = |s: &str| {
+        covered.insert(s.to_string());
+        if let Some(tm) = trait_method_form(s) {
+            covered.insert(tm);
+        }
+    };
+    for m in manifests {
+        for w in &m.walked {
+            add_covered(w);
+        }
+        for t in &m.trusted {
+            add_covered(t);
+        }
+    }
     for m in manifests {
         analyzed.insert(m.crate_name.as_str());
         for w in &m.walked {
-            covered.insert(w.as_str());
             analyzed.insert(crate_of_path(w));
         }
-        for t in &m.trusted {
-            covered.insert(t.as_str());
-        }
         for u in &m.universe {
-            universe.insert(u.as_str());
+            universe.insert(u.clone());
+            if let Some(tm) = trait_method_form(u) {
+                universe.insert(tm);
+            }
             analyzed.insert(crate_of_path(u));
         }
     }
@@ -1099,6 +1187,70 @@ mod tests {
             "a walked callee must not be flagged"
         );
     }
+    #[test]
+    fn trait_method_form_extracts_trait_path() {
+        assert_eq!(
+            trait_method_form("<demo::Calc as demo::Div2>::div2").as_deref(),
+            Some("demo::Div2::div2"),
+        );
+        assert_eq!(
+            trait_method_form("<demo::Matrix<u32> as core::ops::Add>::add").as_deref(),
+            Some("core::ops::Add::add"),
+            "generic args on the trait are dropped (the call is rendered without them)",
+        );
+        assert_eq!(
+            trait_method_form("<<demo::A as demo::T1>::Assoc as demo::T2>::m").as_deref(),
+            Some("demo::T2::m"),
+            "the OUTERMOST trait (last ` as `) is the one dispatched",
+        );
+        // Not trait-impl form → None (a plain fn / inherent method is unchanged).
+        assert_eq!(trait_method_form("demo::free_fn"), None);
+        assert_eq!(trait_method_form("demo::Calc::inherent"), None);
+    }
+    /// CONFIRMED FALSE DISCHARGE (audit 2026-07-18, reproduced end-to-end on
+    /// real MIR): under `verify_roots` narrowing, a statically-dispatched
+    /// trait-method call is referenced by the bare TRAIT path
+    /// `demo::Div2::div2` while the walkable impl item is
+    /// `<demo::Calc as demo::Div2>::div2`. Before the trait-method-form
+    /// augmentation the gate silently ignored the call (the trait path was in
+    /// no universe), so `fn caller(c){ c.div2(10,0) }` with the impl body
+    /// `a / b` unwalked exited 0 despite a reachable division-by-zero.
+    #[test]
+    fn unverified_reachable_callees_flags_unwalked_trait_impl_via_trait_path() {
+        let set = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<HashSet<_>>();
+        // caller (walked) calls the trait method; the impl is in the universe
+        // but was FILTERED OUT of the walk by narrowing.
+        let referenced = set(&["demo::Div2::div2"]);
+        let universe = set(&["demo::caller", "<demo::Calc as demo::Div2>::div2"]);
+        let walked = set(&["demo::caller"]);
+        assert_eq!(
+            unverified_reachable_callees(&referenced, &universe, &walked, &set(&[])),
+            vec!["demo::Div2::div2".to_string()],
+            "an UNWALKED trait-impl method reached via its trait-path call must be flagged",
+        );
+        // Walking the impl clears it (the walk-all case — must NOT over-flag).
+        assert!(
+            unverified_reachable_callees(
+                &referenced,
+                &universe,
+                &set(&["demo::caller", "<demo::Calc as demo::Div2>::div2"]),
+                &set(&[]),
+            )
+            .is_empty(),
+            "a WALKED trait-impl method must clear the gate (no false reject at walk-all)",
+        );
+        // Trusting the impl is an explicit opt-out → not flagged.
+        assert!(
+            unverified_reachable_callees(
+                &referenced,
+                &universe,
+                &walked,
+                &set(&["<demo::Calc as demo::Div2>::div2"]),
+            )
+            .is_empty(),
+            "a #[pitbull::trusted] trait-impl method must not be flagged",
+        );
+    }
     // ----- cross-crate aggregation (whole-workspace gate) --------------
     // Args: (crate_name, walked, referenced, trusted, universe). `universe`
     // is every in-crate fn-with-body (⊇ walked); a narrowed crate has
@@ -1203,6 +1355,47 @@ mod tests {
         assert!(
             cross_crate_indeterminate(&manifests, &ws(&["crate_a"])).is_empty(),
             "...and it is not indeterminate either (the crate WAS analyzed)",
+        );
+    }
+    /// The companion to the test above (audit 2026-07-18): when the impl was
+    /// NOT walked (crate_b narrowed it out) but IS in crate_b's universe, the
+    /// trait-path call from crate_a must be FLAGGED — the cross-crate analog of
+    /// the confirmed per-crate false discharge. Before the trait-method-form
+    /// augmentation this slipped through (the trait path matched no universe
+    /// entry, so `!universe.contains` skipped it).
+    #[test]
+    fn cross_crate_unverified_flags_unwalked_trait_impl_via_trait_path() {
+        let manifests = vec![
+            manifest(
+                "crate_a",
+                &["crate_a::root"],
+                &["crate_a::T::m"], // call references the TRAIT path
+                &[],
+                &["crate_a::root"],
+            ),
+            // crate_b owns the impl, listed in its universe but NOT walked.
+            manifest("crate_b", &[], &[], &[], &["<crate_b::S as crate_a::T>::m"]),
+        ];
+        assert_eq!(
+            cross_crate_unverified(&manifests, &ws(&["crate_a", "crate_b"])),
+            vec!["crate_a::T::m".to_string()],
+            "an UNWALKED trait-impl in a workspace member, reached via its trait-path \
+             call, must be flagged cross-crate (fail closed)",
+        );
+        // Walking (or trusting) the impl clears it.
+        let walked_ok = vec![
+            manifest("crate_a", &["crate_a::root"], &["crate_a::T::m"], &[], &["crate_a::root"]),
+            manifest(
+                "crate_b",
+                &["<crate_b::S as crate_a::T>::m"],
+                &[],
+                &[],
+                &["<crate_b::S as crate_a::T>::m"],
+            ),
+        ];
+        assert!(
+            cross_crate_unverified(&walked_ok, &ws(&["crate_a", "crate_b"])).is_empty(),
+            "a walked trait-impl clears the cross-crate gate too",
         );
     }
     /// Warm-cache safety: when the OWNING crate emitted no manifest (cargo

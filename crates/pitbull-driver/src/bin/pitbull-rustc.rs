@@ -139,9 +139,84 @@ fn decide_pitbull_exit_code(
     };
     rustc_exit_code.max(pitbull_exit_code)
 }
+/// Canonicalize a function path so the HIR-pre-pass spec key
+/// (`tcx.def_path_str` prefixed with the crate name) and the item-walk lookup
+/// key (`rustc_public::CrateDef::name()`) AGREE on trait-impl methods.
+///
+/// The two renderings differ ONLY in where the local crate qualifier sits on a
+/// trait-impl method (audit 2026-07-18 — a CONFIRMED false discharge: a false
+/// `#[pitbull::ensures]` on a trait-impl method emitted NO PB076 and exited 0):
+///   - pre-pass: `demo::<Calc as Doubler>::m`     (crate OUTSIDE the brackets)
+///   - name():   `<demo::Calc as demo::Doubler>::m` (crate INSIDE the brackets)
+///
+/// Stripping the local crate qualifier at each type-path ROOT position — leading
+/// (one occurrence, so a `demo::demo::` module can't over-strip), after `<`, and
+/// after ` as ` — reduces both to `<Calc as Doubler>::m`. Free fns and inherent
+/// methods already matched; canonicalization preserves that (`demo::free_fn` →
+/// `free_fn`; `demo::Calc::m` → `Calc::m` on both sides).
+///
+/// TRAIT-PRESERVING by construction (it keeps `as Doubler`), so — unlike
+/// [`pitbull_subset::reachability`]'s trait-DROPPING `normalize_impl_path` — it
+/// cannot make `<Calc as A>::run` and `<Calc as B>::run` collide (the pitfall
+/// Front 4 flagged: reusing the trait-dropping normalizer for spec binding would
+/// grant one impl's spec to a different impl — a NEW false discharge). Used ONLY
+/// for the `ensures` map: even a hypothetical collision there is fail-SAFE (it
+/// attaches EXTRA postcondition obligations — more checks, never fewer).
+/// `requires`/`trusted` keep their raw keys — dropping them is already fail-safe
+/// (fewer assumptions / the body is still walked), and canonicalizing them would
+/// risk desyncing the call-site precondition gate (`set_known_precondition_fns`).
+#[cfg(any(rustc_public_real, test))]
+fn canonical_spec_key(path: &str, crate_name: &str) -> String {
+    let cp = format!("{crate_name}::");
+    let s = path.strip_prefix(&cp).map_or_else(|| path.to_string(), str::to_string);
+    let s = s.replace(&format!("<{cp}"), "<");
+    s.replace(&format!(" as {cp}"), " as ")
+}
+#[cfg(test)]
+mod canonical_spec_key_tests {
+    use super::canonical_spec_key;
+    #[test]
+    fn trait_impl_renderings_canonicalize_equal() {
+        // The two renderings of the SAME trait-impl method must agree.
+        let hir = canonical_spec_key("demo::<Calc as Doubler>::m", "demo");
+        let name = canonical_spec_key("<demo::Calc as demo::Doubler>::m", "demo");
+        assert_eq!(hir, name, "trait-impl pre-pass and name() keys must match");
+        assert_eq!(hir, "<Calc as Doubler>::m");
+    }
+    #[test]
+    fn foreign_trait_impl_canonicalizes_equal() {
+        // Only the LOCAL crate qualifier is stripped; a foreign trait keeps its
+        // path, and both renderings still agree.
+        let hir = canonical_spec_key("demo::<Calc as core::ops::Add>::add", "demo");
+        let name = canonical_spec_key("<demo::Calc as core::ops::Add>::add", "demo");
+        assert_eq!(hir, name);
+        assert_eq!(hir, "<Calc as core::ops::Add>::add");
+    }
+    #[test]
+    fn free_inherent_and_trait_default_unchanged_and_matching() {
+        // Free fns, inherent methods, and trait DEFAULT methods already matched
+        // between the two renderings; canonicalization keeps them matching.
+        assert_eq!(canonical_spec_key("demo::free_fn", "demo"), "free_fn");
+        assert_eq!(canonical_spec_key("demo::Calc::inherent", "demo"), "Calc::inherent");
+        assert_eq!(canonical_spec_key("demo::Doubler::dfl", "demo"), "Doubler::dfl");
+    }
+    #[test]
+    fn does_not_overstrip_module_named_like_crate() {
+        // `demo::demo::foo` (a module named like the crate) must NOT collapse to
+        // the same key as `demo::foo` — strip_prefix removes ONE leading
+        // occurrence only. A collision here could mis-bind a spec.
+        assert_ne!(
+            canonical_spec_key("demo::demo::foo", "demo"),
+            canonical_spec_key("demo::foo", "demo"),
+        );
+        assert_eq!(canonical_spec_key("demo::demo::foo", "demo"), "demo::foo");
+    }
+}
 #[cfg(test)]
 mod exit_code_tests {
     use super::decide_pitbull_exit_code;
+    // Args: (rustc_exit, violations, undischarged, unverified_callees,
+    //        coverage_gaps, fail_on_coverage_gaps, bridge_failed).
     // Args: (rustc_exit, violations, undischarged, unverified_callees,
     //        coverage_gaps, fail_on_coverage_gaps, bridge_failed).
     #[test]
@@ -270,7 +345,9 @@ fn main() {
         // configured covers no code, so a clean verdict attests to nothing.
         // Folded here (rather than into `violations`) so the existing
         // `fail_on_coverage_gaps` opt-out governs it uniformly.
-        callbacks.coverage_gap_notes + callbacks.unmatched_root_patterns,
+        callbacks.coverage_gap_notes
+            + callbacks.unmatched_root_patterns
+            + callbacks.unmatched_ensures_keys,
         callbacks.fail_on_coverage_gaps,
         callbacks.bridge_failed,
     ));
@@ -329,6 +406,14 @@ struct PitbullCallbacks {
     /// the whole class, independent of the specific rendering bug fixed
     /// alongside it.
     unmatched_root_patterns: usize,
+    /// Count of `#[pitbull::ensures]` keys that bound to NO walked function
+    /// (audit 2026-07-18). A dropped POSTCONDITION is a silently-unchecked spec
+    /// (unlike a dropped precondition, which is fail-safe), so it is folded into
+    /// the coverage-gap exit code — exit 0 must not mean "postcondition proven"
+    /// when the ensures never matched a verified body. The trait-impl /
+    /// trait-default binding fixes make the common renderings bind; this is the
+    /// fail-closed backstop for any that still don't.
+    unmatched_ensures_keys: usize,
 }
 #[cfg(rustc_public_real)]
 impl rustc_driver::Callbacks for PitbullCallbacks {
@@ -457,6 +542,12 @@ impl PitbullCallbacks {
             trusted: hir_trusted,
             ensures: hir_ensures,
         } = collect_hir_pre_pass(tcx, &cfg.subset.allowed_proc_macros);
+        // Local crate name, for `canonical_spec_key` (audit 2026-07-18): the
+        // ensures map is keyed canonically so a trait-impl method's def_path_str
+        // key matches the item-walk's `name()` lookup below.
+        let local_crate_name = tcx
+            .crate_name(rustc_hir::def_id::LOCAL_CRATE)
+            .to_string();
         // Deep audit 2026-07-09 (HIGH): register every precondition-carrying
         // function path (config keys ∪ attribute keys) with the visitor ONCE,
         // so each CALL to one records a CoverageGap — v0.2 has no call-site
@@ -652,8 +743,15 @@ impl PitbullCallbacks {
                     // commit's wrapper wiring). For now, only
                     // the attribute-side is wired; toml-side
                     // can land in a follow-up if needed.
+                    // Look up by the CANONICAL key (audit 2026-07-18) so a
+                    // trait-impl method binds its ensures — `item_path` here is
+                    // `name()`'s `<demo::Calc as demo::Doubler>::m`, the HIR
+                    // store key was def_path_str's `demo::<Calc as Doubler>::m`,
+                    // and `canonical_spec_key` reconciles the two. A no-op for
+                    // free fns / inherent / trait-default methods (already equal).
+                    let ensures_key = canonical_spec_key(&item_path, &local_crate_name);
                     let ensures = hir_ensures
-                        .get(&item_path)
+                        .get(&ensures_key)
                         .cloned()
                         .unwrap_or_default();
                     visitor.set_current_ensures(ensures);
@@ -826,6 +924,33 @@ impl PitbullCallbacks {
                  matched no verified function — its preconditions were NOT applied \
                  (check for a typo, or that the function is reached and not excluded).",
             );
+        }
+        // Fail closed on `#[pitbull::ensures]` keys that bound to NO walked
+        // function (audit 2026-07-18). A dropped POSTCONDITION is a
+        // silently-unchecked spec — the exact false discharge this session
+        // closed for trait-impl / trait-default methods. The canonicalization
+        // at the store + lookup makes the common renderings bind; this is the
+        // backstop: if an ensures key STILL matches no verified body (an exotic
+        // rendering, or a function narrowing left unwalked), treat it as a
+        // coverage gap so exit 0 cannot attest a postcondition that was never
+        // checked. `hir_ensures` keys and `walked` paths are compared in the
+        // SAME canonical space. Governed by `fail_on_coverage_gaps` (default
+        // true), so an intentional `verify_roots` narrowing can opt out.
+        let walked_canonical: std::collections::HashSet<String> = walked_fn_paths
+            .iter()
+            .map(|p| canonical_spec_key(p, &local_crate_name))
+            .collect();
+        for key in hir_ensures.keys() {
+            if !walked_canonical.contains(key) {
+                eprintln!(
+                    "pitbull-rustc: PB076: #[pitbull::ensures] on `{key}` bound to no \
+                     verified function — its postcondition was NOT checked. Treating as \
+                     a coverage gap (fail-closed): add the function to [reachability] \
+                     verify_roots (or leave it empty for full coverage), or remove the \
+                     ensures. Opt out with `verification.fail_on_coverage_gaps = false`.",
+                );
+                self.unmatched_ensures_keys += 1;
+            }
         }
         // Cross-crate reachability manifest. When `PITBULL_REACH_DIR` is
         // set (the `cargo pitbull check` subcommand sets it), write this
@@ -2093,6 +2218,57 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
     /// methods would double-fire (audit-cleanup post-Q.3 red-team
     /// finding M-RT-Q.2 / 2026-05-26).
     fn visit_nested_trait_item(&mut self, _id: rustc_hir::TraitItemId) {}
+    /// Extract `#[pitbull::requires/ensures/trusted]` from TRAIT items —
+    /// specifically trait DEFAULT methods, whose bodies ARE walked by the MIR
+    /// pass but whose attributes were never read (audit 2026-07-18: a
+    /// CONFIRMED false discharge — a false `#[pitbull::ensures]` on a trait
+    /// default method emitted no PB076 and exited 0, because no
+    /// `visit_trait_item` existed at all; the doc previously called this
+    /// "deferred, a smaller corner case").
+    ///
+    /// A trait item's `def_path_str` is `Trait::method` (no `<.. as ..>`), so —
+    /// unlike a trait-IMPL method — its key already matches the item-walk's
+    /// `name()`; canonicalization is a harmless no-op here. Required methods
+    /// (no body) are not walked, so their specs bind to nothing, but extracting
+    /// them is harmless and keeps the three attributes symmetric. Double-fire
+    /// is avoided the same way as `visit_impl_item`: the parent trait's walk is
+    /// blocked by the `visit_nested_trait_item` no-op above, and
+    /// `hir_visit_all_item_likes_in_crate` calls this directly exactly once.
+    fn visit_trait_item(&mut self, ti: &'tcx rustc_hir::TraitItem<'tcx>) {
+        if let rustc_hir::TraitItemKind::Fn(..) = ti.kind {
+            let pitbull = rustc_span::Symbol::intern("pitbull");
+            let requires = rustc_span::Symbol::intern("requires");
+            let trusted = rustc_span::Symbol::intern("trusted");
+            let ensures = rustc_span::Symbol::intern("ensures");
+            let attrs = self.tcx.hir_attrs(ti.hir_id());
+            let def_id = ti.owner_id.to_def_id();
+            let crate_name = self
+                .tcx
+                .crate_name(rustc_hir::def_id::LOCAL_CRATE)
+                .to_string();
+            let local_path = self.tcx.def_path_str(def_id);
+            let fn_path = format!("{crate_name}::{local_path}");
+            for attr in attrs {
+                if attr.path_matches(&[pitbull, requires]) {
+                    for s in self.extract_attr_strings(attr) {
+                        self.preconditions.entry(fn_path.clone()).or_default().push(s);
+                    }
+                } else if attr.path_matches(&[pitbull, ensures]) {
+                    for s in self.extract_attr_strings(attr) {
+                        self.ensures
+                            .entry(canonical_spec_key(&fn_path, &crate_name))
+                            .or_default()
+                            .push(s);
+                    }
+                } else if attr.path_matches(&[pitbull, trusted]) {
+                    self.trusted.insert(fn_path.clone());
+                }
+            }
+        }
+        // Recurse into the default-method body so PB001 unsafe-block detection
+        // fires (mirrors visit_impl_item's walk_impl_item).
+        rustc_hir::intravisit::walk_trait_item(self, ti);
+    }
     fn visit_impl_item(&mut self, ii: &'tcx rustc_hir::ImplItem<'tcx>) {
         if let rustc_hir::ImplItemKind::Fn(..) = ii.kind {
             let pitbull = rustc_span::Symbol::intern("pitbull");
@@ -2120,9 +2296,14 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
                     // postconditions. Same string-literal /
                     // expression-form extraction via the renamed
                     // `extract_attr_strings` helper.
+                    // Keyed by the CANONICAL form (audit 2026-07-18) so a
+                    // trait-impl method's `<Type as Trait>::m` def_path_str
+                    // rendering matches the item-walk's `name()` lookup — else
+                    // the ensures silently dropped (no PB076, exit 0 on a false
+                    // postcondition, a CONFIRMED false discharge).
                     for s in self.extract_attr_strings(attr) {
                         self.ensures
-                            .entry(fn_path.clone())
+                            .entry(canonical_spec_key(&fn_path, &crate_name))
                             .or_default()
                             .push(s);
                     }
@@ -2179,9 +2360,13 @@ impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for HirPreVisitor<'tcx> {
                 } else if attr.path_matches(&[pitbull, ensures]) {
                     // Q.4 (2026-05-26): mirror of requires for
                     // postconditions. Same extraction helper.
+                    // Canonical key (audit 2026-07-18) — see visit_impl_item.
+                    // A no-op for a free fn (`demo::f` → `demo::f` after the
+                    // lookup is likewise canonicalized), kept uniform so every
+                    // ensures store/lookup goes through the same key function.
                     for s in self.extract_attr_strings(attr) {
                         self.ensures
-                            .entry(fn_path.clone())
+                            .entry(canonical_spec_key(&fn_path, &crate_name))
                             .or_default()
                             .push(s);
                     }

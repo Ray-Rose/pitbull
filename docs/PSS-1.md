@@ -2336,6 +2336,48 @@ the std form and now also matches. No shadow type changes.
   panic (n = 8…5000), while a stateful one panics from n ≈ 50. The naive witness
   would have "proven" `sort` total and argued to un-evict it; both facts are
   pinned so the trap is an executable assertion.
+- ✅ **Trait-dispatch soundness pass** (2026-07-18). A fresh four-front
+  adversarial audit. Two fronts corroborated the core (proof core re-confirmed
+  polarity on both solvers; the visitor/allow-list front found no
+  trusted-but-panicking method and independently fingered the
+  `verify_roots`-narrowed reachability gate). The other two reproduced **three
+  confirmed false discharges end-to-end — all §7 residuals previously theorized
+  but never demonstrated or fixed.** Each was reproduced on the clean wrapper
+  before any fix. Tests **381 → 391**; both clippy lanes error-clean; full suite
+  green under `PITBULL_REQUIRE_E2E=1` with z3 4.16.0 + cvc5 1.3.4.
+  1. **Trait-method CALL escaped the #27 reachability gate under `verify_roots`
+     narrowing (CRITICAL).** A statically-dispatched `c.div2(a,b)` is referenced
+     by the bare trait path `demo::Div2::div2`, but the walkable impl item is
+     `<demo::Calc as demo::Div2>::div2` — `referenced ∩ universe` never matched,
+     so `fn caller(c){ c.div2(10,0) }` with impl body `a / b` unwalked exited 0
+     despite a reachable division-by-zero (walk-all correctly exits 1). Fixed by
+     augmenting the `walked`/`universe`/`trusted` sets (per-crate AND cross-crate
+     gates) with each impl path's `trait_method_form` (`<Type as Trait>::m` →
+     `Trait::m`) — trait-PRESERVING, distinct from the trait-DROPPING
+     `normalize_impl_path`. A walked impl clears the gate; an unwalked one is
+     flagged. Now symmetric with a regular callee under narrowing.
+  2. **`#[pitbull::ensures]` on a trait-IMPL method bound nothing (false
+     discharge).** The HIR pre-pass keys by `def_path_str`
+     (`demo::<Calc as Doubler>::m`); the item-walk looks up by `name()`
+     (`<demo::Calc as demo::Doubler>::m`) — they differ only for trait impls, so
+     a false `ensures("result < x")` on `fn m(x){ x }` emitted no PB076 and
+     exited 0. `requires`/`trusted` share the mismatch but fail SAFE; `ensures`
+     was fail-OPEN. Fixed with a trait-preserving `canonical_spec_key` on the
+     `ensures` map store + lookup (leaving `requires`/`trusted` raw, so the
+     `set_known_precondition_fns` call-site gate is untouched; an ensures-key
+     collision is fail-safe — extra obligations).
+  3. **`#[pitbull::ensures]` on a trait-DEFAULT method bound nothing (false
+     discharge).** No `visit_trait_item` extractor existed at all. Added one.
+  Plus a **fail-closed backstop**: an `ensures` key that binds to no walked
+  function is now a coverage gap (`unmatched_ensures_keys`, governed by
+  `fail_on_coverage_gaps`), so an exotic rendering or a narrowed-out fn fails
+  closed instead of silently attesting an unchecked postcondition. `requires`/
+  `trusted` binding on trait-IMPL methods stays deliberately unfixed (fail-safe;
+  canonicalizing risks the call-site gate — a tracked UX follow-up, not a
+  soundness gap). Pinned by +7 unit tests (`trait_method_form`,
+  `canonical_spec_key`, gate augmentation) + 3 e2e (`wrapper_ensures_on_trait_
+  impl_method_binds`, `..._trait_default_method_binds`,
+  `wrapper_trait_method_call_gated_under_verify_roots`).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is a
@@ -2358,7 +2400,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 366 passing, 0 warnings, clippy clean
+# Stable: 391 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

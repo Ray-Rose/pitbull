@@ -72,9 +72,14 @@ pub fn requires(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// identifier `result` binds to the returned value.
 ///
 /// v0.2 status: extracted by the HIR pre-pass and emitted as a PB076
-/// `EnsuresPostcondition` obligation, currently reported "pending" — the
-/// SMT body-effect encoder that discharges it lands in a follow-up. The
-/// `old(e)` form (value of `e` at function entry) is **planned, not yet
+/// `EnsuresPostcondition` obligation that DISCHARGES end-to-end under the SMT
+/// backend for the captured body shapes (Q.4a copy/constant, Q.4b wrapping
+/// `Add`/`Sub`/`Mul`, Q.4c `Div`/`Rem`, Q.4d shifts); other body effects stay
+/// "pending" (fail-closed, never falsely discharged). Binds on free fns,
+/// inherent-impl, trait-impl, AND trait-default methods (the trait-method
+/// binding landed 2026-07-18; before that an `ensures` on a trait-impl or
+/// trait-default method silently emitted no obligation — a false discharge).
+/// The `old(e)` form (value of `e` at function entry) is **planned, not yet
 /// implemented**: the v0.2 predicate grammar has no `old()` and a spec
 /// using it will not parse.
 #[proc_macro_attribute]

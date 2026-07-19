@@ -1084,6 +1084,213 @@ fn wrapper_proves_ensures_copy_arg_discharges() {
         "Q.4a: a fully-discharged ensures obligation should exit 0. Got {code:?}",
     );
 }
+/// CONFIRMED FALSE DISCHARGE regression pin (audit 2026-07-18): a false
+/// `#[pitbull::ensures]` on a TRAIT-IMPL method used to emit NO PB076 and exit
+/// 0 (the HIR pre-pass keyed the spec by `def_path_str`'s
+/// `demo::<Calc as Doubler>::m` while the item-walk looked it up by `name()`'s
+/// `<demo::Calc as demo::Doubler>::m` — the two never matched). After the
+/// canonical-key fix the spec BINDS: the false postcondition `result < x` on
+/// `fn m(x){ x }` is `sat`, so the wrapper reports `NOT DISCHARGED` and exits 1.
+/// Pairs with the TRUE control to prove binding both directions.
+#[test]
+fn wrapper_ensures_on_trait_impl_method_binds() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_ensures_on_trait_impl_method_binds: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-trait-ens-{}.toml", std::process::id()));
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    // FALSE postcondition on a trait-impl method — must be CAUGHT (sat), not
+    // silently dropped. The pre-fix bug was exit 0 with no PB076 line at all.
+    let mut false_rs = std::env::temp_dir();
+    false_rs.push(format!("pitbull-trait-ens-false-{}.rs", std::process::id()));
+    fs::write(
+        &false_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         pub struct Calc;\n\
+         pub trait Doubler { fn m(x: u32) -> u32; }\n\
+         impl Doubler for Calc {\n\
+             #[pitbull::ensures(\"result < x\")]\n\
+             fn m(x: u32) -> u32 { x }\n\
+         }\n",
+    )
+    .expect("write false probe");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &false_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&false_rs);
+    if no_solver_available(&stderr) {
+        let _ = fs::remove_file(&cfg_path);
+        eprintln!("wrapper_ensures_on_trait_impl_method_binds: SKIPPED (no solver)");
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("NOT DISCHARGED"),
+        "SOUNDNESS: a false `ensures` on a TRAIT-IMPL method must emit PB076 and \
+         be refuted (was a silent exit-0 false discharge). Got code {code:?}, \
+         stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "a refuted trait-impl ensures must exit 1; got {code:?}");
+    // TRUE control — the same trait-impl method with a holding postcondition
+    // must DISCHARGE (proves binding is real, not just always-fail).
+    let mut true_rs = std::env::temp_dir();
+    true_rs.push(format!("pitbull-trait-ens-true-{}.rs", std::process::id()));
+    fs::write(
+        &true_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         pub struct Calc;\n\
+         pub trait Doubler { fn m(x: u32) -> u32; }\n\
+         impl Doubler for Calc {\n\
+             #[pitbull::ensures(\"result == x\")]\n\
+             fn m(x: u32) -> u32 { x }\n\
+         }\n",
+    )
+    .expect("write true probe");
+    let (stderr_t, code_t) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &true_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&true_rs);
+    let _ = fs::remove_file(&cfg_path);
+    assert!(
+        stderr_t.contains("(PB076)") && stderr_t.contains("discharged (unsat")
+            && !stderr_t.contains("NOT DISCHARGED"),
+        "a TRUE trait-impl ensures must DISCHARGE. Got code {code_t:?}, stderr:\n{stderr_t}",
+    );
+    assert_eq!(code_t, Some(0), "a discharged trait-impl ensures must exit 0; got {code_t:?}");
+}
+/// CONFIRMED FALSE DISCHARGE regression pin (audit 2026-07-18): a false
+/// `#[pitbull::ensures]` on a trait DEFAULT method used to exit 0 with no PB076
+/// — there was no `visit_trait_item` extractor at all, so trait-item attributes
+/// were never read. After adding the extractor the default-method body binds
+/// its ensures and the false `result < x` is refuted (sat), exit 1.
+#[test]
+fn wrapper_ensures_on_trait_default_method_binds() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_ensures_on_trait_default_method_binds: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-tdflt-ens-{}.toml", std::process::id()));
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[verification]\nsolvers = [\"z3\"]\nsolver_agreement = 1\n",
+    )
+    .expect("write pitbull.toml");
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-tdflt-ens-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "#![feature(register_tool)]\n\
+         #![register_tool(pitbull)]\n\
+         \n\
+         pub trait Doubler {\n\
+             #[pitbull::ensures(\"result < x\")]\n\
+             fn dfl(x: u32) -> u32 { x }\n\
+         }\n",
+    )
+    .expect("write probe");
+    let (stderr, code) = run_one_corpus_file_preserving_attrs(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    let _ = fs::remove_file(&cfg_path);
+    if no_solver_available(&stderr) {
+        eprintln!("wrapper_ensures_on_trait_default_method_binds: SKIPPED (no solver)");
+        return;
+    }
+    assert!(
+        stderr.contains("(PB076)") && stderr.contains("NOT DISCHARGED"),
+        "SOUNDNESS: a false `ensures` on a trait DEFAULT method must emit PB076 and \
+         be refuted (was a silent exit-0 false discharge — no visit_trait_item). \
+         Got code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "a refuted trait-default ensures must exit 1; got {code:?}");
+}
+/// CONFIRMED FALSE DISCHARGE regression pin (audit 2026-07-18): under
+/// `verify_roots` narrowing, a statically-dispatched trait-method CALL is
+/// referenced by its bare trait path (`corpus_test::Div2::div2`) while the
+/// walkable impl item is `<corpus_test::Calc as corpus_test::Div2>::div2`. The
+/// #27 gate's `referenced ∩ universe` never matched the two, so an unproven
+/// trait-impl body reachable from a verified root exited 0. After augmenting
+/// the gate sets with the trait-method form, the gate flags it (fail-closed,
+/// exit 1). No solver needed — this is a reachability gate, not a discharge.
+#[test]
+fn wrapper_trait_method_call_gated_under_verify_roots() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_trait_method_call_gated_under_verify_roots: SKIPPED (no wrapper)");
+        return;
+    };
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!("pitbull-traitreach-{}.toml", std::process::id()));
+    fs::write(
+        &cfg_path,
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\
+         \n[reachability]\nverify_roots = [\"corpus_test::caller\"]\n",
+    )
+    .expect("write pitbull.toml");
+    let mut probe_rs = std::env::temp_dir();
+    probe_rs.push(format!("pitbull-traitreach-{}.rs", std::process::id()));
+    fs::write(
+        &probe_rs,
+        "pub struct Calc;\n\
+         pub trait Div2 { fn div2(&self, a: u32, b: u32) -> u32; }\n\
+         impl Div2 for Calc { fn div2(&self, a: u32, b: u32) -> u32 { a / b } }\n\
+         pub fn caller(c: &Calc) -> u32 { c.div2(10, 0) }\n",
+    )
+    .expect("write probe");
+    // No pitbull attributes here, so the default (attr-stripping) runner is fine.
+    let (stderr, code) = run_one_corpus_file_full(
+        &env,
+        &probe_rs,
+        &[("PITBULL_TOML", cfg_path.as_os_str())],
+    )
+    .expect("wrapper should spawn");
+    let _ = fs::remove_file(&probe_rs);
+    let _ = fs::remove_file(&cfg_path);
+    assert!(
+        stderr.contains("reachable from a verified root but was NOT verified"),
+        "SOUNDNESS: a trait-impl method reachable from a verified root but skipped \
+         by verify_roots narrowing must be flagged (was a silent exit-0 false \
+         discharge). Got code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "an unverified reachable trait-impl callee must fail closed (exit 1); got {code:?}",
+    );
+}
 /// Q.4a (2026-05-29) adversarial twin — FALSE postcondition does NOT
 /// discharge (sat). `#[pitbull::ensures("result < 5")] fn copy_arg(x) { x }`:
 /// `result == x` ∧ `not(result < 5)` is satisfiable (x = 5), so Z3

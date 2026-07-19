@@ -8,10 +8,11 @@ name: CI
 # Two jobs:
 #
 #   1. `stable` — runs the workspace's `cargo +stable test` on Linux.
-#      Pins the 61-test / 0-warning / 0-failure invariant established
-#      through Milestone 2 Tasks E–K. The corpus e2e tests
-#      gracefully skip without the nightly wrapper, so this job
-#      passes without nightly toolchain installation.
+#      Pins the workspace test-suite invariant (0-warning / 0-failure;
+#      see docs/HANDOFF.md §1 for the current test count, which moves
+#      every session). The corpus e2e tests gracefully skip without the
+#      nightly wrapper, so this job passes without nightly toolchain
+#      installation.
 #
 #   2. `nightly-e2e` — installs the pinned `nightly-2026-01-29`,
 #      builds the rustc-replacement wrapper with
