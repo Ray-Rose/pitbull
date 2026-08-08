@@ -72,13 +72,18 @@ strict_library_acceptance = true
 # Increment 2 (2026-08-07) it also proves the forwarding shape, where the
 # actual is one of the CALLER's own parameters and the caller's own
 # contract supplies the evidence: `fn caller(v: u32) { safe_div(10, v) }`
-# under `requires("v > 0")` on `caller` discharges too. A caller whose own
+# under `requires("v > 0")` on `caller` discharges too. As of Increment 3
+# (2026-08-08) it also proves a COMPUTED EXPRESSION over constants and/or
+# caller parameters, traced back through the caller's own straight-line
+# statements: `fn caller(v: u32) { let t = v + 1; safe_div(10, t) }` under
+# a caller contract bounding `v` discharges too. A caller whose own
 # preconditions are mutually contradictory does not get a free pass — the
 # same consistency guard that protects every other obligation kind refuses
-# the claim as vacuous rather than discharging it. Calls it cannot yet
-# encode — an arbitrary expression as the actual (`v + 1`), a raw-SMT-LIB
-# clause anywhere in either contract, a `usize` parameter — are reported as
-# a fail-closed coverage gap (also exit 1), never silently accepted.
+# the claim as vacuous rather than discharging it, for all three
+# increments alike. Calls it cannot yet encode — a value behind a branch,
+# a bitwise op, a raw-SMT-LIB clause anywhere in either contract, a
+# `usize` parameter — are reported as a fail-closed coverage gap (also
+# exit 1), never silently accepted.
 #
 # Example: prove `add_two(x: u32, y: u32) -> u32 { x + y }` safe by
 # constraining both inputs:

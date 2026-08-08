@@ -277,6 +277,17 @@ enum CallsiteBinding {
     /// goal reference lets a caller hypothesis on `__pb_caller_arg{idx}`
     /// actually constrain `b`.
     CallerArg(usize),
+    /// Pin the callee-parameter symbol to a CAPTURED EXPRESSION over
+    /// constants and/or caller-argument symbols (Increment 3, 2026-08-08,
+    /// `capture_call_arg_expr`) — e.g. `(bvadd __pb_caller_arg0
+    /// #x00000001)` for an actual written `v + 1`. `referenced_callers` is
+    /// every caller-argument index the expression mentions (by
+    /// construction of `capture_call_arg_expr`, always of exactly this
+    /// binding's own `ty_name` — the whole expression is captured at one
+    /// uniform target type), so their declarations — and, if a caller
+    /// precondition exists for them, their hypotheses — get folded in
+    /// exactly like a direct `CallerArg` link.
+    Expr { smt: String, referenced_callers: Vec<usize> },
 }
 impl<'cfg> SubsetVisitor<'cfg> {
     /// Construct a fresh visitor from project config.
@@ -522,11 +533,21 @@ impl<'cfg> SubsetVisitor<'cfg> {
             self.clear_per_body_state();
             return;
         }
-        for block in &body.blocks {
+        for (block_idx, block) in body.blocks.iter().enumerate() {
             for stmt in &block.statements {
                 self.visit_statement(stmt);
             }
-            self.visit_terminator(&block.terminator);
+            // Threaded through to `visit_call` (Increment 3, 2026-08-08):
+            // the FULL block list plus this block's own index, so a call
+            // can trace an actual's value back through however many
+            // straight-line (`Goto`/`Assert`-chained) predecessor blocks
+            // precede it — real MIR routinely splits a one-line `let t =
+            // v + 1;` across a block boundary for the overflow-check
+            // `Assert`, so "this block's own statements" alone is NOT
+            // enough (confirmed empirically before writing this: it
+            // gapped `v + 1` on the real wrapper). See
+            // `capture_call_arg_expr`.
+            self.visit_terminator(&block.terminator, &body.blocks, block_idx as u32);
         }
         // M-1 (2026-05-26): a body with `#[pitbull::ensures]` but
         // NO `TerminatorKind::Return` (diverges — infinite loop,
@@ -688,7 +709,12 @@ impl<'cfg> SubsetVisitor<'cfg> {
     // -------------------------------------------------------------------------
     // Terminator dispatch — exhaustive over all 15 TerminatorKind variants.
     // -------------------------------------------------------------------------
-    fn visit_terminator(&mut self, term: &Terminator) {
+    fn visit_terminator(
+        &mut self,
+        term: &Terminator,
+        all_blocks: &[crate::mir_api::BasicBlockData],
+        block_idx: u32,
+    ) {
         match &term.kind {
             // Plain control flow. No checks.
             TerminatorKind::Goto { .. } => {}
@@ -743,7 +769,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
             }
             // Function call. The interesting dispatch site.
             TerminatorKind::Call { func, args, destination, .. } => {
-                self.visit_call(func, args, destination, term.span);
+                self.visit_call(func, args, destination, term.span, all_blocks, block_idx);
             }
             // PB045: TailCall (the `become` keyword).
             TerminatorKind::TailCall { .. } => {
@@ -808,7 +834,15 @@ impl<'cfg> SubsetVisitor<'cfg> {
     // -------------------------------------------------------------------------
     // Call dispatch: the most decision-heavy site in the visitor.
     // -------------------------------------------------------------------------
-    fn visit_call(&mut self, func: &Operand, args: &[Operand], dest: &Place, span: Span) {
+    fn visit_call(
+        &mut self,
+        func: &Operand,
+        args: &[Operand],
+        dest: &Place,
+        span: Span,
+        all_blocks: &[crate::mir_api::BasicBlockData],
+        block_idx: u32,
+    ) {
         // First: visit the callee operand. If it's a constant FnDef we can
         // pattern-match on the path; if it's a function pointer or closure,
         // separate rules fire.
@@ -823,7 +857,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 // preconditions is a coverage gap until call-site discharge
                 // exists — the callee was verified ASSUMING them; nothing
                 // proves this call satisfies them.
-                self.maybe_gap_callsite_preconditions(c, args, span);
+                self.maybe_gap_callsite_preconditions(c, args, span, all_blocks, block_idx);
             }
             Operand::Copy(p) | Operand::Move(p) => {
                 // Calling through a local of `fn` type: PB032 (function
@@ -900,6 +934,8 @@ impl<'cfg> SubsetVisitor<'cfg> {
         c: &ConstOperand,
         args: &[Operand],
         span: Span,
+        all_blocks: &[crate::mir_api::BasicBlockData],
+        block_idx: u32,
     ) {
         let Some(p) = self.path_of_const(c) else {
             return;
@@ -914,7 +950,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // the obligation undischarged, which the wrapper folds into the
         // exit code exactly as the gap did.
         if let Some((discharge, consistency, notes)) =
-            self.build_callsite_precondition_smt(&p, args)
+            self.build_callsite_precondition_smt(&p, args, all_blocks, block_idx)
         {
             let seq = self.vc_obligations.len();
             self.vc_obligations.push(crate::vc::VcObligation {
@@ -1021,6 +1057,8 @@ impl<'cfg> SubsetVisitor<'cfg> {
         &self,
         callee_path: &str,
         args: &[Operand],
+        all_blocks: &[crate::mir_api::BasicBlockData],
+        block_idx: u32,
     ) -> Option<(String, Option<String>, Vec<String>)> {
         let spec = self.callee_specs.get(callee_path)?;
         if spec.preconditions.is_empty() {
@@ -1032,7 +1070,9 @@ impl<'cfg> SubsetVisitor<'cfg> {
         let mut bound: Vec<(String, String, CallsiteBinding)> = Vec::new();
         let mut terms: Vec<String> = Vec::new();
         for raw in &spec.preconditions {
-            let term = self.callsite_precondition_term(raw, spec, args, &mut bound)?;
+            let term = self.callsite_precondition_term(
+                raw, spec, args, all_blocks, block_idx, &mut bound,
+            )?;
             terms.push(term);
         }
         // Unreachable given the non-empty check above (every clause either
@@ -1064,6 +1104,20 @@ impl<'cfg> SubsetVisitor<'cfg> {
                         "(assert (= {name} {}))\n",
                         Self::caller_arg_symbol(*idx)
                     ));
+                }
+                // Increment 3 (2026-08-08): the actual is a captured
+                // EXPRESSION over constants and/or caller-argument symbols
+                // (`v + 1`), built by `capture_call_arg_expr`. Every
+                // caller-argument symbol it references must ALSO be
+                // declared, exactly like a direct `CallerArg` link — a
+                // `referenced_callers` entry we didn't declare would leave
+                // the solver an undeclared symbol (a hard error, not a
+                // soundness risk, but a real functional bug).
+                CallsiteBinding::Expr { smt, referenced_callers } => {
+                    for idx in referenced_callers {
+                        caller_syms.entry(*idx).or_insert_with(|| ty_name.clone());
+                    }
+                    pins.push_str(&format!("(assert (= {name} {smt}))\n"));
                 }
             }
         }
@@ -1144,14 +1198,18 @@ impl<'cfg> SubsetVisitor<'cfg> {
         raw: &str,
         spec: &CalleeSpec,
         args: &[Operand],
+        all_blocks: &[crate::mir_api::BasicBlockData],
+        block_idx: u32,
         bound: &mut Vec<(String, String, CallsiteBinding)>,
     ) -> Option<String> {
         // Shape 1: `<ident> <cmp> <ident>` — both sides must be parameters
         // of the SAME primitive integer type, else the comparison would be
         // ill-sorted (or, worse, silently compare different widths).
         if let Ok(p) = crate::predicate::parse_ident_vs_ident_predicate(raw) {
-            let lhs = self.bind_callsite_param(&p.lhs, spec, args, bound)?;
-            let rhs = self.bind_callsite_param(&p.rhs, spec, args, bound)?;
+            let lhs =
+                self.bind_callsite_param(&p.lhs, spec, args, all_blocks, block_idx, bound)?;
+            let rhs =
+                self.bind_callsite_param(&p.rhs, spec, args, all_blocks, block_idx, bound)?;
             if lhs != rhs {
                 return None;
             }
@@ -1162,7 +1220,8 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // against the parameter's own type by `predicate_to_smt_assertion`,
         // so an out-of-range literal fails closed instead of wrapping.
         if let Ok(p) = crate::predicate::parse_predicate(raw) {
-            let ty_name = self.bind_callsite_param(&p.var, spec, args, bound)?;
+            let ty_name =
+                self.bind_callsite_param(&p.var, spec, args, all_blocks, block_idx, bound)?;
             let assertion =
                 crate::predicate::predicate_to_smt_assertion(&p, &p.var, &ty_name).ok()?;
             return strip_assert(&assertion);
@@ -1173,14 +1232,18 @@ impl<'cfg> SubsetVisitor<'cfg> {
     }
     /// Resolve one precondition ident to a callee parameter, verify the
     /// corresponding ACTUAL is either an extractable constant of the
-    /// parameter's own type (Increment 1) or a bare read of one of the
-    /// CALLER's own parameters of that same type (Increment 2), and record
+    /// parameter's own type (Increment 1), a bare read of one of the
+    /// CALLER's own parameters of that same type (Increment 2), or a
+    /// captured EXPRESSION over constants/caller-parameters built from the
+    /// current block's own preceding statements (Increment 3), and record
     /// the binding. Returns the parameter's primitive integer type name.
     fn bind_callsite_param(
         &self,
         ident: &str,
         spec: &CalleeSpec,
         args: &[Operand],
+        all_blocks: &[crate::mir_api::BasicBlockData],
+        block_idx: u32,
         bound: &mut Vec<(String, String, CallsiteBinding)>,
     ) -> Option<String> {
         if ident.is_empty() {
@@ -1213,22 +1276,215 @@ impl<'cfg> SubsetVisitor<'cfg> {
                 }
                 CallsiteBinding::Constant(k.value?)
             }
-            // Increment 2: the actual is a bare read of one of the CALLER's
-            // OWN parameters (a computed expression, a field/deref/index
-            // projection, or any non-argument local still declines — see
-            // `operand_as_caller_arg`). Its type must equal the callee
-            // parameter's declared type, exactly like the constant case,
-            // so the link this produces is well-sorted.
             Operand::Copy(_) | Operand::Move(_) => {
-                let (caller_idx, caller_ty) = self.operand_as_caller_arg(actual)?;
-                if caller_ty != ty_name {
-                    return None;
+                if let Some((caller_idx, caller_ty)) = self.operand_as_caller_arg(actual) {
+                    // Increment 2 (cheaper, and identical in spirit to the
+                    // constant case): a bare read of one of the CALLER's
+                    // OWN parameters. Its type must equal the callee
+                    // parameter's declared type, exactly like the constant
+                    // case, so the link this produces is well-sorted. A
+                    // mismatch here does NOT fall through to Increment 3 —
+                    // `capture_call_arg_expr` would reject the identical
+                    // operand for the identical reason, so there is
+                    // nothing to gain by retrying.
+                    if caller_ty != ty_name {
+                        return None;
+                    }
+                    CallsiteBinding::CallerArg(caller_idx)
+                } else {
+                    // Increment 3: not a bare caller-parameter read either,
+                    // so try tracing it back through this block's own
+                    // preceding statements as a captured EXPRESSION over
+                    // constants and/or caller parameters (`v + 1`).
+                    // `capture_call_arg_expr` already enforces
+                    // `ty_name`-uniform typing throughout, so no separate
+                    // type check is needed here (unlike the case above).
+                    let (smt, referenced_callers) = self.capture_call_arg_expr(
+                        actual, all_blocks, block_idx, &ty_name,
+                    )?;
+                    CallsiteBinding::Expr { smt, referenced_callers }
                 }
-                CallsiteBinding::CallerArg(caller_idx)
             }
         };
         bound.push((ident.to_string(), ty_name.clone(), binding));
         Some(ty_name)
+    }
+    /// Increment 3 (2026-08-08): trace `op` backward through
+    /// `block_statements` — the CALL's own basic block, and by MIR
+    /// construction (a call is always a block TERMINATOR, never a
+    /// mid-block statement) therefore EXACTLY the statements that ran
+    /// before it — to see whether it was assigned a capturable EXPRESSION
+    /// over constants and/or the CALLER's own parameters. `target_ty` is
+    /// the callee parameter's declared type; the whole expression is
+    /// captured uniformly at that one width, so a component of a different
+    /// type simply fails to resolve rather than silently truncating.
+    ///
+    /// Deliberately REUSES `capture_rvalue`/`capture_operand` — the exact
+    /// machinery `#[pitbull::ensures]` (Q.4a-Q.4d) already uses to capture
+    /// a function's return-typed effect — rather than a parallel
+    /// implementation: those two functions are generic over their target
+    /// type parameter (there is nothing return-slot-specific baked into
+    /// them, verified by reading them before writing this), so seeding
+    /// their `env` with CALLER PARAMETERS instead of `capture_body_effect`'s
+    /// return-typed-parameters-only seed, and stopping at this call instead
+    /// of at `Return`, is the only new logic this increment needed. Same
+    /// fail-closed posture inherited for free: a write through a
+    /// projection invalidates that local, an uncapturable rvalue (a cast,
+    /// a field read, a call result, anything but `Use`/same-type
+    /// arithmetic) drops it, and nothing here ever GUESSES.
+    ///
+    /// Scope, deliberately bounded like the two increments before it: only
+    /// a LINEAR chain from bb0 (`Goto`/`Assert`-success edges only, exactly
+    /// `capture_body_effect`'s own boundary) is walked. A value behind an
+    /// actual BRANCH (`SwitchInt`, or reached only via one arm of a match)
+    /// is NOT traced — guessing which arm ran is precisely the kind of
+    /// unfounded assumption this codebase refuses to make. An uncapturable
+    /// operand keeps the pre-existing coverage gap, never a silent pass.
+    ///
+    /// Returns the captured SMT expression together with every CALLER
+    /// parameter index it references (via `referenced_caller_arg_indices`),
+    /// so the caller can declare them and fold in whatever the caller's own
+    /// preconditions establish about them — exactly like a direct
+    /// `CallerArg` link.
+    fn capture_call_arg_expr(
+        &self,
+        op: &Operand,
+        all_blocks: &[crate::mir_api::BasicBlockData],
+        call_block_idx: u32,
+        target_ty: &str,
+    ) -> Option<(String, Vec<usize>)> {
+        use crate::mir_api::{StatementKind, TerminatorKind};
+        // Seed EVERY caller parameter (regardless of its own type) with its
+        // canonical symbol. `capture_operand`'s own type check — it
+        // compares the OPERAND's declared type against `target_ty` BEFORE
+        // ever consulting this map — is what excludes a wrong-typed
+        // parameter, so seeding all of them here is safe: a `u8` caller
+        // parameter can never leak into a `u32`-target expression, because
+        // `capture_operand` rejects the READ of it, never reaching the map.
+        let mut env: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        for (i, name) in self.current_body_arg_names.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            // Matches `capture_body_effect`'s identical seeding cast.
+            env.insert((i as u32) + 1, Self::caller_arg_symbol(i));
+        }
+        // `checked` mirrors `capture_body_effect`'s identical map: real MIR
+        // lowers `v + 1` to `AddWithOverflow(v, 1)` — a `(u32, bool)` TUPLE —
+        // in ONE block, with a SEPARATE statement `_2 = move (_3.0)` in the
+        // successor reading the sum back out (verified by dumping real MIR
+        // for exactly this shape via `rustc -Z unpretty=mir` before writing
+        // this fix; the first draft, which only wrote to `env`, gapped
+        // every checked arithmetic expression — i.e. essentially all of
+        // them, since overflow checks are the common case). The shadow
+        // adapter collapses `CheckedBinaryOp` to a plain `BinaryOp` (see
+        // `mir_api/adapter.rs`), so `capture_rvalue` captures `_3`'s value
+        // exactly like an unchecked add; recording it under BOTH `env`
+        // (whole-local reads) and `checked` (`.0`-of-tuple reads) means
+        // whichever shape the NEXT statement uses to read it resolves.
+        let mut checked: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        // Walk the LINEAR block chain from bb0, following `Goto` /
+        // `Assert`-success — the SAME traversal `capture_body_effect` uses
+        // for `#[pitbull::ensures]`, verified necessary empirically before
+        // writing this: real MIR routinely splits a one-line `let t = v +
+        // 1;` across a block boundary for the overflow-check `Assert`, so
+        // walking only the call's own block (this function's first draft)
+        // gapped it. A revisited block is a back-edge (loop) — fail closed,
+        // same as `capture_body_effect`. Stops at `call_block_idx` itself
+        // (processing ITS statements too, then stopping BEFORE following
+        // its terminator further — we want the env as of the call, not
+        // wherever the call's own terminator would lead).
+        let mut current: u32 = 0;
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return None; // back-edge / loop — uncapturable
+            }
+            let block = all_blocks.get(current as usize)?;
+            for stmt in &block.statements {
+                let StatementKind::Assign(place, rvalue) = &stmt.kind else {
+                    continue;
+                };
+                if !place.projection.is_empty() {
+                    // Write through a projection invalidates the base
+                    // local's captured value in BOTH maps (fail closed) —
+                    // mirrors `capture_body_effect`'s identical guard.
+                    env.remove(&place.local.0);
+                    checked.remove(&place.local.0);
+                    continue;
+                }
+                match self.capture_rvalue(rvalue, &env, &checked, target_ty) {
+                    Some(e) => {
+                        env.insert(place.local.0, e.clone());
+                        checked.insert(place.local.0, e);
+                    }
+                    None => {
+                        env.remove(&place.local.0);
+                        checked.remove(&place.local.0);
+                    }
+                }
+            }
+            if current == call_block_idx {
+                break;
+            }
+            match &block.terminator.kind {
+                TerminatorKind::Goto { target } => current = target.0,
+                TerminatorKind::Assert { target, .. } => current = target.0,
+                // Branches, calls (a DIFFERENT call than the one we're
+                // resolving — this function only reaches one), drops, tail
+                // calls, yields, unreachable, unwinds, inline asm — none of
+                // these precede `call_block_idx` on a straight-line path,
+                // so reaching one first means the true path is NOT linear.
+                // Fail closed; never guess which branch executes.
+                _ => return None,
+            }
+        }
+        // Resolve `op` itself against the fully-built env. Only a BARE
+        // (unprojected) local read is an entry point — the same
+        // conservative posture as `operand_as_caller_arg`'s Increment 2
+        // case, and for the same reason: a projection needs data-flow
+        // analysis this visitor does not do.
+        let (Operand::Copy(p) | Operand::Move(p)) = op else {
+            return None;
+        };
+        if !p.projection.is_empty() {
+            return None;
+        }
+        if self.operand_primitive_int_name(op).as_deref() != Some(target_ty) {
+            return None;
+        }
+        let smt = env.get(&p.local.0)?.clone();
+        let referenced_callers = Self::referenced_caller_arg_indices(&smt);
+        Some((smt, referenced_callers))
+    }
+    /// Extract every distinct caller-argument index a captured SMT
+    /// expression references, by scanning for the canonical
+    /// `__pb_caller_arg{idx}` symbol (`caller_arg_symbol`). Sound because
+    /// that exact substring is SYNTHETIC — `caller_arg_symbol` is its only
+    /// producer anywhere in this codebase, so it cannot appear in a
+    /// captured expression for any reason other than a genuine reference
+    /// (unlike scanning for a user-chosen identifier, which could collide
+    /// with unrelated text). A structural (non-string-scanning) alternative
+    /// would mean threading a dependency set through `capture_rvalue`/
+    /// `capture_operand` — shared code `#[pitbull::ensures]` also depends
+    /// on — so this stays a self-contained post-pass instead.
+    fn referenced_caller_arg_indices(smt: &str) -> Vec<usize> {
+        const MARKER: &str = "__pb_caller_arg";
+        let mut found = Vec::new();
+        let mut rest = smt;
+        while let Some(pos) = rest.find(MARKER) {
+            let digits_start = &rest[pos + MARKER.len()..];
+            let digit_len = digits_start.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits_start.len());
+            if digit_len > 0 {
+                if let Ok(idx) = digits_start[..digit_len].parse::<usize>() {
+                    if !found.contains(&idx) {
+                        found.push(idx);
+                    }
+                }
+            }
+            rest = &digits_start[digit_len..];
+        }
+        found
     }
     /// Canonical, collision-proof SMT symbol for the CALLER's own parameter
     /// at index `idx` (Increment 2). Never derived from user-chosen
@@ -8935,5 +9191,320 @@ mod tests {
         assert!(smt.contains("(assert (= a __pb_caller_arg0))"), "smt:\n{smt}");
         assert!(smt.contains("(assert (= b __pb_caller_arg0))"), "smt:\n{smt}");
         assert!(!gapped);
+    }
+    // === PB077 Increment 3: arbitrary expression actuals (2026-08-08) ===
+    //
+    // `capture_call_arg_expr` deliberately reuses `capture_rvalue`/
+    // `capture_operand` verbatim (the same machinery `#[pitbull::ensures]`
+    // already uses and already has extensive coverage for), so these tests
+    // focus on what's actually NEW: seeding with caller-argument symbols,
+    // stopping at the call instead of at `Return`, the same-BLOCK-only
+    // boundary, and folding captured caller-arg references into
+    // declarations/hypotheses exactly like a direct Increment 2 link.
+    #[test]
+    fn referenced_caller_arg_indices_finds_every_distinct_index() {
+        assert_eq!(
+            SubsetVisitor::referenced_caller_arg_indices(
+                "(bvadd __pb_caller_arg0 __pb_caller_arg12)"
+            ),
+            vec![0, 12],
+        );
+        assert_eq!(
+            SubsetVisitor::referenced_caller_arg_indices(
+                "(bvadd __pb_caller_arg3 __pb_caller_arg3)"
+            ),
+            vec![3],
+            "a repeated reference must be deduplicated",
+        );
+        assert_eq!(
+            SubsetVisitor::referenced_caller_arg_indices("(bvadd b #x00000001)"),
+            Vec::<usize>::new(),
+            "no marker present",
+        );
+        assert_eq!(
+            SubsetVisitor::referenced_caller_arg_indices(""),
+            Vec::<usize>::new(),
+        );
+    }
+    /// A single-statement caller body: `local[params.len()+1] = lhs <op>
+    /// rhs;` followed by a call to `path` with `call_args`. Sequential
+    /// helper `pb077_body_multi_stmt` below generalizes to a CHAIN.
+    fn pb077_body_with_stmts(
+        caller_params: &[(&str, Ty)],
+        stmts: &[(Ty, crate::mir_api::BinOp, Operand, Operand)],
+        path: &str,
+        call_args: Vec<Operand>,
+    ) -> Body {
+        use crate::mir_api::*;
+        let bool_ty = Ty { kind: TyKind::RigidTy(RigidTy::Bool) };
+        let local =
+            |ty: Ty| LocalDecl { ty, span: Span::default(), mutability: Mutability::Not };
+        let mut locals = vec![local(bool_ty.clone())];
+        locals.extend(caller_params.iter().map(|(_, ty)| local(ty.clone())));
+        for (ty, ..) in stmts {
+            locals.push(local(ty.clone()));
+        }
+        let base = caller_params.len() as u32 + 1;
+        let statements: Vec<Statement> = stmts
+            .iter()
+            .enumerate()
+            .map(|(i, (_, op, lhs, rhs))| Statement {
+                kind: StatementKind::Assign(
+                    Place { local: Local(base + i as u32), projection: vec![] },
+                    Rvalue::BinaryOp(*op, lhs.clone(), rhs.clone()),
+                ),
+                span: Span::default(),
+            })
+            .collect();
+        Body {
+            def_id: DefId(0),
+            arg_tys: caller_params.iter().map(|(_, ty)| ty.clone()).collect(),
+            arg_names: caller_params.iter().map(|(n, _)| (*n).to_string()).collect(),
+            return_ty: bool_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals,
+            blocks: vec![BasicBlockData {
+                statements,
+                terminator: Terminator {
+                    kind: TerminatorKind::Call {
+                        func: Operand::Constant(ConstOperand {
+                            ty: bool_ty,
+                            def_id: None,
+                            path: Some(path.to_string()),
+                            value: None,
+                        }),
+                        args: call_args,
+                        destination: Place { local: Local(0), projection: vec![] },
+                        target: None,
+                    },
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        }
+    }
+    fn op_param(idx: u32) -> Operand {
+        Operand::Copy(Place { local: Local(idx + 1), projection: vec![] })
+    }
+    fn op_local(idx: u32) -> Operand {
+        Operand::Copy(Place { local: Local(idx), projection: vec![] })
+    }
+    fn op_const_u32(v: i128) -> Operand {
+        Operand::Constant(ConstOperand { ty: pb077_u32(), def_id: None, path: None, value: Some(v) })
+    }
+    #[test]
+    fn pb077_expr_single_hop_captures_and_links_caller_hypothesis() {
+        // `let t = v + 1; safe_div(10, t)` under caller `requires("v >= 5")`
+        // and callee `requires("b > 0")`. `t` is not a bare caller-param
+        // read (Increment 2), so this exercises Increment 3's capture path.
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_body_with_stmts(
+            &[("v", pb077_u32())],
+            &[(pb077_u32(), crate::mir_api::BinOp::Add, op_param(0), op_const_u32(1))],
+            "demo::callee",
+            vec![op_local(2)],
+        );
+        let (discharge, consistency, gapped) = pb077_run_2(&cfg, spec, &["v >= 5"], &body);
+        let smt = discharge.expect("a same-block captured expression must not gap");
+        assert!(
+            smt.contains("(declare-const __pb_caller_arg0 (_ BitVec 32))"),
+            "smt:\n{smt}",
+        );
+        assert!(
+            smt.contains("(assert (= b (bvadd __pb_caller_arg0 #x00000001)))"),
+            "the captured expression must be linked verbatim:\n{smt}",
+        );
+        assert!(
+            smt.contains("(assert (bvuge __pb_caller_arg0 #x00000005))"),
+            "the caller's own hypothesis must still be folded in:\n{smt}",
+        );
+        let cs = consistency.expect("an Expr binding must carry the F1 guard");
+        assert!(cs.contains("(bvuge __pb_caller_arg0 #x00000005)"), "cs:\n{cs}");
+        assert!(!gapped);
+    }
+    #[test]
+    fn pb077_expr_chained_statements_captures_through_both() {
+        // `let a = v + 1; let b2 = a * 2; safe_div(10, b2)` — TWO
+        // statements, the second reading the first's result. Proves the
+        // capture walk accumulates across statements rather than only
+        // looking at the single statement immediately before the call.
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_body_with_stmts(
+            &[("v", pb077_u32())],
+            &[
+                (pb077_u32(), crate::mir_api::BinOp::Add, op_param(0), op_const_u32(1)),
+                (pb077_u32(), crate::mir_api::BinOp::Mul, op_local(2), op_const_u32(2)),
+            ],
+            "demo::callee",
+            vec![op_local(3)],
+        );
+        let (discharge, _consistency, gapped) = pb077_run_2(&cfg, spec, &["v >= 0"], &body);
+        let smt = discharge.expect("a chained same-block capture must not gap");
+        assert!(
+            smt.contains(
+                "(assert (= b (bvmul (bvadd __pb_caller_arg0 #x00000001) #x00000002)))"
+            ),
+            "smt:\n{smt}",
+        );
+        assert!(!gapped);
+    }
+    #[test]
+    fn pb077_expr_two_caller_params_both_referenced_and_declared() {
+        // `safe_div(v + w, 1)`-shaped: `a` (callee's first param, unrelated
+        // to this contract) aside, the referenced-callee clause binds on
+        // BOTH `v` and `w` via one captured expression — both indices must
+        // be declared, and a precondition on EITHER must fold in.
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_body_with_stmts(
+            &[("v", pb077_u32()), ("w", pb077_u32())],
+            &[(pb077_u32(), crate::mir_api::BinOp::Add, op_param(0), op_param(1))],
+            "demo::callee",
+            vec![op_local(3)],
+        );
+        let (discharge, _consistency, gapped) =
+            pb077_run_2(&cfg, spec, &["v > 0", "w > 0"], &body);
+        let smt = discharge.expect("smt");
+        assert!(smt.contains("(declare-const __pb_caller_arg0"), "smt:\n{smt}");
+        assert!(smt.contains("(declare-const __pb_caller_arg1"), "smt:\n{smt}");
+        assert!(smt.contains("(assert (bvugt __pb_caller_arg0 #x00000000))"), "smt:\n{smt}");
+        assert!(smt.contains("(assert (bvugt __pb_caller_arg1 #x00000000))"), "smt:\n{smt}");
+        assert!(!gapped);
+    }
+    #[test]
+    fn pb077_expr_value_from_a_predecessor_block_via_goto_is_captured() {
+        // The SAME `v + 1` computation as the single-hop test above, but
+        // assigned in a PREDECESSOR block reached via `Goto` rather than
+        // the call's own block — exactly the shape real MIR produces for a
+        // one-line `let t = v + 1;` (the overflow-check `Assert` — or here,
+        // for simplicity, a plain `Goto` — splits it from the call).
+        // Verified necessary empirically before writing this redesign: the
+        // FIRST draft of `capture_call_arg_expr` only walked the call's own
+        // block and gapped this exact shape on the real wrapper. It must
+        // now capture, mirroring `capture_body_effect`'s identical
+        // Goto/Assert-following traversal for `#[pitbull::ensures]`.
+        use crate::mir_api::*;
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_two_block_body(
+            "v",
+            pb077_u32(),
+            BinOp::Add,
+            op_param(0),
+            op_const_u32(1),
+            TerminatorKind::Goto { target: BasicBlock(1) },
+            vec![op_local(2)],
+        );
+        let (discharge, _consistency, gapped) = pb077_run_2(&cfg, spec, &["v >= 5"], &body);
+        let smt = discharge.expect("a Goto-chained predecessor value must be captured");
+        assert!(
+            smt.contains("(assert (= b (bvadd __pb_caller_arg0 #x00000001)))"),
+            "smt:\n{smt}",
+        );
+        assert!(!gapped);
+    }
+    #[test]
+    fn pb077_expr_value_behind_a_branch_is_not_captured() {
+        // The IDENTICAL `v + 1` computation, but the predecessor block's
+        // terminator is a BRANCH (`SwitchInt`) rather than `Goto`/`Assert`.
+        // `capture_body_effect` (the `#[ensures]` sibling this reuses)
+        // draws the identical line: only a LINEAR straight-line chain is
+        // followed, never a branch — guessing which arm executes would be
+        // exactly the kind of unfounded assumption this codebase refuses
+        // to make. Must fall back to the coverage gap.
+        use crate::mir_api::*;
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_two_block_body(
+            "v",
+            pb077_u32(),
+            BinOp::Add,
+            op_param(0),
+            op_const_u32(1),
+            TerminatorKind::SwitchInt { discr: op_const_u32(0), targets: vec![BasicBlock(1)] },
+            vec![op_local(2)],
+        );
+        let (discharge, _consistency, gapped) = pb077_run_2(&cfg, spec, &["v >= 0"], &body);
+        assert!(discharge.is_none(), "a value behind a branch must not be captured");
+        assert!(gapped);
+    }
+    /// A two-block caller body: block 0 assigns `local(2) = lhs <op> rhs`
+    /// then ends with `pred_terminator` (typically `Goto`/`Assert` to
+    /// reach block 1, or a branch to test the boundary); block 1 calls
+    /// `demo::callee` with `call_args`.
+    fn pb077_two_block_body(
+        param_name: &str,
+        param_ty: Ty,
+        op: crate::mir_api::BinOp,
+        lhs: Operand,
+        rhs: Operand,
+        pred_terminator: crate::mir_api::TerminatorKind,
+        call_args: Vec<Operand>,
+    ) -> Body {
+        use crate::mir_api::*;
+        let bool_ty = Ty { kind: TyKind::RigidTy(RigidTy::Bool) };
+        let local =
+            |ty: Ty| LocalDecl { ty, span: Span::default(), mutability: Mutability::Not };
+        Body {
+            def_id: DefId(0),
+            arg_tys: vec![param_ty.clone()],
+            arg_names: vec![param_name.to_string()],
+            return_ty: bool_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![local(bool_ty.clone()), local(param_ty.clone()), local(param_ty)],
+            blocks: vec![
+                BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(2), projection: vec![] },
+                            Rvalue::BinaryOp(op, lhs, rhs),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator { kind: pred_terminator, span: Span::default() },
+                },
+                BasicBlockData {
+                    statements: vec![],
+                    terminator: Terminator {
+                        kind: TerminatorKind::Call {
+                            func: Operand::Constant(ConstOperand {
+                                ty: bool_ty,
+                                def_id: None,
+                                path: Some("demo::callee".to_string()),
+                                value: None,
+                            }),
+                            args: call_args,
+                            destination: Place { local: Local(0), projection: vec![] },
+                            target: None,
+                        },
+                        span: Span::default(),
+                    },
+                },
+            ],
+            span: Span::default(),
+        }
+    }
+    #[test]
+    fn pb077_expr_referenced_caller_contradictory_precondition_reaches_consistency_check() {
+        // Same cardinal case as Increment 2's equivalent test, reached via
+        // an Expr binding instead of a direct CallerArg link: the F1 guard
+        // must still see both contradictory hypotheses.
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_body_with_stmts(
+            &[("v", pb077_u32())],
+            &[(pb077_u32(), crate::mir_api::BinOp::Add, op_param(0), op_const_u32(1))],
+            "demo::callee",
+            vec![op_local(2)],
+        );
+        let (_discharge, consistency, _gapped) =
+            pb077_run_2(&cfg, spec, &["v > 10", "v < 5"], &body);
+        let cs = consistency.expect("an Expr binding must carry the F1 guard");
+        assert!(cs.contains("(assert (bvugt __pb_caller_arg0 #x0000000A))"), "cs:\n{cs}");
+        assert!(cs.contains("(assert (bvult __pb_caller_arg0 #x00000005))"), "cs:\n{cs}");
     }
 }

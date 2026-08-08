@@ -4238,13 +4238,15 @@ fn wrapper_callsite_precondition_falls_back_to_the_gap() {
             &["b > 0", "(assert (bvugt a #x00000063))"],
         ),
         (
-            "arbitrary expression actual",
-            // `v + 1` is a COMPUTED operand, not a bare read of `fwd`'s own
-            // parameter — `operand_as_caller_arg` requires an unprojected
-            // Copy/Move of an argument local, which this MIR never
-            // produces (the addition lowers to its own temp). Increment 3's
-            // scope, not Increment 2's.
-            "pub fn fwd(v: u32) -> u32 { safe_div(10, v + 1) }\n",
+            "bitwise expression actual",
+            // `v & 1` IS a computed same-block expression over a caller
+            // parameter (Increment 3's general shape), but `capture_rvalue`
+            // only handles `Add`/`Sub`/`Mul`/`Div`/`Rem`/`Shl`/`Shr` —
+            // bitwise ops stay deferred (the same boundary the
+            // `#[pitbull::ensures]` encoder this is shared with already
+            // documents), so it must still fall back to the gap rather
+            // than silently drop the operation.
+            "pub fn fwd(v: u32) -> u32 { safe_div(10, v & 1) }\n",
             &["b > 0"],
         ),
     ];
@@ -4485,4 +4487,244 @@ fn wrapper_callsite_precondition_via_caller_parameter_respects_self_offset() {
          code {code:?}, stderr:\n{stderr}",
     );
     assert_eq!(code, Some(1), "stderr:\n{stderr}");
+}
+
+// =============================================================================
+// PB077 — call-site precondition discharge, Increment 3 (2026-08-08):
+// arbitrary expression actuals
+// =============================================================================
+//
+// These pin the shapes red-teamed by hand before this suite existed (8
+// probes against the real wrapper, z3 4.16.0 + cvc5 1.3.4). The FIRST
+// design (walking only the call's own basic block) failed the very first
+// probe: real MIR lowers `let t = v + 1;` to `AddWithOverflow` (a `(u32,
+// bool)` tuple) in ONE block, with a `_2 = move (_3.0)` read in the
+// SUCCESSOR block reached via the overflow-check `Assert` -- so a
+// same-block-only capture gapped essentially every checked arithmetic
+// expression, which is the common case. Fixed by reusing
+// `capture_body_effect`'s exact Goto/Assert-chain traversal instead of a
+// bespoke same-block walk; every test below runs on the real wrapper,
+// which is what caught the gap the shadow-IR unit tests (hand-built,
+// bypassing real rustc lowering) could not.
+#[test]
+fn wrapper_proves_callsite_precondition_via_captured_expression() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_callsite_precondition_via_captured_expression: SKIPPED");
+        return;
+    };
+    // `let t = v + 1; safe_div(10, t)` under a caller contract that bounds
+    // `v` enough to establish BOTH `t`'s own overflow-freedom and the
+    // callee's `b > 0`.
+    let src = format!(
+        "{PB077_INC2_PRELUDE}{PB077_INC2_CALLEE}\
+         #[pitbull::requires(\"v >= 5\")]\n#[pitbull::requires(\"v < 1000\")]\n\
+         pub fn caller(v: u32) -> u32 {{ let t = v + 1; safe_div(10, t) }}\n"
+    );
+    let (stderr, code) = run_wrapper_on_source(&env, &src, &[]).expect("wrapper should spawn");
+    if discharge_env_unavailable(&stderr) {
+        eprintln!(
+            "wrapper_proves_callsite_precondition_via_captured_expression: SKIPPED \
+             (discharge env unavailable)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("PB077") && stderr.contains("discharged"),
+        "a captured same-function-chain expression whose caller contract \
+         establishes the callee's precondition must DISCHARGE; \
+         code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+}
+#[test]
+fn wrapper_refutes_callsite_precondition_via_insufficient_captured_expression() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "wrapper_refutes_callsite_precondition_via_insufficient_captured_expression: SKIPPED",
+        );
+        return;
+    };
+    // The callee needs `b > 100`; the caller's contract on `v` (`< 1000`)
+    // says nothing that forces `t = v + 1` above 100.
+    let src = format!(
+        "{PB077_INC2_PRELUDE}\
+         #[pitbull::requires(\"b > 100\")]\npub fn safe_div(a: u32, b: u32) -> u32 {{ a / b }}\n\
+         #[pitbull::requires(\"v < 1000\")]\n\
+         pub fn oops(v: u32) -> u32 {{ let t = v + 1; safe_div(10, t) }}\n"
+    );
+    let (stderr, code) = run_wrapper_on_source(&env, &src, &[]).expect("wrapper should spawn");
+    if discharge_env_unavailable(&stderr) {
+        eprintln!(
+            "wrapper_refutes_callsite_precondition_via_insufficient_captured_expression: \
+             SKIPPED (discharge env unavailable)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("PB077") && stderr.contains("NOT DISCHARGED"),
+        "an insufficient caller contract behind a captured expression must \
+         be refuted, not discharged; code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+}
+#[test]
+fn wrapper_refuses_vacuous_discharge_from_contradictory_preconditions_via_expression() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "wrapper_refuses_vacuous_discharge_from_contradictory_preconditions_via_expression: \
+             SKIPPED",
+        );
+        return;
+    };
+    // THE cardinal case, reached through a captured expression instead of
+    // a direct caller-parameter link: `requires("v > 100")` and
+    // `requires("v < 50")` are jointly unsatisfiable. Must be REFUSED via
+    // the F1 guard, never vacuously discharged just because the actual
+    // happens to be an expression rather than a bare parameter.
+    let src = format!(
+        "{PB077_INC2_PRELUDE}{PB077_INC2_CALLEE}\
+         #[pitbull::requires(\"v > 100\")]\n#[pitbull::requires(\"v < 50\")]\n\
+         pub fn contradictory(v: u32) -> u32 {{ let t = v + 1; safe_div(10, t) }}\n"
+    );
+    let (stderr, code) = run_wrapper_on_source(&env, &src, &[]).expect("wrapper should spawn");
+    if discharge_env_unavailable(&stderr) {
+        eprintln!(
+            "wrapper_refuses_vacuous_discharge_from_contradictory_preconditions_via_expression: \
+             SKIPPED (discharge env unavailable)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("PB077") && stderr.contains("REFUSED") && stderr.contains("contradictory"),
+        "CARDINAL: a contradictory caller contract reached through a \
+         captured expression must be REFUSED via the F1 vacuity guard, \
+         never silently discharge; code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("(PB077): discharged"),
+        "a vacuous discharge must never be reported as `discharged`; \
+         stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+}
+#[test]
+fn wrapper_proves_callsite_precondition_via_chained_captured_expression() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "wrapper_proves_callsite_precondition_via_chained_captured_expression: SKIPPED",
+        );
+        return;
+    };
+    // `let a = v + 1; let b = a * 2; safe_div(10, b)` -- TWO statements,
+    // the second reading the first's result, proving the capture walk
+    // accumulates across statements (and across the checked-arithmetic
+    // block split each one individually introduces) rather than only
+    // resolving the single assignment immediately before the call.
+    let src = format!(
+        "{PB077_INC2_PRELUDE}{PB077_INC2_CALLEE}\
+         #[pitbull::requires(\"v >= 1\")]\n#[pitbull::requires(\"v < 100\")]\n\
+         pub fn caller(v: u32) -> u32 {{ \
+         let a = v + 1; let b = a * 2; safe_div(10, b) }}\n"
+    );
+    let (stderr, code) = run_wrapper_on_source(&env, &src, &[]).expect("wrapper should spawn");
+    if discharge_env_unavailable(&stderr) {
+        eprintln!(
+            "wrapper_proves_callsite_precondition_via_chained_captured_expression: SKIPPED \
+             (discharge env unavailable)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("PB077") && stderr.contains("discharged"),
+        "a chained same-function captured expression must discharge PB077 \
+         once the caller contract suffices; code {code:?}, stderr:\n{stderr}",
+    );
+    let _ = code; // PB049 on the `* 2` may separately gap without its own
+                  // bound on `a`'s name -- an orthogonal, pre-existing
+                  // completeness gap unrelated to PB077's own verdict,
+                  // which is asserted above via the stderr line directly.
+}
+#[test]
+fn wrapper_callsite_precondition_via_expression_behind_a_branch_falls_back_to_the_gap() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "wrapper_callsite_precondition_via_expression_behind_a_branch_falls_back_to_the_gap: \
+             SKIPPED",
+        );
+        return;
+    };
+    // `let t = if flag { v + 1 } else { v + 2 }; safe_div(10, t)` -- `t` is
+    // defined behind an ACTUAL BRANCH, not a linear Goto/Assert chain.
+    // Increment 3 must never guess which arm ran; this stays a coverage
+    // gap exactly like Increment 1/2's own uncapturable shapes.
+    let src = format!(
+        "{PB077_INC2_PRELUDE}{PB077_INC2_CALLEE}\
+         #[pitbull::requires(\"v >= 1\")]\n#[pitbull::requires(\"v < 100\")]\n\
+         pub fn caller(v: u32, flag: bool) -> u32 {{ \
+         let t = if flag {{ v + 1 }} else {{ v + 2 }}; safe_div(10, t) }}\n"
+    );
+    let (stderr, code) = run_wrapper_on_source(&env, &src, &[]).expect("wrapper should spawn");
+    assert!(
+        stderr.contains("carries precondition(s)"),
+        "a value behind a branch must fall back to the fail-closed \
+         coverage gap; code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("PB077"),
+        "must NOT attempt a discharge it cannot soundly encode; \
+         stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+}
+#[test]
+fn wrapper_proves_callsite_precondition_via_two_caller_params_combined() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "wrapper_proves_callsite_precondition_via_two_caller_params_combined: SKIPPED",
+        );
+        return;
+    };
+    // `let t = v + w; safe_div(10, t)` where BOTH `v` and `w` are caller
+    // parameters, each individually bounded tightly enough that their sum
+    // cannot overflow (removing the wraparound counterexample) NOR fail
+    // the callee's `b > 0` -- confirms `referenced_caller_arg_indices`
+    // correctly identifies and declares BOTH indices from one expression.
+    let src = format!(
+        "{PB077_INC2_PRELUDE}{PB077_INC2_CALLEE}\
+         #[pitbull::requires(\"v >= 1\")]\n#[pitbull::requires(\"v < 100\")]\n\
+         #[pitbull::requires(\"w >= 1\")]\n#[pitbull::requires(\"w < 100\")]\n\
+         pub fn caller(v: u32, w: u32) -> u32 {{ let t = v + w; safe_div(10, t) }}\n"
+    );
+    let (stderr, code) = run_wrapper_on_source(&env, &src, &[]).expect("wrapper should spawn");
+    if discharge_env_unavailable(&stderr) {
+        eprintln!(
+            "wrapper_proves_callsite_precondition_via_two_caller_params_combined: SKIPPED \
+             (discharge env unavailable)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("PB077") && stderr.contains("discharged"),
+        "an expression combining TWO caller parameters, both properly \
+         bounded, must discharge; code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
 }

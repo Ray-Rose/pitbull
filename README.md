@@ -77,11 +77,12 @@ Pitbull separately requires every CALL to establish it (PB077) — otherwise
 `safe_div(a,b){a/b}` under `requires("b > 0")` would verify and so would
 `oops(){safe_div(10,0)}`, which divides by zero. Call sites whose arguments are
 constant integers are proved or refuted outright, and so are call sites that
-forward one of the CALLER's own parameters (`fn caller(v: u32) { safe_div(10,
-v) }` under `requires("v > 0")` on `caller` now verifies too — a contradictory
-caller contract is refused, never a vacuous discharge). Anything not yet
-encodable (an arbitrary expression as the argument, a raw SMT-LIB clause, a
-`usize` parameter) is reported as a coverage gap and exits non-zero. Postconditions
+forward one of the CALLER's own parameters, or a computed expression over
+them (`fn caller(v: u32) { let t = v + 1; safe_div(10, t) }` under
+`requires("v >= 5")` on `caller` now verifies too — a contradictory caller
+contract is refused, never a vacuous discharge). Anything not yet encodable
+(a value behind a branch, a bitwise op, a raw SMT-LIB clause, a `usize`
+parameter) is reported as a coverage gap and exits non-zero. Postconditions
 (`#[pitbull::ensures]`, PB076) are proved for the straight-line body shapes the
 visitor can capture exactly, and stay *pending* otherwise.
 Pitbull will not claim to have proven what it has not: an unimplemented

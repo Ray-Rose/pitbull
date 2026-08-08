@@ -492,11 +492,31 @@ vacuously true` rather than a vacuous "discharged". A pure-Increment-1
 (all-constant) call site's SMT text is unaffected byte-for-byte — the
 caller-hypothesis machinery only engages when a caller-parameter link is
 actually present.
-**Not yet covered:** arbitrary expression actuals (Increment 3 —
-`safe_div(10, v + 1)`, or anything that isn't a bare constant or a bare
-caller-parameter read). Keeps the fail-closed CoverageGap today, as do a
+**v0.2 status (Increment 3 — 2026-08-08).** Extends the encoder to a third
+binding shape: a COMPUTED EXPRESSION over constants and/or caller
+parameters (`v + 1`). `capture_call_arg_expr` reuses `capture_rvalue`/
+`capture_operand` — the same generic-over-target-type machinery
+`#[pitbull::ensures]` uses for its return-effect capture — seeded with the
+caller's own parameters (mapped to Increment 2's canonical
+`__pb_caller_arg{index}` symbols) instead of return-typed parameters, and
+walks the SAME `Goto`/`Assert`-only linear chain from bb0
+`capture_body_effect` walks, stopping at the call's block instead of at
+`Return`. `fn caller(v: u32) { let t = v + 1; safe_div(10, t) }` under a
+caller contract bounding `v` now DISCHARGES. The chain-walking (not a
+same-block-only walk) is load-bearing, not incidental: real MIR lowers `v +
+1` to `AddWithOverflow` — a `(u32, bool)` tuple — in one block, with the sum
+read back out via a `.0`-projected statement in the block the
+overflow-check `Assert`'s success edge targets, so a same-block-only design
+(the first draft, which gapped the very first real-wrapper probe as a
+result) would have missed nearly every checked-arithmetic expression, i.e.
+most real code. A value behind an actual BRANCH is still refused —
+`capture_body_effect`'s own boundary, inherited unchanged: never guess
+which arm ran.
+**Not yet covered:** anything `capture_rvalue` itself declines — a value
+behind a branch, a bitwise op, a cast, a field/call-result read — plus a
 raw-SMT-LIB clause anywhere in either contract, a `usize` parameter, and a
-mixed-width comparison.
+mixed-width comparison. Extending any of these extends `#[pitbull::ensures]`
+too, since the machinery is shared.
 **Future.** Permanent.
 ## 14. Audit methodology
 Each rule is implemented in `pitbull-subset` as a single explicit arm
@@ -2569,6 +2589,56 @@ the std form and now also matches. No shadow type changes.
     expression, Increment 3's scope) so the test keeps pinning a real
     residual instead of a stale one.
   - **Not yet covered:** arbitrary expression actuals (Increment 3).
+- ✅ **Call-site precondition discharge, Increment 3** (2026-08-08) — same
+  continuous session as Increments 1 (audit+commit) and 2, continued at the
+  user's "keep moving forward". Closes Increment 2's remaining residual: a
+  call-site actual that is a COMPUTED EXPRESSION (`v + 1`), not just a bare
+  constant or bare caller-parameter read. New `capture_call_arg_expr`
+  REUSES `capture_rvalue`/`capture_operand` verbatim — confirmed generic
+  over their target-type parameter (nothing return-slot-specific) by
+  reading them before reuse — seeded with the caller's own parameters
+  (Increment 2's canonical `__pb_caller_arg{index}` symbols) instead of
+  `capture_body_effect`'s return-typed-parameter seed. Tests **424 → 437**
+  (7 unit + 6 e2e).
+  - **A real mid-course correction, documented rather than smoothed over.**
+    The first draft walked only the call's OWN basic block (architecturally
+    smaller — no need to thread the full block list + index through the
+    dispatch chain). It compiled, passed its hand-built shadow-IR unit
+    tests, and GAPPED THE FIRST real-wrapper probe. Dumped real MIR
+    (`rustc -Z unpretty=mir`) instead of debugging blind: `v + 1` lowers to
+    `AddWithOverflow` — a `(u32, bool)` TUPLE — in one block, with the sum
+    read back out via a `.0`-projected statement in the block the
+    overflow-check `Assert` jumps to. A same-block walk can never see
+    across that split, which would have gapped essentially every checked
+    arithmetic expression — most real code — the exact "shadow-IR fixtures
+    bypass real rustc lowering" trap this file's own 2026-06-13 entry
+    warns about, caught here for a NEW piece of code rather than an old
+    rule. Fixed by (1) reusing `capture_body_effect`'s existing
+    `Goto`/`Assert`-chain traversal instead of a bespoke same-block walk,
+    and (2) writing every capture into BOTH the `env` and `checked` maps
+    (the first draft's "narrower on purpose" choice to skip `checked` was
+    the actual bug, not a defensible scope cut). Re-ran the failing probe
+    after the fix: discharged.
+  - **Verified, not assumed.** 8 adversarial probes on the real wrapper (z3
+    4.16.0 + cvc5 1.3.4, 2-of-2) run before the permanent e2e tests: the
+    failing probe above, now passing; a genuinely insufficient caller
+    contract refutes; the CONTRADICTORY-caller-preconditions case reached
+    through an expression is still `REFUSED` by the (unmodified) F1
+    guard; a two-statement CHAINED expression discharges, proving the walk
+    accumulates across statements and their individual checked-arithmetic
+    block splits; a value behind an `if`/`else` branch still gaps, never
+    guessing which arm ran; and an expression combining TWO caller
+    parameters — first unbounded (correctly REFUTED: both `>= 1` does not
+    prevent `bvadd` wraparound to 0, a genuine machine-arithmetic
+    counterexample, not a bug) then properly bounded (cleanly discharges,
+    exit 0) — confirms `referenced_caller_arg_indices` attributes both
+    symbols from one expression correctly. Zero false discharges. The full
+    existing suite (Increments 1+2, the 34-probe red-team suite) was
+    re-run after — all pass; the Increment 2 e2e test whose "still gapped"
+    fixture was `v + 1` (chosen specifically because Increment 2 couldn't
+    capture it) needed that fixture swapped to `v & 1` (a bitwise op,
+    `capture_rvalue`'s own separately-documented deferred boundary), since
+    `v + 1` is now capturable by design.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is a
@@ -2591,7 +2661,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 424 passing, 0 warnings, clippy clean
+# Stable: 437 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054
