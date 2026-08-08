@@ -260,6 +260,24 @@ impl CalleeSpec {
         Self { arg_names: body.arg_names.clone(), arg_ty_names, preconditions }
     }
 }
+/// How a callee parameter is bound at a PB077 call site (`bind_callsite_param`).
+/// Increment 1 produced only `Constant`; Increment 2 (2026-08-07) adds
+/// `CallerArg` for an actual that is itself a bare parameter of the
+/// enclosing (caller's) function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CallsiteBinding {
+    /// Pin the callee-parameter symbol to this literal actual (Increment 1).
+    Constant(i128),
+    /// Link the callee-parameter symbol to the CALLER's own parameter at
+    /// this index (`current_body_arg_names`/`current_body_locals`) via an
+    /// equality assertion, rather than a literal pin. Whatever the caller's
+    /// own precondition set establishes about that parameter — translated
+    /// by `caller_precondition_hypotheses` — becomes a hypothesis in the
+    /// SAME discharge problem, so `(= b __pb_caller_arg{idx})` plus `b`'s
+    /// goal reference lets a caller hypothesis on `__pb_caller_arg{idx}`
+    /// actually constrain `b`.
+    CallerArg(usize),
+}
 impl<'cfg> SubsetVisitor<'cfg> {
     /// Construct a fresh visitor from project config.
     #[must_use]
@@ -868,11 +886,15 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// Increment 1 (2026-08-03) turns the gap into a real PROOF whenever it
     /// can: if the callee's spec is known and every precondition reduces to
     /// a check over CONSTANT actuals, a `CallSitePrecondition` (PB077)
-    /// obligation is emitted instead and the solver decides it. Everything
-    /// the encoder cannot capture keeps the original CoverageGap, so the
-    /// fail-closed default is unchanged — this only converts calls that
-    /// were previously *conservatively* rejected into ones that are
-    /// *proved* (or refuted with a counterexample).
+    /// obligation is emitted instead and the solver decides it. Increment 2
+    /// (2026-08-07) extends this to an actual that is itself a bare
+    /// parameter of the CALLER, linked to the callee's parameter and
+    /// constrained by whatever the caller's own precondition set
+    /// establishes about it. Everything the encoder cannot capture keeps
+    /// the original CoverageGap, so the fail-closed default is unchanged —
+    /// this only converts calls that were previously *conservatively*
+    /// rejected into ones that are *proved* (or refuted with a
+    /// counterexample).
     fn maybe_gap_callsite_preconditions(
         &mut self,
         c: &ConstOperand,
@@ -891,7 +913,9 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // (unknown / timeout / solver disagreement / missing pool) leaves
         // the obligation undischarged, which the wrapper folds into the
         // exit code exactly as the gap did.
-        if let Some((discharge, consistency)) = self.build_callsite_precondition_smt(&p, args) {
+        if let Some((discharge, consistency, notes)) =
+            self.build_callsite_precondition_smt(&p, args)
+        {
             let seq = self.vc_obligations.len();
             self.vc_obligations.push(crate::vc::VcObligation {
                 id: format!("pb077-callsite-{seq}"),
@@ -901,26 +925,36 @@ impl<'cfg> SubsetVisitor<'cfg> {
                     discharge_smt: Some(discharge),
                     consistency_smt: consistency,
                 },
-                // The hypotheses (the argument pins) are baked into
+                // The hypotheses (the argument pins/links + any caller
+                // preconditions folded in by Increment 2) are baked into
                 // `discharge_smt`, mirroring EnsuresPostcondition.
                 assumptions: Vec::new(),
             });
+            // Transparency (Increment 2): a real obligation was just
+            // emitted, so a caller precondition that COULDN'T be folded in
+            // as a hypothesis only makes it HARDER to discharge — never a
+            // silent weakening. See `caller_precondition_hypotheses`.
+            for msg in notes {
+                self.audit_transparency(span, msg);
+            }
             return;
         }
         self.audit_note(
             span,
             format!(
                 "call to `{p}`, which carries precondition(s): this call site's \
-                 actual arguments could not be encoded (call-site discharge \
-                 covers constant integer actuals today), so this call is \
-                 UNPROVEN (the callee was verified assuming its preconditions; \
-                 nothing proves this call satisfies them) — fails closed as a \
-                 coverage gap"
+                 actual arguments could not be encoded (call-site discharge covers \
+                 constant integer actuals and bare caller-parameter actuals today), \
+                 so this call is UNPROVEN (the callee was verified assuming its \
+                 preconditions; nothing proves this call satisfies them) — fails \
+                 closed as a coverage gap"
             ),
         );
     }
     /// Build the PB077 discharge + consistency SMT problems for a call to
-    /// `callee_path` with `args` (Increment 1: CONSTANT actuals).
+    /// `callee_path` with `args` (Increment 1: CONSTANT actuals; Increment 2,
+    /// 2026-08-07: bare CALLER-parameter actuals, linked + constrained by the
+    /// caller's own precondition set).
     ///
     /// Returns `None` — meaning "fall back to the fail-closed CoverageGap" —
     /// unless EVERY one of the following holds. Each is a place where a
@@ -942,13 +976,29 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// 4. That parameter's declared type is a supported primitive integer,
     ///    and — for the two-ident shape — both sides share it, so the
     ///    emitted comparison is well-sorted rather than a sort error.
-    /// 5. The matching ACTUAL is a constant whose own type equals the
-    ///    parameter's declared type and whose value the adapter extracted.
-    ///    Comparing the pin literal at the parameter's width against a
-    ///    constant of a different width is exactly how a bogus `unsat`
-    ///    would arise.
+    /// 5. The matching ACTUAL is either (a) a constant whose own type equals
+    ///    the parameter's declared type and whose value the adapter
+    ///    extracted, or (b) — Increment 2 — a bare read of one of the
+    ///    CALLER's own parameters, of that same type, with no projection
+    ///    (`p.0`, `*p`, `p[i]` all decline; only a direct `Copy`/`Move` of an
+    ///    argument local qualifies). Comparing the pin literal, or linking
+    ///    the callee's symbol, at the parameter's width against something of
+    ///    a different width is exactly how a bogus `unsat` would arise.
     ///
-    /// SMT shape (for `safe_div(10, 5)` with `requires("b > 0")`):
+    /// For a `CallerArg` binding, the caller's OWN precondition set is
+    /// folded in as hypotheses by `caller_precondition_hypotheses` — see
+    /// its doc comment for why that is safe to do BEST-EFFORT (unlike this
+    /// function's own all-or-nothing contract for the callee's clauses) and
+    /// why the F1 consistency check below is what actually stands between a
+    /// contradictory caller contract and a vacuous discharge.
+    ///
+    /// Returns the discharge SMT, its consistency-check SMT, and any
+    /// audit-transparency messages for caller preconditions that could not
+    /// be folded in (empty when no `CallerArg` binding was used at all, so
+    /// a pure-Increment-1 call site's SMT text is unaffected byte-for-byte).
+    ///
+    /// SMT shape for `safe_div(10, 5)` with `requires("b > 0")` (Increment 1,
+    /// unchanged):
     /// ```text
     /// (set-logic QF_BV)
     /// (declare-const b (_ BitVec 32))
@@ -956,11 +1006,22 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// (assert (not (bvugt b #x00000000)))   ; negated precondition
     /// (check-sat)                     ; unsat ⇒ the contract holds here
     /// ```
+    /// SMT shape for `fn caller(v: u32) { safe_div(10, v) }` under
+    /// `requires("v > 0")` on `caller` (Increment 2):
+    /// ```text
+    /// (set-logic QF_BV)
+    /// (declare-const __pb_caller_arg0 (_ BitVec 32))  ; caller's `v`
+    /// (declare-const b (_ BitVec 32))                 ; callee's `b`
+    /// (assert (bvugt __pb_caller_arg0 #x00000000))    ; caller's own hypothesis
+    /// (assert (= b __pb_caller_arg0))                 ; the link
+    /// (assert (not (bvugt b #x00000000)))             ; negated precondition
+    /// (check-sat)                                     ; unsat ⇒ discharged
+    /// ```
     fn build_callsite_precondition_smt(
         &self,
         callee_path: &str,
         args: &[Operand],
-    ) -> Option<(String, Option<String>)> {
+    ) -> Option<(String, Option<String>, Vec<String>)> {
         let spec = self.callee_specs.get(callee_path)?;
         if spec.preconditions.is_empty() {
             return None;
@@ -968,7 +1029,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // Declarations + pins are accumulated in first-reference order so
         // the emitted problem is deterministic (certificates are compared
         // byte-for-byte at replay).
-        let mut bound: Vec<(String, String, i128)> = Vec::new();
+        let mut bound: Vec<(String, String, CallsiteBinding)> = Vec::new();
         let mut terms: Vec<String> = Vec::new();
         for raw in &spec.preconditions {
             let term = self.callsite_precondition_term(raw, spec, args, &mut bound)?;
@@ -982,12 +1043,29 @@ impl<'cfg> SubsetVisitor<'cfg> {
         }
         let mut decls = String::new();
         let mut pins = String::new();
-        for (name, ty_name, value) in &bound {
+        // Increment 2: caller-argument symbols referenced by a `CallerArg`
+        // link, keyed by caller arg index so the map naturally dedups a
+        // parameter linked at more than one callee position (e.g.
+        // `f(v, v)`) and iterates in deterministic (sorted) order.
+        let mut caller_syms: std::collections::BTreeMap<usize, String> =
+            std::collections::BTreeMap::new();
+        for (name, ty_name, binding) in &bound {
             let (_signed, bits) = crate::predicate::int_type_info(ty_name)?;
             decls.push_str(&format!("(declare-const {name} (_ BitVec {bits}))\n"));
-            let pin = crate::predicate::operand_pin_assertion(name, *value, ty_name)?;
-            pins.push_str(&pin);
-            pins.push('\n');
+            match binding {
+                CallsiteBinding::Constant(value) => {
+                    let pin = crate::predicate::operand_pin_assertion(name, *value, ty_name)?;
+                    pins.push_str(&pin);
+                    pins.push('\n');
+                }
+                CallsiteBinding::CallerArg(idx) => {
+                    caller_syms.insert(*idx, ty_name.clone());
+                    pins.push_str(&format!(
+                        "(assert (= {name} {}))\n",
+                        Self::caller_arg_symbol(*idx)
+                    ));
+                }
+            }
         }
         // A precondition that references no parameter at all (so nothing was
         // pinned) would leave the goal over free symbols — the solver could
@@ -995,20 +1073,65 @@ impl<'cfg> SubsetVisitor<'cfg> {
         if bound.is_empty() {
             return None;
         }
+        // Increment 2: fold in the CALLER's own precondition set as
+        // hypotheses, over the SAME canonical symbols any `CallerArg` link
+        // above uses — but only attempt it when a link is actually present,
+        // so a pure-Increment-1 (all-constant) call site emits EXACTLY the
+        // same SMT as before this increment, unaffected by anything the
+        // caller's own (possibly irrelevant) preconditions say.
+        let mut notes: Vec<String> = Vec::new();
+        let mut caller_decls = String::new();
+        let mut caller_hyps = String::new();
+        if !caller_syms.is_empty() {
+            let (extra_syms, hypothesis_terms, hyp_notes) = self.caller_precondition_hypotheses();
+            for (idx, ty) in extra_syms {
+                caller_syms.entry(idx).or_insert(ty);
+            }
+            notes = hyp_notes;
+            for term in &hypothesis_terms {
+                caller_hyps.push_str(&format!("(assert {term})\n"));
+            }
+        }
+        for (idx, ty) in &caller_syms {
+            let (_signed, bits) = crate::predicate::int_type_info(ty)?;
+            caller_decls.push_str(&format!(
+                "(declare-const {} (_ BitVec {bits}))\n",
+                Self::caller_arg_symbol(*idx)
+            ));
+        }
         let negated = if terms.len() == 1 {
             format!("(not {})", terms[0])
         } else {
             format!("(not (and {}))", terms.join(" "))
         };
+        // Caller declarations/hypotheses precede the callee's own so a
+        // reader sees "what the caller brings" before "what the callee
+        // demands"; SMT-LIB itself doesn't care about the split, only that
+        // every symbol is declared before its first use, which holds here
+        // regardless of this ordering choice.
         let mut discharge = String::from("(set-logic QF_BV)\n");
+        discharge.push_str(&caller_decls);
         discharge.push_str(&decls);
+        discharge.push_str(&caller_hyps);
         discharge.push_str(&pins);
         discharge.push_str(&format!("(assert {negated})\n(check-sat)\n"));
+        // F1 vacuous-hypothesis guard: EXACTLY the same declarations +
+        // hypotheses (caller preconditions AND argument pins/links) as the
+        // discharge problem, with no goal. This is what stands between a
+        // contradictory caller contract and a vacuous discharge — if the
+        // caller's own preconditions are mutually unsatisfiable (e.g.
+        // `requires("v > 10")` and `requires("v < 5")` on the same `v`),
+        // THIS check comes back unsat, and the wrapper's existing dispatch
+        // ("run consistency-check first, refuse if Unsat") refuses to trust
+        // the main check's unsat as a real discharge — never assumed, always
+        // re-derived from the same text.
         let mut consistency = String::from("(set-logic QF_BV)\n");
+        consistency.push_str(&caller_decls);
         consistency.push_str(&decls);
+        consistency.push_str(&caller_hyps);
         consistency.push_str(&pins);
         consistency.push_str("(check-sat)\n");
-        Some((discharge, Some(consistency)))
+        Some((discharge, Some(consistency), notes))
     }
     /// Translate ONE of the callee's preconditions into an SMT term over
     /// this call site's actuals, recording each newly-referenced parameter
@@ -1021,7 +1144,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
         raw: &str,
         spec: &CalleeSpec,
         args: &[Operand],
-        bound: &mut Vec<(String, String, i128)>,
+        bound: &mut Vec<(String, String, CallsiteBinding)>,
     ) -> Option<String> {
         // Shape 1: `<ident> <cmp> <ident>` — both sides must be parameters
         // of the SAME primitive integer type, else the comparison would be
@@ -1049,15 +1172,16 @@ impl<'cfg> SubsetVisitor<'cfg> {
         None
     }
     /// Resolve one precondition ident to a callee parameter, verify the
-    /// corresponding ACTUAL is an extractable constant of the parameter's
-    /// own type, and record the pin. Returns the parameter's primitive
-    /// integer type name.
+    /// corresponding ACTUAL is either an extractable constant of the
+    /// parameter's own type (Increment 1) or a bare read of one of the
+    /// CALLER's own parameters of that same type (Increment 2), and record
+    /// the binding. Returns the parameter's primitive integer type name.
     fn bind_callsite_param(
         &self,
         ident: &str,
         spec: &CalleeSpec,
         args: &[Operand],
-        bound: &mut Vec<(String, String, i128)>,
+        bound: &mut Vec<(String, String, CallsiteBinding)>,
     ) -> Option<String> {
         if ident.is_empty() {
             return None;
@@ -1077,23 +1201,213 @@ impl<'cfg> SubsetVisitor<'cfg> {
             return None;
         }
         let ty_name = spec.arg_ty_names.get(idx)?.clone()?;
-        // Increment 1 boundary: the actual must be a CONSTANT. A caller
-        // parameter, a local, or any computed operand keeps the
-        // CoverageGap — proving those needs the caller's own precondition
-        // context (Increment 2).
-        let Operand::Constant(k) = args.get(idx)? else {
-            return None;
+        let actual = args.get(idx)?;
+        let binding = match actual {
+            Operand::Constant(k) => {
+                // The constant's own type must equal the parameter's
+                // declared type. Without this check a `u8` literal could be
+                // pinned into a 32-bit declaration (or vice versa) and the
+                // resulting `unsat` would prove nothing about the real call.
+                if primitive_int_name_from_ty(&k.ty).as_deref() != Some(ty_name.as_str()) {
+                    return None;
+                }
+                CallsiteBinding::Constant(k.value?)
+            }
+            // Increment 2: the actual is a bare read of one of the CALLER's
+            // OWN parameters (a computed expression, a field/deref/index
+            // projection, or any non-argument local still declines — see
+            // `operand_as_caller_arg`). Its type must equal the callee
+            // parameter's declared type, exactly like the constant case,
+            // so the link this produces is well-sorted.
+            Operand::Copy(_) | Operand::Move(_) => {
+                let (caller_idx, caller_ty) = self.operand_as_caller_arg(actual)?;
+                if caller_ty != ty_name {
+                    return None;
+                }
+                CallsiteBinding::CallerArg(caller_idx)
+            }
         };
-        // The constant's own type must equal the parameter's declared type.
-        // Without this check a `u8` literal could be pinned into a 32-bit
-        // declaration (or vice versa) and the resulting `unsat` would prove
-        // nothing about the real call.
-        if primitive_int_name_from_ty(&k.ty).as_deref() != Some(ty_name.as_str()) {
+        bound.push((ident.to_string(), ty_name.clone(), binding));
+        Some(ty_name)
+    }
+    /// Canonical, collision-proof SMT symbol for the CALLER's own parameter
+    /// at index `idx` (Increment 2). Never derived from user-chosen
+    /// identifier text — unlike the callee-side symbols above, which reuse
+    /// the precondition's own ident verbatim — specifically so it cannot
+    /// collide with a callee parameter that happens to share a caller
+    /// parameter's name (`fn caller(b: u32) { safe_div(10, b) }` is a real
+    /// shape, not a contrived one: the caller's `b` and the callee's `b`
+    /// must NOT become the same SMT symbol by accident). Mirrors the
+    /// project's existing `__pb_idx`/`__pb_len` canonical-name convention
+    /// (`pitbull-vc/src/smt.rs`).
+    fn caller_arg_symbol(idx: usize) -> String {
+        format!("__pb_caller_arg{idx}")
+    }
+    /// Resolve a call-site actual to the CALLER's own parameter it reads
+    /// bare — Increment 2's non-constant binding case. Mirrors
+    /// `local_arg_name`'s index arithmetic, but returns the ARG INDEX
+    /// (needed for `caller_arg_symbol`) rather than the debug name, paired
+    /// with the parameter's primitive integer type (`None` for any other
+    /// type, which keeps the CoverageGap exactly as an unsupported constant
+    /// type would).
+    ///
+    /// Unlike `local_arg_name`, an anonymous (`_`) parameter is NOT
+    /// excluded here: linking one is harmless rather than unsound — nothing
+    /// can ever reference an anonymous parameter by name to supply a
+    /// hypothesis about it (see `caller_precondition_hypotheses`), so the
+    /// link can only ever fail to discharge (an unconstrained symbol), never
+    /// falsely succeed.
+    fn operand_as_caller_arg(&self, op: &Operand) -> Option<(usize, String)> {
+        let place = match op {
+            Operand::Constant(_) => return None,
+            Operand::Copy(p) | Operand::Move(p) => p,
+        };
+        if !place.projection.is_empty() {
             return None;
         }
-        let value = k.value?;
-        bound.push((ident.to_string(), ty_name.clone(), value));
-        Some(ty_name)
+        let local_idx = place.local.0 as usize;
+        if local_idx == 0 {
+            return None; // the return slot, not an argument
+        }
+        let arg_idx = local_idx - 1;
+        if arg_idx >= self.current_body_arg_names.len() {
+            return None; // a temp/let-bound local, not an argument slot
+        }
+        let ty = primitive_int_name_from_ty(&self.current_body_locals.get(local_idx)?.ty)?;
+        Some((arg_idx, ty))
+    }
+    /// Resolve an identifier to the CALLER's (the body currently being
+    /// walked) own parameter — the same ambiguity guard as
+    /// `bind_callsite_param`, but against `current_body_arg_names`/
+    /// `current_body_locals` instead of a `CalleeSpec`, because the caller
+    /// has no `CalleeSpec` of its own (it's mid-walk, not yet fully known).
+    /// The ident must name EXACTLY one parameter of a supported primitive
+    /// integer type, or it is unusable as a hypothesis.
+    fn caller_param_lookup(&self, ident: &str) -> Option<(usize, String)> {
+        if ident.is_empty() {
+            return None;
+        }
+        let mut matches = self
+            .current_body_arg_names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.as_str() == ident);
+        let (idx, _) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        let ty = primitive_int_name_from_ty(&self.current_body_locals.get(idx + 1)?.ty)?;
+        Some((idx, ty))
+    }
+    /// Best-effort translation of the CALLER's OWN precondition set
+    /// (`current_body_preconditions` — the same list `visit_body` installs
+    /// as assumptions for the callee's own arithmetic/index/ensures
+    /// obligations) into SMT hypothesis terms over canonical caller-argument
+    /// symbols (`caller_arg_symbol`), for Increment 2's call-site discharge.
+    ///
+    /// SOUNDNESS: unlike `callsite_precondition_term` (the callee-side GOAL,
+    /// which must translate every clause or the whole obligation is
+    /// abandoned), this is deliberately best-effort. A hypothesis this
+    /// function cannot translate is DROPPED, not fatal: using a SUBSET of
+    /// what the caller's body may assume about itself only makes the
+    /// discharge goal HARDER to prove, never easier — the same posture
+    /// `maybe_emit_overflow_obligation` already takes with a precondition
+    /// that doesn't bind to an arithmetic operand. A raw-SMT-LIB clause is
+    /// always dropped (never renamed into the canonical namespace): splicing
+    /// opaque text in under a substituted symbol risks asserting something
+    /// other than what it says.
+    ///
+    /// A caller whose OWN preconditions are mutually contradictory is still
+    /// SAFE even though this function will happily translate every clause:
+    /// nothing HERE proves the discharge is trustworthy by itself. The F1
+    /// consistency check built by `build_callsite_precondition_smt` (which
+    /// includes these SAME hypotheses with no goal) is what catches that —
+    /// if the hypotheses alone are unsat, the wrapper's existing dispatch
+    /// refuses to trust the main check's unsat as a real discharge. This
+    /// function must never be the only thing standing between a
+    /// contradictory caller contract and a false discharge.
+    ///
+    /// Returns (declarations needed, keyed by caller arg index; hypothesis
+    /// terms; audit-transparency messages for anything dropped).
+    fn caller_precondition_hypotheses(
+        &self,
+    ) -> (std::collections::BTreeMap<usize, String>, Vec<String>, Vec<String>) {
+        let mut decls: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+        let mut terms: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        for raw in &self.current_body_preconditions {
+            if let Ok(p) = crate::predicate::parse_ident_vs_ident_predicate(raw) {
+                let lhs = self.caller_param_lookup(&p.lhs);
+                let rhs = self.caller_param_lookup(&p.rhs);
+                let (Some((lhs_idx, lhs_ty)), Some((rhs_idx, rhs_ty))) = (lhs, rhs) else {
+                    notes.push(format!(
+                        "PB077: caller precondition {raw:?} not usable as a call-site \
+                         hypothesis (an identifier does not name exactly one parameter \
+                         of this function of a supported primitive integer type) — any \
+                         call-site proof this enables is correspondingly weaker",
+                    ));
+                    continue;
+                };
+                if lhs_ty != rhs_ty {
+                    notes.push(format!(
+                        "PB077: caller precondition {raw:?} not usable as a call-site \
+                         hypothesis (both sides must share a primitive integer type)",
+                    ));
+                    continue;
+                }
+                let renamed = crate::predicate::IdentVsIdentPredicate {
+                    lhs: Self::caller_arg_symbol(lhs_idx),
+                    op: p.op,
+                    rhs: Self::caller_arg_symbol(rhs_idx),
+                };
+                match crate::predicate::ident_vs_ident_to_smt_assertion(&renamed, &lhs_ty)
+                    .ok()
+                    .and_then(|a| strip_assert(&a))
+                {
+                    Some(term) => {
+                        decls.insert(lhs_idx, lhs_ty);
+                        decls.insert(rhs_idx, rhs_ty);
+                        terms.push(term);
+                    }
+                    None => notes.push(format!(
+                        "PB077: caller precondition {raw:?} failed to translate to SMT \
+                         and was not used as a call-site hypothesis",
+                    )),
+                }
+                continue;
+            }
+            if let Ok(p) = crate::predicate::parse_predicate(raw) {
+                let Some((idx, ty)) = self.caller_param_lookup(&p.var) else {
+                    notes.push(format!(
+                        "PB077: caller precondition {raw:?} not usable as a call-site \
+                         hypothesis (`{}` does not name exactly one parameter of this \
+                         function of a supported primitive integer type)",
+                        p.var,
+                    ));
+                    continue;
+                };
+                let sym = Self::caller_arg_symbol(idx);
+                match crate::predicate::predicate_to_smt_assertion(&p, &sym, &ty)
+                    .ok()
+                    .and_then(|a| strip_assert(&a))
+                {
+                    Some(term) => {
+                        decls.insert(idx, ty);
+                        terms.push(term);
+                    }
+                    None => notes.push(format!(
+                        "PB077: caller precondition {raw:?} failed to translate to SMT \
+                         and was not used as a call-site hypothesis",
+                    )),
+                }
+                continue;
+            }
+            notes.push(format!(
+                "PB077: caller precondition {raw:?} not usable as a call-site hypothesis \
+                 (raw SMT-LIB clauses are not translated for this purpose)",
+            ));
+        }
+        (decls, terms, notes)
     }
     /// Classify a call by its callee's `DefId` path.
     ///
@@ -8294,5 +8608,332 @@ mod tests {
             vec![Some("u8".to_string()), Some("u32".to_string())],
         );
         assert_eq!(spec.preconditions, vec!["b > 0".to_string()]);
+    }
+    // === PB077 Increment 2: caller-param actuals (2026-08-07) ===
+    //
+    // Same posture as the Increment 1 block above: these pin the encoding
+    // deterministically and solver-free. The one genuinely new soundness
+    // question — does a CONTRADICTORY caller contract actually get refused,
+    // not just "produce a consistency problem that says so" — is a solver
+    // question, not a pure-function one, so it is re-verified end-to-end on
+    // the real wrapper (see the dated HANDOFF/PSS-1 entry) rather than only
+    // asserted here.
+    /// One of Increment 2's caller-body actuals: either a constant (the
+    /// Increment 1 shape, reused here to test them mixed) or a bare read of
+    /// the CALLER's own parameter at `caller_params[idx]`.
+    enum Pb077Actual {
+        Const(i128, Ty),
+        CallerParam(usize),
+    }
+    /// A caller with its OWN parameters `caller_params` (name, type), whose
+    /// single terminator calls `path` with `actuals`. Mirrors
+    /// `pb077_caller_body` but gives the caller a real parameter list, so
+    /// `Pb077Actual::CallerParam` can reference MIR locals `1..=len` as bare
+    /// (unprojected) reads — exactly the shape `operand_as_caller_arg` looks
+    /// for.
+    fn pb077_caller_body_with_params(
+        path: &str,
+        caller_params: &[(&str, Ty)],
+        actuals: &[Pb077Actual],
+    ) -> Body {
+        use crate::mir_api::*;
+        let bool_ty = Ty { kind: TyKind::RigidTy(RigidTy::Bool) };
+        let local =
+            |ty: Ty| LocalDecl { ty, span: Span::default(), mutability: Mutability::Not };
+        // locals[0] is the return slot; caller parameter `i` is local `i + 1`,
+        // matching every other convention in this file (`CalleeSpec::from_body`,
+        // `operand_as_caller_arg`, `caller_param_lookup`).
+        let mut locals = vec![local(bool_ty.clone())];
+        locals.extend(caller_params.iter().map(|(_, ty)| local(ty.clone())));
+        let mir_args = actuals
+            .iter()
+            .map(|a| match a {
+                Pb077Actual::Const(v, ty) => Operand::Constant(ConstOperand {
+                    ty: ty.clone(),
+                    def_id: None,
+                    path: None,
+                    value: Some(*v),
+                }),
+                Pb077Actual::CallerParam(idx) => Operand::Copy(Place {
+                    local: Local(u32::try_from(*idx + 1).expect("small test index")),
+                    projection: vec![],
+                }),
+            })
+            .collect();
+        Body {
+            def_id: DefId(0),
+            arg_tys: caller_params.iter().map(|(_, ty)| ty.clone()).collect(),
+            arg_names: caller_params.iter().map(|(n, _)| (*n).to_string()).collect(),
+            return_ty: bool_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals,
+            blocks: vec![BasicBlockData {
+                statements: vec![],
+                terminator: Terminator {
+                    kind: TerminatorKind::Call {
+                        func: Operand::Constant(ConstOperand {
+                            ty: bool_ty,
+                            def_id: None,
+                            path: Some(path.to_string()),
+                            value: None,
+                        }),
+                        args: mir_args,
+                        destination: Place { local: Local(0), projection: vec![] },
+                        target: None,
+                    },
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        }
+    }
+    /// Like `pb077_run`, but installs `caller_preconditions` via
+    /// `set_current_preconditions` before the walk — Increment 2's caller
+    /// contract, available as call-site hypotheses — and runs
+    /// `pb077_caller_body_with_params`. Returns
+    /// `(discharge_smt, consistency_smt, gap_note_present)`.
+    fn pb077_run_2(
+        cfg: &SubsetConfig,
+        spec: CalleeSpec,
+        caller_preconditions: &[&str],
+        body: &Body,
+    ) -> (Option<String>, Option<String>, bool) {
+        const CALLEE: &str = "demo::callee";
+        let mut v = SubsetVisitor::new(cfg);
+        v.set_known_precondition_fns(
+            [CALLEE.to_string()].into_iter().collect::<std::collections::BTreeSet<_>>(),
+        );
+        v.set_callee_specs([(CALLEE.to_string(), spec)].into_iter().collect());
+        v.set_current_preconditions(
+            caller_preconditions.iter().map(|s| (*s).to_string()).collect(),
+        );
+        v.visit_body(body, false);
+        let report = v.into_report();
+        let found = report.vc_obligations.iter().find_map(|o| match &o.kind {
+            crate::vc::VcObligationKind::CallSitePrecondition {
+                discharge_smt,
+                consistency_smt,
+                ..
+            } => Some((discharge_smt.clone(), consistency_smt.clone())),
+            _ => None,
+        });
+        let gapped =
+            report.audit_notes.iter().any(|n| n.message.contains("carries precondition(s)"));
+        match found {
+            Some((d, c)) => (d, c, gapped),
+            None => (None, None, gapped),
+        }
+    }
+    #[test]
+    fn pb077_caller_param_actual_links_and_folds_in_the_caller_hypothesis() {
+        // fn caller(v: u32) under requires("v > 0") calling
+        // callee(v) where callee requires("b > 0"). The link `(= b
+        // __pb_caller_arg0)` plus the caller's own hypothesis on
+        // `__pb_caller_arg0` is what makes this discharge — dropping
+        // EITHER piece would leave `b` unconstrained.
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_caller_body_with_params(
+            "demo::callee",
+            &[("v", pb077_u32())],
+            &[Pb077Actual::CallerParam(0)],
+        );
+        let (discharge, consistency, gapped) = pb077_run_2(&cfg, spec, &["v > 0"], &body);
+        let smt = discharge.expect("a caller-parameter actual must not gap");
+        assert!(
+            smt.contains("(declare-const __pb_caller_arg0 (_ BitVec 32))"),
+            "smt:\n{smt}",
+        );
+        assert!(smt.contains("(declare-const b (_ BitVec 32))"), "smt:\n{smt}");
+        assert!(smt.contains("(assert (= b __pb_caller_arg0))"), "missing link:\n{smt}");
+        assert!(
+            smt.contains("(assert (bvugt __pb_caller_arg0 #x00000000))"),
+            "missing the caller's own hypothesis:\n{smt}",
+        );
+        assert!(
+            smt.contains("(assert (not (bvugt b #x00000000)))"),
+            "the negated callee goal must be unchanged:\n{smt}",
+        );
+        let cs = consistency.expect("a CallerArg binding must carry the F1 guard");
+        assert!(
+            cs.contains("(assert (bvugt __pb_caller_arg0 #x00000000))"),
+            "the consistency check must carry the SAME hypotheses as the \
+             discharge problem, or it isn't actually guarding them:\n{cs}",
+        );
+        assert!(!cs.contains("bvugt b"), "the guard must carry no GOAL:\n{cs}");
+        assert!(!gapped, "an emitted obligation subsumes the coverage gap");
+    }
+    #[test]
+    fn pb077_caller_param_without_a_matching_precondition_is_attempted_not_gapped() {
+        // The caller offers NO evidence about `v` at all. This must still
+        // produce a real (attempted) obligation — refuted at solve time by
+        // an unconstrained symbol, never silently downgraded to "unproven"
+        // the way an uncapturable actual is. Diagnostic upgrade over
+        // Increment 1's coverage gap for this exact shape, not a soundness
+        // change (both fail closed).
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_caller_body_with_params(
+            "demo::callee",
+            &[("v", pb077_u32())],
+            &[Pb077Actual::CallerParam(0)],
+        );
+        let (discharge, _consistency, gapped) = pb077_run_2(&cfg, spec, &[], &body);
+        let smt = discharge.expect("the link alone is enough to attempt discharge");
+        assert!(smt.contains("(assert (= b __pb_caller_arg0))"), "smt:\n{smt}");
+        assert!(
+            !smt.contains("bvugt __pb_caller_arg0"),
+            "no caller hypothesis exists to add:\n{smt}",
+        );
+        assert!(!gapped, "an attempted-but-unconstrained obligation is not a gap");
+    }
+    #[test]
+    fn pb077_contradictory_caller_preconditions_reach_the_consistency_check() {
+        // CARDINAL: `requires("v > 10")` and `requires("v < 5")` on the same
+        // `v` are jointly unsatisfiable. This test pins that BOTH
+        // hypotheses reach the F1 consistency problem (so the solver-level
+        // guard — re-verified end-to-end on the real wrapper — has
+        // something to actually refuse on); it does not itself run a
+        // solver, so it cannot by itself prove the refusal happens.
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_caller_body_with_params(
+            "demo::callee",
+            &[("v", pb077_u32())],
+            &[Pb077Actual::CallerParam(0)],
+        );
+        let (_discharge, consistency, _gapped) =
+            pb077_run_2(&cfg, spec, &["v > 10", "v < 5"], &body);
+        let cs = consistency.expect("a CallerArg binding must carry the F1 guard");
+        assert!(cs.contains("(assert (bvugt __pb_caller_arg0 #x0000000A))"), "cs:\n{cs}");
+        assert!(cs.contains("(assert (bvult __pb_caller_arg0 #x00000005))"), "cs:\n{cs}");
+        assert!(!cs.contains("bvugt b"), "the guard must carry no callee-side GOAL:\n{cs}");
+    }
+    #[test]
+    fn pb077_untranslatable_caller_hypothesis_is_dropped_not_fatal() {
+        // Unlike the callee-side contract (any untranslatable clause
+        // abandons the WHOLE obligation), a caller hypothesis this encoder
+        // cannot translate is simply dropped: using fewer true hypotheses
+        // only makes the goal harder to prove, never easier. The raw-SMT
+        // clause must NOT survive into the problem under any symbol name.
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_caller_body_with_params(
+            "demo::callee",
+            &[("v", pb077_u32())],
+            &[Pb077Actual::CallerParam(0)],
+        );
+        let (discharge, _consistency, gapped) = pb077_run_2(
+            &cfg,
+            spec,
+            &["v > 0", "(assert (bvugt v #x00000000))"],
+            &body,
+        );
+        let smt = discharge.expect("the translatable caller clause alone is still usable");
+        assert!(
+            smt.contains("(assert (bvugt __pb_caller_arg0 #x00000000))"),
+            "the translatable clause must still be used:\n{smt}",
+        );
+        assert!(
+            !smt.to_lowercase().contains("(assert (bvugt v "),
+            "the raw clause must not be spliced in under the raw ident:\n{smt}",
+        );
+        assert!(!gapped);
+    }
+    #[test]
+    fn pb077_caller_param_of_a_different_type_than_the_parameter_declines_the_binding() {
+        // The caller's `v` is u8; the callee's `b` is u32. Linking them
+        // would let a solver comparing a truncated width "prove" something
+        // about the real (wider) call. Declines the binding for THIS
+        // clause, which (being the contract's only clause) falls back to
+        // the coverage gap exactly like a mismatched constant would.
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let body = pb077_caller_body_with_params(
+            "demo::callee",
+            &[("v", pb077_u8())],
+            &[Pb077Actual::CallerParam(0)],
+        );
+        let (discharge, _consistency, gapped) = pb077_run_2(&cfg, spec, &["v > 0"], &body);
+        assert!(discharge.is_none(), "a width-mismatched caller actual must fail closed");
+        assert!(gapped);
+    }
+    #[test]
+    fn pb077_projected_caller_operand_is_not_linked() {
+        // `operand_as_caller_arg` must decline anything with a projection
+        // (field/deref/index) — this visitor has no data-flow analysis, so
+        // "the caller's parameter, transformed somehow" is indistinguishable
+        // from an arbitrary expression, which stays Increment 3's job.
+        use crate::mir_api::*;
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let mut body = pb077_caller_body_with_params(
+            "demo::callee",
+            &[("v", pb077_u32())],
+            &[Pb077Actual::CallerParam(0)],
+        );
+        if let TerminatorKind::Call { args, .. } = &mut body.blocks[0].terminator.kind {
+            args[0] = Operand::Copy(Place {
+                local: Local(1),
+                projection: vec![ProjectionElem::Deref],
+            });
+        }
+        let (discharge, _consistency, gapped) = pb077_run_2(&cfg, spec, &["v > 0"], &body);
+        assert!(discharge.is_none(), "a projected caller operand must fail closed");
+        assert!(gapped);
+    }
+    #[test]
+    fn pb077_pure_constant_call_site_smt_is_byte_identical_to_increment_1() {
+        // Regression guard: a call site with ONLY constant actuals must
+        // produce EXACTLY the same SMT as before Increment 2 existed, even
+        // when the caller happens to have unrelated preconditions of its
+        // own (they must not leak in as spurious declarations/hypotheses).
+        let cfg = SubsetConfig::default_for_test();
+        let spec_a = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let spec_b = spec_a.clone();
+        let (via_run, gapped_a) =
+            pb077_run(&cfg, spec_a, &[(5, pb077_u32())]);
+        let via_run = via_run.expect("constant actual discharges");
+        let body = pb077_caller_body_with_params(
+            "demo::callee",
+            &[("unrelated", pb077_u32())],
+            &[Pb077Actual::Const(5, pb077_u32())],
+        );
+        let (via_run_2, _consistency, gapped_b) =
+            pb077_run_2(&cfg, spec_b, &["unrelated > 100"], &body);
+        let via_run_2 = via_run_2.expect("constant actual discharges");
+        assert_eq!(via_run, via_run_2, "an unrelated caller precondition must not leak in");
+        assert!(!via_run_2.contains("__pb_caller_arg"), "smt:\n{via_run_2}");
+        assert!(!gapped_a && !gapped_b);
+    }
+    #[test]
+    fn pb077_same_caller_param_linked_twice_is_declared_once() {
+        // `callee(v, v)` where callee requires both `a > 0` and `b > 0`:
+        // BOTH callee parameters link to the SAME caller symbol
+        // (`__pb_caller_arg0`), which must be declared exactly once (a
+        // duplicate `declare-const` is an SMT-LIB error, not a soundness
+        // issue, but it would make the whole problem malformed).
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(
+            &["a", "b"],
+            &[pb077_u32(), pb077_u32()],
+            &["a > 0", "b > 0"],
+        );
+        let body = pb077_caller_body_with_params(
+            "demo::callee",
+            &[("v", pb077_u32())],
+            &[Pb077Actual::CallerParam(0), Pb077Actual::CallerParam(0)],
+        );
+        let (discharge, _consistency, gapped) = pb077_run_2(&cfg, spec, &["v > 0"], &body);
+        let smt = discharge.expect("both links must succeed");
+        assert_eq!(
+            smt.matches("(declare-const __pb_caller_arg0").count(),
+            1,
+            "must declare the shared caller symbol exactly once:\n{smt}",
+        );
+        assert!(smt.contains("(assert (= a __pb_caller_arg0))"), "smt:\n{smt}");
+        assert!(smt.contains("(assert (= b __pb_caller_arg0))"), "smt:\n{smt}");
+        assert!(!gapped);
     }
 }

@@ -461,10 +461,42 @@ The precondition set discharged here is built by the same merge the
 callee's own body assumes (config clauses then attribute clauses, same
 key) — proving a SUBSET of what the callee assumed would be a false
 discharge, so there is deliberately one expression of that merge.
-**Not yet covered:** actuals that are caller parameters (Increment 2 —
-bind them to caller variables and assume the caller's own preconditions)
-and arbitrary expression actuals (Increment 3). Both keep the
-fail-closed CoverageGap today.
+**v0.2 status (Increment 2 — 2026-08-07).** Extends the encoder to a second
+binding shape: an actual that is a bare (unprojected) read of the CALLER's
+own parameter. `operand_as_caller_arg` recognizes it and, instead of pinning
+the callee's parameter symbol to a literal, links it via equality to a
+canonical `__pb_caller_arg{index}` symbol — never derived from the caller's
+own identifier text, specifically so a callee parameter that happens to
+share a caller parameter's name (`fn caller(b: u32) { safe_div(10, b) }`)
+cannot collide with it. `caller_precondition_hypotheses` then translates the
+CALLER's own precondition set into hypothesis assertions over those same
+canonical symbols, so `fn caller(v: u32) { safe_div(10, v) }` under
+`requires("v > 0")` on `caller` now DISCHARGES — the forwarding-code shape
+real code needs, previously a fail-closed CoverageGap even though the
+caller's contract obviously suffices. Unlike the callee-side goal (any
+untranslatable clause abandons the whole obligation), the caller-hypothesis
+translation is deliberately best-effort: a caller precondition it cannot
+translate (a raw-SMT-LIB clause, an ident not naming exactly one caller
+parameter) is simply DROPPED, never fatal — a subset of true hypotheses only
+makes the discharge goal harder to prove, never easier. **The soundness
+question this increment adds:** a caller's own preconditions CAN be mutually
+contradictory (`requires("v > 10")` and `requires("v < 5")` on the same
+`v`), and under contradictory hypotheses any goal is vacuously "unsat". The
+answer is the SAME F1 consistency-check dispatch every other obligation kind
+already uses (`pitbull-rustc.rs` runs `goal.consistency_check` first,
+generically over `VcGoal`, with no `CallSitePrecondition`-specific branch
+anywhere) — confirmed both by reading that dispatch code and by running the
+contradictory-caller case on the real wrapper, which reports `REFUSED —
+preconditions are contradictory ... a discharge claim here would be
+vacuously true` rather than a vacuous "discharged". A pure-Increment-1
+(all-constant) call site's SMT text is unaffected byte-for-byte — the
+caller-hypothesis machinery only engages when a caller-parameter link is
+actually present.
+**Not yet covered:** arbitrary expression actuals (Increment 3 —
+`safe_div(10, v + 1)`, or anything that isn't a bare constant or a bare
+caller-parameter read). Keeps the fail-closed CoverageGap today, as do a
+raw-SMT-LIB clause anywhere in either contract, a `usize` parameter, and a
+mixed-width comparison.
 **Future.** Permanent.
 ## 14. Audit methodology
 Each rule is implemented in `pitbull-subset` as a single explicit arm
@@ -2464,6 +2496,79 @@ the std form and now also matches. No shadow type changes.
     `question_mark` into an `error:` on the old shape — the same
     toolchain-drift class as the 2026-06-14 `callee_paths` fix. The
     signedness/width decode had no direct test until now; it has one.
+- ✅ **Call-site precondition discharge, Increment 2** (2026-08-07) — a
+  fresh session first audited + committed Increment 1 (which had shipped in
+  code but sat uncommitted for three days), then continued the feature line
+  at the user's choice. Extends `bind_callsite_param` with a second binding
+  shape: an actual that is a bare (unprojected) read of the CALLER's own
+  parameter, recognized by the new `operand_as_caller_arg`. Instead of
+  pinning the callee's parameter symbol to a literal, it is linked by
+  equality to a canonical `__pb_caller_arg{index}` symbol (`caller_arg_
+  symbol` — never derived from user identifier text, so it cannot collide
+  with a callee parameter that happens to share a caller parameter's name),
+  and the new `caller_precondition_hypotheses` translates the CALLER's own
+  precondition set into hypothesis assertions over those same canonical
+  symbols. `fn caller(v: u32) { safe_div(10, v) }` under `requires("v > 0")`
+  on `caller` now DISCHARGES — the forwarding-code shape Increment 1
+  explicitly deferred. Tests **411 → 424** (8 unit + 5 e2e); zero wrapper/
+  driver changes (confirmed via `git diff --stat` — the whole feature is
+  `pitbull-subset`-only).
+  - **The new soundness question, and why it doesn't need new machinery.**
+    Increment 1 only ever pinned symbols to literal constants, which can
+    never be mutually contradictory. Increment 2 assumes the CALLER's own
+    preconditions as hypotheses, and those CAN be self-contradictory
+    (`requires("v > 10")` and `requires("v < 5")` on the same `v`) — under
+    contradictory hypotheses, any goal is vacuously "unsat", so a naive
+    implementation would discharge every call the caller makes regardless
+    of whether it's actually safe. The defense is the SAME F1
+    consistency-check dispatch every other obligation kind already used:
+    `pitbull-rustc.rs`'s dispatch loop runs `goal.consistency_check` first
+    and refuses to trust the main check's `unsat` verdict unless it comes
+    back `sat`, entirely generic over `VcGoal` with no
+    `CallSitePrecondition`-specific branch anywhere. Confirmed by reading
+    that dispatch code BEFORE writing any Increment 2 code (not assumed),
+    then re-confirmed by running the contradictory-caller case on the real
+    wrapper: `REFUSED — preconditions are contradictory ... a discharge
+    claim here would be vacuously true`, exit 1. Zero new dispatch code was
+    written or needed.
+  - **Asymmetric translation, deliberately.** The callee's own precondition
+    set (the GOAL) keeps Increment 1's all-or-nothing contract — any
+    untranslatable clause abandons the whole obligation, since discharging a
+    subset would prove a weaker contract than the callee assumed. The
+    caller's own precondition set (the HYPOTHESES) is best-effort:
+    `caller_precondition_hypotheses` drops whatever it cannot translate (a
+    raw-SMT-LIB clause, an ident not naming exactly one caller parameter)
+    rather than aborting, because a subset of true hypotheses only makes the
+    discharge goal harder to prove, never easier — it cannot manufacture a
+    false discharge. A pure-Increment-1 (all-constant) call site's SMT text
+    is unaffected byte-for-byte: the caller-hypothesis machinery only runs
+    when a caller-parameter link is actually present, pinned by
+    `pb077_pure_constant_call_site_smt_is_byte_identical_to_increment_1`.
+  - **Verified, not assumed.** 8 adversarial probes on the real wrapper (z3
+    4.16.0 + cvc5 1.3.4, 2-of-2), run BEFORE the permanent e2e tests were
+    written: the contradictory-caller case above; a satisfying caller
+    contract discharges; a subtly-insufficient one (`v >= 0` doesn't
+    establish the needed `v > 0` — `v == 0` is a genuine counterexample)
+    refutes; no caller precondition at all is still ATTEMPTED, not silently
+    downgraded to a gap, and correctly refutes via an unconstrained symbol;
+    a shape-1 (ident-vs-ident) caller-precondition chain that doesn't
+    jointly establish the goal refutes; mixed constant + caller-linked
+    actuals across two independent call sites in one file get independent,
+    correct verdicts; and self-offset method dispatch (`c.div(10, v)`)
+    combined with caller-linking binds `v` to the right MIR argument slot,
+    not the receiver. Zero false discharges. The 34-probe independent
+    red-team suite and all four Increment 1 e2e tests were re-run after —
+    still all pass.
+  - **One Increment 1 e2e test needed updating, not fixing.**
+    `wrapper_callsite_precondition_falls_back_to_the_gap`'s "non-constant
+    actual" case used `safe_div(10, v)` (a bare caller parameter) as an
+    example of a shape that must gap — true under Increment 1, no longer
+    true under Increment 2 (it's now attempted and correctly refuted, same
+    exit code, different diagnostic text). Changed the fixture to
+    `safe_div(10, v + 1)` (a genuinely still-uncapturable arbitrary
+    expression, Increment 3's scope) so the test keeps pinning a real
+    residual instead of a stale one.
+  - **Not yet covered:** arbitrary expression actuals (Increment 3).
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is a
@@ -2486,7 +2591,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 411 passing, 0 warnings, clippy clean
+# Stable: 424 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054
