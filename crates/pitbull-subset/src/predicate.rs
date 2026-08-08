@@ -569,12 +569,14 @@ pub fn operand_pin_assertion(
 /// Returns `None` for non-int types, suffixes, or unsupported widths.
 #[must_use]
 pub fn int_type_info(name: &str) -> Option<(bool, u32)> {
-    let (signed, rest) = if let Some(r) = name.strip_prefix('u') {
-        (false, r)
-    } else if let Some(r) = name.strip_prefix('i') {
-        (true, r)
-    } else {
-        return None;
+    // `u` first, then `i`; any other leading byte is not a primitive
+    // integer name. The `?` IS the third branch of what reads more
+    // naturally as an if-let chain — clippy (1.97+) rejects that form, so
+    // the shape is pinned by `int_type_info_decodes_every_supported_width`
+    // rather than by the control flow being self-evident.
+    let (signed, rest) = match name.strip_prefix('u') {
+        Some(r) => (false, r),
+        None => (true, name.strip_prefix('i')?),
     };
     let bits = match rest {
         "8" => 8,
@@ -1193,6 +1195,36 @@ mod tests {
                 validate_assertion_form(bad),
                 Err(AssertionFormError::Empty),
             ));
+        }
+    }
+    /// `int_type_info` decides the SIGNEDNESS of every SMT comparison and
+    /// the WIDTH of every bit-vector literal the project emits, so a
+    /// mis-decode is a silent encoding error, not a compile failure. It had
+    /// no direct test until 2026-08-03, when a clippy-driven rewrite of its
+    /// prefix dispatch made that gap uncomfortable.
+    #[test]
+    fn int_type_info_decodes_every_supported_width() {
+        for (name, want) in [
+            ("u8", (false, 8u32)),
+            ("u16", (false, 16)),
+            ("u32", (false, 32)),
+            ("u64", (false, 64)),
+            ("u128", (false, 128)),
+            ("i8", (true, 8)),
+            ("i16", (true, 16)),
+            ("i32", (true, 32)),
+            ("i64", (true, 64)),
+            ("i128", (true, 128)),
+        ] {
+            assert_eq!(int_type_info(name), Some(want), "decoding {name}");
+        }
+        // Deferred and non-integer names must stay `None` — every caller
+        // reads `None` as "cannot encode" and fails closed.
+        for name in [
+            "usize", "isize", "u", "i", "", "bool", "f32", "f64", "char",
+            "u33", "i7", "U32", "u32x4", "&u32",
+        ] {
+            assert_eq!(int_type_info(name), None, "must not decode {name}");
         }
     }
 }

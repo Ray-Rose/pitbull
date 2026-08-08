@@ -172,6 +172,43 @@ fn canonical_spec_key(path: &str, crate_name: &str) -> String {
     let s = s.replace(&format!("<{cp}"), "<");
     s.replace(&format!(" as {cp}"), " as ")
 }
+/// The precondition list for one function path: `pitbull.toml`'s
+/// `[verification.preconditions]` entry followed by the HIR pre-pass's
+/// `#[pitbull::requires]` entry, config first.
+///
+/// SOUNDNESS (Increment 1, 2026-08-03): this is deliberately the ONLY
+/// expression of that merge. It has two callers — the callee-spec pre-pass
+/// that builds the PB077 call-site context, and the per-body install that
+/// makes the callee ASSUME these clauses while proving itself. Discharging
+/// a call site against a SMALLER set than the callee assumed is a false
+/// discharge (the callee's internal obligations were closed with clauses
+/// nothing established), so the two call sites must never compute the merge
+/// independently.
+///
+/// Keyed on the RAW `name()` path, not `canonical_spec_key`: the visitor's
+/// call-site matcher and `set_known_precondition_fns` both use raw keys, and
+/// §7 records that canonicalizing `requires` without threading the same key
+/// through the call-site gate risks desyncing them. So a trait-impl
+/// method's `#[pitbull::requires]` still does not bind (fail-SAFE: it is
+/// simply not assumed, and the call keeps its coverage gap) — unchanged by
+/// this increment.
+#[cfg(any(rustc_public_real, test))]
+fn callee_spec_preconditions(
+    cfg: &pitbull_subset::SubsetConfig,
+    hir_preconditions: &std::collections::HashMap<String, Vec<String>>,
+    item_path: &str,
+) -> Vec<String> {
+    let mut preconditions = cfg
+        .verification
+        .preconditions
+        .get(item_path)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(attr_preconds) = hir_preconditions.get(item_path) {
+        preconditions.extend(attr_preconds.iter().cloned());
+    }
+    preconditions
+}
 #[cfg(test)]
 mod canonical_spec_key_tests {
     use super::canonical_spec_key;
@@ -210,6 +247,84 @@ mod canonical_spec_key_tests {
             canonical_spec_key("demo::foo", "demo"),
         );
         assert_eq!(canonical_spec_key("demo::demo::foo", "demo"), "demo::foo");
+    }
+}
+#[cfg(test)]
+mod callee_spec_preconditions_tests {
+    use super::callee_spec_preconditions;
+    fn cfg_with(entries: &[(&str, &[&str])]) -> pitbull_subset::SubsetConfig {
+        let mut cfg = pitbull_subset::SubsetConfig::default_for_test();
+        for (k, v) in entries {
+            cfg.verification.preconditions.insert(
+                (*k).to_string(),
+                v.iter().map(|s| (*s).to_string()).collect(),
+            );
+        }
+        cfg
+    }
+    fn hir_with(
+        entries: &[(&str, &[&str])],
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(k, v)| {
+                ((*k).to_string(), v.iter().map(|s| (*s).to_string()).collect())
+            })
+            .collect()
+    }
+    /// SOUNDNESS (Increment 1): the merge must be CONFIG THEN ATTRIBUTE and
+    /// must include BOTH. This one list is what the callee assumes while
+    /// proving its own body AND what a call site must establish (PB077);
+    /// a call site proved against a subset would be a false discharge.
+    #[test]
+    fn merges_config_then_attribute_sources() {
+        let cfg = cfg_with(&[("demo::f", &["a > 0"])]);
+        let hir = hir_with(&[("demo::f", &["b > 0"])]);
+        assert_eq!(
+            callee_spec_preconditions(&cfg, &hir, "demo::f"),
+            vec!["a > 0".to_string(), "b > 0".to_string()],
+        );
+    }
+    #[test]
+    fn each_source_alone_and_neither() {
+        let only_cfg = cfg_with(&[("demo::f", &["a > 0"])]);
+        let only_hir = hir_with(&[("demo::g", &["b > 0"])]);
+        let empty_hir = hir_with(&[]);
+        assert_eq!(
+            callee_spec_preconditions(&only_cfg, &empty_hir, "demo::f"),
+            vec!["a > 0".to_string()],
+        );
+        assert_eq!(
+            callee_spec_preconditions(
+                &pitbull_subset::SubsetConfig::default_for_test(),
+                &only_hir,
+                "demo::g",
+            ),
+            vec!["b > 0".to_string()],
+        );
+        // An unregistered path yields an empty list, which the pre-pass
+        // reads as "no contract" — so no spec entry, so any call to it
+        // keeps whatever the gap logic decides.
+        assert!(
+            callee_spec_preconditions(&only_cfg, &only_hir, "demo::unrelated").is_empty(),
+        );
+    }
+    /// The lookup is on the RAW `name()` key, deliberately (see the
+    /// function's doc comment): canonicalizing here without threading the
+    /// same key through the visitor's call-site matcher would desync the
+    /// two. A trait-impl method's HIR key therefore does not match, and
+    /// its clauses are simply not assumed — fail-SAFE, not fail-open.
+    #[test]
+    fn trait_impl_hir_key_does_not_match_the_name_rendering() {
+        let hir = hir_with(&[("demo::<Calc as Doubler>::m", &["b > 0"])]);
+        assert!(
+            callee_spec_preconditions(
+                &pitbull_subset::SubsetConfig::default_for_test(),
+                &hir,
+                "<demo::Calc as demo::Doubler>::m",
+            )
+            .is_empty(),
+        );
     }
 }
 #[cfg(test)]
@@ -562,6 +677,56 @@ impl PitbullCallbacks {
                 .cloned()
                 .collect(),
         );
+        // Increment 1 (2026-08-03): the CALLEE-SPEC pre-pass that upgrades
+        // that gap into a discharge. For every in-crate fn whose path
+        // carries preconditions, record its parameter names + types so a
+        // call site can bind the callee's precondition idents to the actual
+        // arguments (PB077).
+        //
+        // A SEPARATE loop, before the walk, because item order is not
+        // caller-before-callee: a call site must find the spec regardless of
+        // where the callee appears in `all_local_items()`.
+        //
+        // SOUNDNESS — the precondition list built here MUST equal the one
+        // installed for that body below (`set_current_preconditions`): same
+        // two maps, same `item_path` key, same merge order. Discharging a
+        // subset of what the callee assumed would close its internal
+        // obligations with clauses no call site ever established. The
+        // `callee_spec_preconditions` helper is the single expression of
+        // that merge, called from both places, so they cannot drift.
+        //
+        // `exclude`d items are skipped so an excluded callee (dropped before
+        // the universe, invisible to the #27 gate) cannot be treated as a
+        // verified contract holder.
+        {
+            let mut callee_specs: std::collections::BTreeMap<
+                String,
+                pitbull_subset::CalleeSpec,
+            > = std::collections::BTreeMap::new();
+            for item in rustc_public::all_local_items() {
+                let item_path = item.name();
+                if exclude.iter().any(|p| pattern_matches(p, &item_path)) {
+                    continue;
+                }
+                if !matches!(item.kind(), rustc_public::ItemKind::Fn) || !item.has_body() {
+                    continue;
+                }
+                let preconditions = callee_spec_preconditions(
+                    &cfg,
+                    &hir_preconditions,
+                    &item_path,
+                );
+                if preconditions.is_empty() {
+                    continue;
+                }
+                let body = pitbull_subset::mir_api::adapter::body(&item.expect_body());
+                callee_specs.insert(
+                    item_path,
+                    pitbull_subset::CalleeSpec::from_body(&body, preconditions),
+                );
+            }
+            visitor.set_callee_specs(callee_specs);
+        }
         // The HIR pre-pass finds BOTH PB001 (unsafe blocks) and PB003
         // (unsafe impl/trait). Count only PB001 for the "unsafe blocks"
         // summary line so the diagnostic stays accurate; PB003 still flows
@@ -722,17 +887,16 @@ impl PitbullCallbacks {
                     // visitor's downstream processing
                     // (`maybe_emit_overflow_obligation`) is
                     // source-agnostic.
-                    let mut preconditions = cfg
-                        .verification
-                        .preconditions
-                        .get(&item_path)
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(attr_preconds) =
-                        hir_preconditions.get(&item_path)
-                    {
-                        preconditions.extend(attr_preconds.iter().cloned());
-                    }
+                    //
+                    // Shared with the callee-spec pre-pass above via
+                    // `callee_spec_preconditions` — the two MUST produce the
+                    // same list for the same path, or PB077 would discharge a
+                    // weaker contract than this body assumed.
+                    let preconditions = callee_spec_preconditions(
+                        &cfg,
+                        &hir_preconditions,
+                        &item_path,
+                    );
                     visitor.set_current_preconditions(preconditions);
                     // Q.4 (2026-05-26): mirror of preconditions
                     // for postconditions. The HIR pre-pass

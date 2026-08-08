@@ -71,6 +71,16 @@ regardless. The residual is now the *inverse* and far smaller: a genuinely
 *total* stdlib method the allow-list does not yet enumerate is **conservatively
 rejected** (a false *reject*, never a false discharge) until it is added — see
 `docs/SAFETY-MANUAL.md` §3.6.
+**Contracts are checked at both ends.** A `#[pitbull::requires("...")]`
+clause is an *assumption* while proving the annotated function's own body, so
+Pitbull separately requires every CALL to establish it (PB077) — otherwise
+`safe_div(a,b){a/b}` under `requires("b > 0")` would verify and so would
+`oops(){safe_div(10,0)}`, which divides by zero. Call sites whose arguments are
+constant integers are proved or refuted outright; anything not yet encodable
+(a caller variable as the argument, a raw SMT-LIB clause, a `usize` parameter)
+is reported as a coverage gap and exits non-zero. Postconditions
+(`#[pitbull::ensures]`, PB076) are proved for the straight-line body shapes the
+visitor can capture exactly, and stay *pending* otherwise.
 Pitbull will not claim to have proven what it has not: an unimplemented
 rule is a documented gap, never a silent pass.
 ## Why this list looks brutal

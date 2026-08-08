@@ -54,9 +54,24 @@ strict_library_acceptance = true
 # yet cover. Use raw SMT-LIB sparingly; the predicate form is
 # easier to audit.
 #
-# v0.2 O.3 will add `#[pitbull::requires(...)]` extraction so
-# preconditions can live next to the code they constrain instead of
-# in this config file.
+# `#[pitbull::requires("...")]` extraction landed in v0.2 O.3, so
+# preconditions can live next to the code they constrain instead of in
+# this config file. (This comment said "will add" long after it shipped;
+# corrected 2026-08-03.) Both sources are merged for a given function —
+# config clauses first, then attribute clauses — and the merged list is
+# BOTH what the callee assumes and what its callers must establish.
+#
+# ## Callers must establish what the callee assumes (PB077)
+#
+# A precondition is an ASSUMPTION while proving the callee's own body, so
+# every CALL to that function must separately establish it, or modular
+# verification would be unsound. As of Increment 1 (2026-08-03) Pitbull
+# proves this at the call site when the actual arguments are CONSTANT
+# integers: `safe_div(10, 5)` discharges against `requires("b > 0")`, and
+# `safe_div(10, 0)` is refuted with a counterexample (exit 1). Calls it
+# cannot yet encode — a caller variable as the actual, a raw-SMT-LIB
+# clause anywhere in the contract, a `usize` parameter — are reported as
+# a fail-closed coverage gap (also exit 1), never silently accepted.
 #
 # Example: prove `add_two(x: u32, y: u32) -> u32 { x + y }` safe by
 # constraining both inputs:

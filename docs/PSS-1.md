@@ -427,6 +427,45 @@ encoding would falsely discharge a wrong postcondition, so the capture
 admits only shapes it can prove exactly and invalidates on any
 projection write or uncapturable rvalue.
 **Future.** Permanent.
+### PB077 — Precondition unmet at call site
+Added 2026-08-03 alongside call-site precondition discharge, Increment 1.
+Category: Control flow (registered as the 77th rule; `RULE_COUNT = 77`).
+The DUAL of PB076. A `#[pitbull::requires("...")]` /
+`[verification.preconditions]` clause is consumed as an *assumption*
+while proving the callee's own body — it is what discharges the callee's
+internal obligations — so modular verification is only sound if every
+CALL separately establishes it. Without this rule,
+`safe_div(a,b){a/b}` under `requires("b > 0")` verified AND
+`oops(){safe_div(10,0)}` verified, yet `oops()` divides by zero (the
+2026-07-09 audit finding). From that audit until this rule landed, every
+call to a precondition-carrying function recorded a fail-closed
+CoverageGap instead — honest, but so conservative that `safe_div(10, 5)`
+could not verify either.
+**v0.2 status (Increment 1 — 2026-08-03).** The visitor emits one
+`VcObligationKind::CallSitePrecondition` per call to a
+precondition-carrying callee whose actuals it can encode: it maps each
+precondition ident to the callee's parameter, pins that parameter to the
+CONSTANT integer actual passed at this call site, asserts the negated
+conjunction of the callee's preconditions, and checks sat. `unsat` ⇒ the
+contract holds here (discharged); `sat` ⇒ a genuine counterexample
+(`safe_div(10, 0)`), NOT discharged. The pins are hypotheses, so the F1
+consistency guard runs over them exactly as for PB049/PB054/PB076.
+The encoder refuses — leaving the pre-existing CoverageGap, never a
+partial proof — unless *every* clause translates, *every* referenced
+ident names exactly one parameter of a supported primitive integer type
+(both sides sharing it for the two-ident shape), and *every* matching
+actual is an extractable constant of that same type. So a raw-SMT-LIB
+clause, a caller-variable actual, a `usize` parameter, or a mixed-width
+comparison all stay conservative rather than becoming a weaker proof.
+The precondition set discharged here is built by the same merge the
+callee's own body assumes (config clauses then attribute clauses, same
+key) — proving a SUBSET of what the callee assumed would be a false
+discharge, so there is deliberately one expression of that merge.
+**Not yet covered:** actuals that are caller parameters (Increment 2 —
+bind them to caller variables and assume the caller's own preconditions)
+and arbitrary expression actuals (Increment 3). Both keep the
+fail-closed CoverageGap today.
+**Future.** Permanent.
 ## 14. Audit methodology
 Each rule is implemented in `pitbull-subset` as a single explicit arm
 in the visitor's exhaustive dispatch. The dispatch table is over the
@@ -2378,6 +2417,53 @@ the std form and now also matches. No shadow type changes.
   `canonical_spec_key`, gate augmentation) + 3 e2e (`wrapper_ensures_on_trait_
   impl_method_binds`, `..._trait_default_method_binds`,
   `wrapper_trait_method_call_gated_under_verify_roots`).
+- ✅ **Call-site precondition discharge, Increment 1** (2026-08-03) — the
+  first COMPLETENESS increment since WS-3, and the closing half of the
+  2026-07-09 modular-verification finding. **New rule PB077** ("precondition
+  unmet at call site", `RULE_COUNT` 76 → 77) plus
+  `VcObligationKind::CallSitePrecondition`, routed through
+  `pitbull-vc::compile` verbatim exactly like `EnsuresPostcondition`
+  (`None` ⇒ pending ⇒ fail closed). The wrapper gained a callee-spec
+  pre-pass — for every in-crate fn whose path carries preconditions, record
+  its parameter names + primitive-int types — and the visitor maps each
+  precondition ident to its parameter, pins that parameter to the CONSTANT
+  actual at the call site, and asks the solver whether the negated contract
+  is satisfiable. `safe_div(10, 5)` now VERIFIES (it was a fail-closed
+  coverage gap); `safe_div(10, 0)` is REFUTED with a counterexample rather
+  than merely gapped. Tests **391 → 411**.
+  - **Why this is the delicate direction:** unlike the trait-dispatch and
+    allow-list work, this *broadens what is accepted*. Every guard is
+    therefore a refusal: one untranslatable clause abandons the whole
+    obligation (discharging the translatable subset would prove a WEAKER
+    contract than the callee assumed — the exact false-discharge shape); an
+    ident must name exactly one parameter (an unmatched ident would become a
+    free SMT symbol the solver may choose to satisfy the goal); both sides of
+    a two-ident comparison must share a width; the actual's type must equal
+    the parameter's. The precondition list itself comes from a single shared
+    merge helper used BOTH here and where the callee's body assumes it, so
+    the two cannot drift apart.
+  - **Verified, not assumed.** 20 adversarial probes were run on the real
+    nightly wrapper (z3 4.16.0 + cvc5 1.3.4, 2-of-2) before the tests were
+    written: parameter binding is correct for the first, middle, and
+    `self`-offset positions (`s.div(10, 0)` where `b` is argument index 2 is
+    refuted); the boundary is sharp (`b8(200)` refuted vs `b8(201)`
+    discharged under `x > 200`); signed comparisons use `bvsgt` (`s(10, -1)`
+    refuted); `usize`, mixed widths, raw-SMT clauses, unknown idents, and
+    caller-variable actuals all fall back to the gap; two call sites of the
+    same callee get independent verdicts; and a `verify_roots`-narrowed
+    callee still trips the #27 gate even when its call site discharges (the
+    two gates are independent, and both are required). The 34-probe
+    independent red-team suite was **re-run after the change — still 0 false
+    discharges** (the standing rule for any accept-side broadening).
+  - **Deliberately still gapped:** caller-parameter actuals (Increment 2 —
+    bind to caller variables, assume the caller's own preconditions) and
+    arbitrary expression actuals (Increment 3).
+  - Incidental, same session: `predicate::int_type_info` and
+    `smt::IntInfo::from_name` were rewritten from an if-let chain to a
+    `match` + `?` (behaviour-identical) because clippy 1.97 turned
+    `question_mark` into an `error:` on the old shape — the same
+    toolchain-drift class as the 2026-06-14 `callee_paths` fix. The
+    signedness/width decode had no direct test until now; it has one.
 **Known limitations of the current scaffold:**
 - Nightly + opt-in `cargo test` fails to link (`rlib format` errors for
   rustc internals like `rustc_data_structures`, `rustc_index`). This is a
@@ -2400,7 +2486,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 391 passing, 0 warnings, clippy clean
+# Stable: 411 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

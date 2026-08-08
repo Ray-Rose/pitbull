@@ -29,7 +29,7 @@
 //!
 //! ## Module map
 //!
-//! - [`rules`]         — the rule registry: PB001..=PB076 as static data.
+//! - [`rules`]         — the rule registry: PB001..=PB077 as static data.
 //! - [`visitor`]       — the exhaustive MIR / item / type visitor.
 //! - [`reachability`]  — call-graph traversal from `#[pitbull::verify]` roots.
 //! - [`config`]        — `pitbull.toml` parsing.
@@ -61,8 +61,8 @@ pub use config::SubsetConfig;
 pub use diagnostic::{Severity, SubsetError, SubsetReport};
 pub use rules::{Category, Rule, RuleId, RULES};
 pub use vc::{ArithOp, VcObligation, VcObligationKind};
-pub use visitor::SubsetVisitor;
+pub use visitor::{CalleeSpec, SubsetVisitor};
 /// Pitbull subset specification version this crate enforces.
 pub const PSS_VERSION: &str = "PSS-1";
 /// Number of rules defined in PSS-1.
-pub const RULE_COUNT: usize = 76;
+pub const RULE_COUNT: usize = 77;

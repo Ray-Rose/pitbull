@@ -63,12 +63,14 @@ struct IntInfo {
 }
 impl IntInfo {
     fn from_name(name: &str) -> Option<Self> {
-        let (signed, rest) = if let Some(r) = name.strip_prefix('u') {
-            (false, r)
-        } else if let Some(r) = name.strip_prefix('i') {
-            (true, r)
-        } else {
-            return None;
+        // `u` first, then `i`; the `?` is the "neither" branch. (Written
+        // as a match rather than an if-let chain because clippy 1.97+
+        // rejects the latter — same shape as
+        // `pitbull_subset::predicate::int_type_info`, which this must
+        // keep agreeing with.)
+        let (signed, rest) = match name.strip_prefix('u') {
+            Some(r) => (false, r),
+            None => (true, name.strip_prefix('i')?),
         };
         let bits = match rest {
             "8" => 8,

@@ -189,6 +189,58 @@ pub enum VcObligationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consistency_smt: Option<String>,
     },
+    /// A CALL to a function carrying `#[pitbull::requires("...")]` /
+    /// `[verification.preconditions]` clauses: the actual arguments must
+    /// establish every one of them. Maps to PB077. Increment 1
+    /// (2026-08-03).
+    ///
+    /// This is the DUAL of `EnsuresPostcondition`. A precondition is
+    /// consumed as an ASSUMPTION while proving the callee's own body, so
+    /// without a matching call-site obligation modular verification is
+    /// unsound: `safe_div(a,b){a/b}` under `requires("b > 0")` verifies,
+    /// and so did `oops(){safe_div(10,0)}` — which divides by zero.
+    ///
+    /// Emitted by the visitor at `visit_call` when the callee is in the
+    /// precondition-carrying set AND the visitor could build a sound SMT
+    /// problem from the actuals. When it could NOT, no obligation is
+    /// emitted and the pre-existing fail-closed CoverageGap audit note
+    /// fires instead — so a call site is never silently unchecked.
+    ///
+    /// `pitbull-vc::compile` routes `discharge_smt` through verbatim
+    /// (exactly like `EnsuresPostcondition`); `None` ⇒ pending ⇒ fail
+    /// closed. The visitor owns the encoding because the SMT symbol
+    /// names are the CALLEE's parameter names.
+    CallSitePrecondition {
+        /// Fully-qualified path of the callee, for the diagnostic. Also
+        /// the key under which the visitor looked up the callee's spec,
+        /// so an auditor can tie the obligation back to the contract.
+        callee_path: String,
+        /// The full SMT-LIB discharge problem: a declaration for every
+        /// callee parameter the preconditions reference, an `(assert (=
+        /// <param> <bv-literal>))` pinning each to the ACTUAL argument
+        /// passed at this call site, then the NEGATED conjunction of the
+        /// callee's preconditions, then `(check-sat)`. `unsat` ⇒ the
+        /// actuals establish the contract (discharged); `sat` ⇒ a real
+        /// counterexample (`safe_div(10, 0)`).
+        ///
+        /// `None` is unreachable from the visitor today (it emits this
+        /// kind only when it has a problem to attach) but is kept in the
+        /// type so a future increment that emits an unconstructible
+        /// obligation fails closed at `compile` rather than needing a
+        /// new code path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discharge_smt: Option<String>,
+        /// F1 vacuous-hypothesis guard: the declarations + the argument
+        /// pins + `(check-sat)`, with no goal. Must come back `sat` or
+        /// the main check's `unsat` is vacuous and the wrapper refuses
+        /// to claim discharge. Trivially satisfiable for Increment 1
+        /// (constant pins cannot contradict each other, one per
+        /// parameter), but emitted anyway: Increment 2 assumes the
+        /// CALLER's own preconditions, which can be contradictory, and
+        /// the guard must already be wired when that lands.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consistency_smt: Option<String>,
+    },
 }
 impl VcObligationKind {
     /// Canonical PSS-1 rule ID for this obligation kind, as the
@@ -213,6 +265,7 @@ impl VcObligationKind {
             VcObligationKind::IndexBound { .. } => "PB054",
             VcObligationKind::RecursionDecreases => "PB041",
             VcObligationKind::EnsuresPostcondition { .. } => "PB076",
+            VcObligationKind::CallSitePrecondition { .. } => "PB077",
         }
     }
 }

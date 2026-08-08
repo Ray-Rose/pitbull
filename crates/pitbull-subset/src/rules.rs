@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 /// Identifier for a PSS-1 rule.
 ///
-/// Rules are numbered `PB001` through `PB076` (PB076 — "postcondition
-/// unmet" — was added in v0.2 alongside `#[pitbull::ensures]`). The
-/// numeric value is
+/// Rules are numbered `PB001` through `PB077` (PB076 — "postcondition
+/// unmet" — was added in v0.2 alongside `#[pitbull::ensures]`; PB077 —
+/// "precondition unmet at call site" — alongside call-site precondition
+/// discharge). The numeric value is
 /// stable across releases: a rule's number never changes once published, and
 /// retired rules are kept in the registry as `FuturePlan::Retired` rather
 /// than renumbered.
@@ -270,6 +271,18 @@ pub const PB075: RuleId = RuleId(75);
 /// implicit return at end-of-body) must be provable from the
 /// body's effects and the precondition set.
 pub const PB076: RuleId = RuleId(76);
+/// Precondition unmet at a call site. Increment 1 (2026-08-03): added
+/// when call-site precondition discharge landed. Category F (Control
+/// flow) — the DUAL of PB076. A callee's `#[pitbull::requires]` /
+/// `[verification.preconditions]` clauses are ASSUMED while proving the
+/// callee's own body; PB077 is the matching obligation that every CALL
+/// establishes them. Without it, modular verification is unsound
+/// (`safe_div(a,b){a/b}` under `requires("b > 0")` verified AND
+/// `oops(){safe_div(10,0)}` verified — yet `oops()` divides by zero).
+/// Until this rule existed, every such call was recorded as a
+/// fail-closed CoverageGap instead; the gap remains the fallback for
+/// call sites whose actuals this increment cannot encode.
+pub const PB077: RuleId = RuleId(77);
 // -----------------------------------------------------------------------------
 // The rule registry. Order is significant for reporting: rules appear in
 // numeric order, grouped by category, mirroring `docs/PSS-1.md`.
@@ -750,6 +763,19 @@ pub const RULES: &[Rule] = &[
         rationale: "Spec-declared exit condition must hold at every return.",
         future: FuturePlan::Permanent,
     },
+    // Increment 1 (2026-08-03): call-site precondition discharge. The
+    // dual of PB076 — a precondition is ASSUMED inside the callee, so
+    // something must PROVE it at every call, or modular verification
+    // is unsound. Emitted by the visitor at `visit_call` for a callee
+    // carrying spec preconditions; `pitbull-vc::compile` routes the
+    // visitor-built SMT through verbatim (None => pending, fail closed).
+    Rule {
+        id: PB077, title: "precondition unmet at call site",
+        category: Category::ControlFlow, severity: Severity::Error,
+        rationale: "A callee's precondition is assumed while proving its body, \
+                    so every call must establish it.",
+        future: FuturePlan::Permanent,
+    },
 ];
 /// Look up a rule by id. Panics in debug, returns `None` in release if the id
 /// is unknown — callers should refer to rules through the `PB001`-style
@@ -791,7 +817,7 @@ mod tests {
             PB059, PB060, PB061, PB062, PB063,
             PB064, PB065, PB066, PB067, PB068, PB069, PB070,
             PB071, PB072, PB073, PB074, PB075,
-            PB076,
+            PB076, PB077,
         ];
         assert_eq!(constants.len(), RULES.len());
         for (k, c) in constants.iter().enumerate() {

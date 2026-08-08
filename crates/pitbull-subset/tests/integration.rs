@@ -4071,3 +4071,192 @@ fn red_team_safe_code_verifies() {
         failures.join("\n\n"),
     );
 }
+
+// =============================================================================
+// PB077 — call-site precondition discharge (Increment 1, 2026-08-03)
+// =============================================================================
+//
+// These run the REAL wrapper on real MIR, which is the only way to pin the
+// argument binding: the visitor unit tests build the actuals by hand, so an
+// adapter-side off-by-one (or a rustc lowering that doesn't put the literal
+// where the encoder expects) would pass them and fail here.
+//
+// The pair `..._discharges` / `..._refutes_violation` is the direct regression
+// pin for the modular-verification false discharge the 2026-07-09 audit found:
+// `safe_div(a,b){a/b}` under `requires("b > 0")` verifies, and before the
+// call-site gap existed `oops(){safe_div(10,0)}` ALSO verified.
+
+/// Run `source` through the wrapper with a `pitbull.toml` whose
+/// `[verification.preconditions]` carries `clauses` for `corpus_test::<key>`.
+fn run_with_preconditions(
+    env: &E2eEnv,
+    source: &str,
+    key: &str,
+    clauses: &[&str],
+) -> (String, Option<i32>) {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut cfg_path = std::env::temp_dir();
+    cfg_path.push(format!(
+        "pitbull-pb077-{}-{}.toml",
+        std::process::id(),
+        counter,
+    ));
+    let rendered: Vec<String> =
+        clauses.iter().map(|c| format!("\"{c}\"")).collect();
+    let cfg_text = format!(
+        "[project]\nname = \"corpus_test\"\n\
+         toolchain = \"pitbull-0.1.0-ferrocene-26.02.0\"\n\n\
+         [verification.preconditions]\n\
+         \"corpus_test::{key}\" = [{}]\n",
+        rendered.join(", "),
+    );
+    fs::write(&cfg_path, cfg_text).expect("write pitbull.toml");
+    let out = run_wrapper_on_source(env, source, &[("PITBULL_TOML", cfg_path.as_os_str())])
+        .expect("wrapper should spawn");
+    let _ = fs::remove_file(&cfg_path);
+    out
+}
+/// The callee under test in every probe below: safe exactly when `b > 0`.
+const PB077_CALLEE: &str = "pub fn safe_div(a: u32, b: u32) -> u32 { a / b }\n";
+#[test]
+fn wrapper_proves_callsite_precondition_discharges() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_proves_callsite_precondition_discharges: SKIPPED");
+        return;
+    };
+    let src = format!("{PB077_CALLEE}pub fn good() -> u32 {{ safe_div(10, 5) }}\n");
+    let (stderr, code) =
+        run_with_preconditions(&env, &src, "safe_div", &["b > 0"]);
+    if discharge_env_unavailable(&stderr) {
+        eprintln!(
+            "wrapper_proves_callsite_precondition_discharges: SKIPPED \
+             (discharge env unavailable)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("PB077") && stderr.contains("discharged"),
+        "a call whose constant actuals satisfy the contract must DISCHARGE \
+         PB077 (before this feature it was a fail-closed coverage gap); \
+         code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "completeness: `safe_div(10, 5)` is provably fine and must now verify. \
+         Got code {code:?}, stderr:\n{stderr}",
+    );
+}
+#[test]
+fn wrapper_refutes_callsite_precondition_violation() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_refutes_callsite_precondition_violation: SKIPPED");
+        return;
+    };
+    // The 2026-07-09 modular-verification false discharge, verbatim.
+    let src = format!("{PB077_CALLEE}pub fn oops() -> u32 {{ safe_div(10, 0) }}\n");
+    let (stderr, code) =
+        run_with_preconditions(&env, &src, "safe_div", &["b > 0"]);
+    if discharge_env_unavailable(&stderr) {
+        eprintln!(
+            "wrapper_refutes_callsite_precondition_violation: SKIPPED \
+             (discharge env unavailable)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("PB077") && stderr.contains("NOT DISCHARGED"),
+        "CARDINAL: `safe_div(10, 0)` violates `b > 0` and must be REFUTED with \
+         a counterexample, never discharged; code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "a refuted call-site precondition is undischarged ⇒ exit 1. \
+         Got code {code:?}, stderr:\n{stderr}",
+    );
+}
+#[test]
+fn wrapper_callsite_precondition_binds_the_declared_parameter() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_callsite_precondition_binds_the_declared_parameter: SKIPPED");
+        return;
+    };
+    // `a > 0` constrains the FIRST parameter, and the FIRST actual violates
+    // it while the second satisfies it. An off-by-one in the ident→argument
+    // mapping would "prove" this call and exit 0 — the exact shape of a
+    // false discharge, so it is pinned on real MIR rather than assumed.
+    let src = format!("{PB077_CALLEE}pub fn wrong() -> u32 {{ safe_div(0, 5) }}\n");
+    let (stderr, code) =
+        run_with_preconditions(&env, &src, "safe_div", &["a > 0", "b > 0"]);
+    if discharge_env_unavailable(&stderr) {
+        eprintln!(
+            "wrapper_callsite_precondition_binds_the_declared_parameter: SKIPPED \
+             (discharge env unavailable)",
+        );
+        return;
+    }
+    assert!(
+        stderr.contains("PB077") && stderr.contains("NOT DISCHARGED"),
+        "the precondition on parameter `a` must be checked against the FIRST \
+         actual (0), not the second (5); code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+}
+#[test]
+fn wrapper_callsite_precondition_falls_back_to_the_gap() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_callsite_precondition_falls_back_to_the_gap: SKIPPED");
+        return;
+    };
+    // Two shapes that Increment 1 cannot encode. Both must keep the
+    // pre-existing fail-closed coverage gap — NOT discharge a partial
+    // contract, and NOT silently pass.
+    let cases: [(&str, &str, &[&str]); 2] = [
+        (
+            "untranslatable clause",
+            // The raw-SMT clause cannot be bound to an actual; discharging
+            // only `b > 0` would prove a WEAKER contract than the callee
+            // assumed.
+            "pub fn good() -> u32 { safe_div(10, 5) }\n",
+            &["b > 0", "(assert (bvugt a #x00000063))"],
+        ),
+        (
+            "non-constant actual",
+            "pub fn fwd(v: u32) -> u32 { safe_div(10, v) }\n",
+            &["b > 0"],
+        ),
+    ];
+    for (label, caller, clauses) in cases {
+        let src = format!("{PB077_CALLEE}{caller}");
+        let (stderr, code) =
+            run_with_preconditions(&env, &src, "safe_div", clauses);
+        assert!(
+            stderr.contains("carries precondition(s)"),
+            "[{label}] must fall back to the fail-closed coverage gap; \
+             code {code:?}, stderr:\n{stderr}",
+        );
+        assert!(
+            !stderr.contains("PB077"),
+            "[{label}] must NOT emit a discharge attempt it cannot soundly \
+             encode; stderr:\n{stderr}",
+        );
+        assert_eq!(
+            code,
+            Some(1),
+            "[{label}] a coverage gap fails closed. Got {code:?}, stderr:\n{stderr}",
+        );
+    }
+}

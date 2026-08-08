@@ -137,10 +137,27 @@ pub fn compile_with_index_bits(obligation: &VcObligation, index_bits: u32) -> Op
         // here exactly like an unsupported kind — the obligation stays
         // pending so the auditor sees the gap.
         VcObligationKind::EnsuresPostcondition { discharge_smt, consistency_smt, .. } => {
-            match discharge_smt {
-                Some(s) => (s.clone(), consistency_smt.clone()),
-                None => return None,
-            }
+            // The `?` IS the fail-closed arm: no visitor-built problem ⇒
+            // `compile` returns None ⇒ the obligation reports pending.
+            (discharge_smt.clone()?, consistency_smt.clone())
+        }
+        // Increment 1 (2026-08-03): CallSitePrecondition (PB077) — the
+        // DUAL of PB076, routed identically. The visitor owns the
+        // encoding because the SMT symbol names are the CALLEE's
+        // parameter names (and the pins are this call site's actual
+        // arguments), so `pitbull-vc` passes the prebuilt problem
+        // through: `discharge_smt` becomes the goal, `consistency_smt`
+        // its F1 vacuous-hypothesis guard.
+        //
+        // `None` fails closed here exactly like an unsupported kind.
+        // The visitor does not emit this kind without a problem today —
+        // when it cannot build one it emits NO obligation and lets the
+        // pre-existing call-site CoverageGap fire instead — but the
+        // arm must still refuse rather than fabricate a goal, so that a
+        // future increment cannot introduce a silent pass by emitting an
+        // empty obligation.
+        VcObligationKind::CallSitePrecondition { discharge_smt, consistency_smt, .. } => {
+            (discharge_smt.clone()?, consistency_smt.clone())
         }
         // These kinds need richer encodings than bit-vector arithmetic
         // alone — path-sensitive symbolic execution for panic
@@ -445,6 +462,71 @@ mod tests {
             assumptions: Vec::new(),
         };
         assert!(compile(&ens_obl).is_none());
+        // Increment 1: same for a CallSitePrecondition with no problem
+        // attached. The visitor does not emit that shape today (it falls
+        // back to the coverage gap instead), but if a future increment
+        // ever does, `compile` must refuse rather than fabricate a goal.
+        let cs_obl = VcObligation {
+            id: "pb077-callsite-0".into(),
+            span: Span::default(),
+            kind: VcObligationKind::CallSitePrecondition {
+                callee_path: "demo::safe_div".into(),
+                discharge_smt: None,
+                consistency_smt: None,
+            },
+            assumptions: Vec::new(),
+        };
+        assert!(compile(&cs_obl).is_none());
+    }
+    /// Increment 1: a `CallSitePrecondition` carrying a visitor-built
+    /// problem routes through VERBATIM — `compile` must not rewrite,
+    /// re-sort, or re-derive it, because the visitor owns the symbol
+    /// names (the callee's parameters) and the pins (this call site's
+    /// actuals). The consistency problem rides along as the F1 guard.
+    #[test]
+    fn compile_routes_callsite_precondition_smt_verbatim() {
+        let discharge = "(set-logic QF_BV)\n(declare-const b (_ BitVec 32))\n\
+                         (assert (= b #x00000005))\n\
+                         (assert (not (bvugt b #x00000000)))\n(check-sat)\n";
+        let consistency = "(set-logic QF_BV)\n(declare-const b (_ BitVec 32))\n\
+                           (assert (= b #x00000005))\n(check-sat)\n";
+        let obligation = VcObligation {
+            id: "pb077-callsite-1".into(),
+            span: Span::default(),
+            kind: VcObligationKind::CallSitePrecondition {
+                callee_path: "demo::safe_div".into(),
+                discharge_smt: Some(discharge.to_string()),
+                consistency_smt: Some(consistency.to_string()),
+            },
+            assumptions: Vec::new(),
+        };
+        let goal = compile(&obligation).expect("a problem is attached");
+        assert_eq!(goal.smt, discharge, "the discharge problem must pass through unchanged");
+        assert_eq!(
+            goal.consistency_check.as_deref(),
+            Some(consistency),
+            "the F1 guard must pass through unchanged",
+        );
+        assert_eq!(obligation.kind.rule_id(), "PB077");
+    }
+    /// The new kind survives the certificate/report JSON round trip, so a
+    /// bundle written by one run replays in another (`replay` deserializes
+    /// obligations before re-running their SMT).
+    #[test]
+    fn callsite_precondition_round_trips_through_json() {
+        let o = VcObligation {
+            id: "pb077-callsite-2".into(),
+            span: Span::default(),
+            kind: VcObligationKind::CallSitePrecondition {
+                callee_path: "demo::safe_div".into(),
+                discharge_smt: Some("(check-sat)\n".into()),
+                consistency_smt: None,
+            },
+            assumptions: Vec::new(),
+        };
+        let s = serde_json::to_string(&o).expect("serialize");
+        let back: VcObligation = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, o);
     }
     /// No assumptions → no consistency check (the empty hypothesis
     /// set is trivially consistent; skipping the extra solver call
