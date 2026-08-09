@@ -4692,6 +4692,88 @@ fn wrapper_callsite_precondition_via_expression_behind_a_branch_falls_back_to_th
     assert_eq!(code, Some(1), "stderr:\n{stderr}");
 }
 #[test]
+fn wrapper_refuses_callsite_discharge_when_a_loop_can_reenter_the_call() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_refuses_callsite_discharge_when_a_loop_can_reenter_the_call: SKIPPED");
+        return;
+    };
+    // REGRESSION for a CONFIRMED CARDINAL false discharge, found by
+    // adversarial probe on 2026-08-08 and reproduced end-to-end: this exact
+    // program was reported VERIFIED (exit 0, "PB077: discharged") while
+    // panicking with "attempt to divide by zero" when actually run.
+    //
+    // The call sits in a loop header reachable BOTH from the entry block
+    // (where `t = v + 1`, provably > 0 under the caller's contract) and
+    // from the loop body (where `t = 0`). Increment 3's capture walk saw
+    // only the entry path and emitted `(= b (bvadd __pb_caller_arg0 #x1))`
+    // as a HYPOTHESIS — a premise that is false on the second iteration —
+    // so the solver "proved" `b > 0` from it. The pre-existing back-edge
+    // guard could not catch this: the walk BREAKS at the call block before
+    // ever traversing the back edge. Closed by the in-edge count guard
+    // (`block_in_edge_counts`), which refuses any block with more than one
+    // predecessor.
+    //
+    // Runtime ground truth for this source (verified, not assumed):
+    //   thread 'main' panicked: attempt to divide by zero
+    let src = format!(
+        "{PB077_INC2_PRELUDE}{PB077_INC2_CALLEE}\
+         #[pitbull::requires(\"v >= 5\")]\n#[pitbull::requires(\"v < 100\")]\n\
+         pub fn caller(v: u32) -> u32 {{\n    let mut t = v + 1;\n    \
+         loop {{\n        let r = safe_div(10, t);\n        \
+         if r == 7 {{ return r; }}\n        t = 0;\n    }}\n}}\n"
+    );
+    let (stderr, code) = run_wrapper_on_source(&env, &src, &[]).expect("wrapper should spawn");
+    assert!(
+        !stderr.contains("(PB077): discharged"),
+        "CARDINAL: this program divides by zero on its second loop \
+         iteration and must NEVER report a discharged call-site \
+         precondition; code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("carries precondition(s)"),
+        "it must fall back to the fail-closed coverage gap; \
+         code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "a program that panics at runtime must not exit 0. \
+         Got {code:?}, stderr:\n{stderr}",
+    );
+}
+#[test]
+fn wrapper_refuses_callsite_discharge_for_a_reassigned_caller_parameter() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!(
+            "wrapper_refuses_callsite_discharge_for_a_reassigned_caller_parameter: SKIPPED",
+        );
+        return;
+    };
+    // Sibling of the above (2026-08-08 audit, defence in depth). The
+    // caller's contract says `v > 0`, but `v` is overwritten with 0 before
+    // the call, so the entry-value hypothesis is false at the call site.
+    // Must be refuted or gapped — never discharged.
+    let src = format!(
+        "{PB077_INC2_PRELUDE}{PB077_INC2_CALLEE}\
+         #[pitbull::requires(\"v > 0\")]\n\
+         pub fn reassigned(mut v: u32) -> u32 {{ v = 0; safe_div(10, v) }}\n"
+    );
+    let (stderr, code) = run_wrapper_on_source(&env, &src, &[]).expect("wrapper should spawn");
+    assert!(
+        !stderr.contains("(PB077): discharged"),
+        "CARDINAL: `v` is 0 at the call site despite `requires(\"v > 0\")` \
+         describing its ENTRY value; this divides by zero and must never \
+         discharge; code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+}
+#[test]
 fn wrapper_proves_callsite_precondition_via_two_caller_params_combined() {
     let Some(env) = E2eEnv::probe() else {
         if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {

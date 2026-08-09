@@ -512,6 +512,16 @@ result) would have missed nearly every checked-arithmetic expression, i.e.
 most real code. A value behind an actual BRANCH is still refused —
 `capture_body_effect`'s own boundary, inherited unchanged: never guess
 which arm ran.
+**Reachability guard (2026-08-08 audit, CRITICAL).** The captured
+expression is emitted as a HYPOTHESIS, so it must be true of EVERY
+execution that reaches the call — not merely of the path the walk
+inspected. The walk therefore also requires the entry block to have no
+in-edges and every block it steps into to have exactly one
+(`block_in_edge_counts`). Without this, a call at a MERGE POINT — the shape
+a loop header produces — was a reproduced false discharge: `let mut t = v +
+1; loop { safe_div(10, t); ...; t = 0; }` reported *discharged*, exit 0,
+while panicking with a divide-by-zero at runtime. Any merge (loop
+back-edge, `if`/`else` join, shared continuation) now fails closed.
 **Not yet covered:** anything `capture_rvalue` itself declines — a value
 behind a branch, a bitwise op, a cast, a field/call-result read — plus a
 raw-SMT-LIB clause anywhere in either contract, a `usize` parameter, and a
@@ -2589,6 +2599,33 @@ the std form and now also matches. No shadow type changes.
     expression, Increment 3's scope) so the test keeps pinning a real
     residual instead of a stale one.
   - **Not yet covered:** arbitrary expression actuals (Increment 3).
+- ✅ **PB077 audit: one CONFIRMED false discharge found and fixed**
+  (2026-08-08, immediately after Increment 3 shipped in `4332996`).
+  Increment 3 emits the captured actual as a HYPOTHESIS
+  (`(assert (= b <expr>))`), and its walk stopped at the call's block
+  without checking the block is reachable ONLY by the chain it walked.
+  Whenever the call sits at a MERGE POINT it is not: a loop header holding
+  the call is reachable both from the entry (`t = v + 1`, provably `> 0`)
+  and from the loop body (`t = 0`), so the hypothesis was true on iteration
+  1 and false on iteration 2 — and the solver "proved" `b > 0` from it.
+  Wrapper verdict before the fix: **`(PB077): discharged`, exit 0** on a
+  program whose runtime ground truth (compiled and run, not argued) is
+  `panicked: attempt to divide by zero`. The pre-existing back-edge guard
+  could not catch it — the walk breaks at the call block before traversing
+  the back edge. **Fixed** by `block_in_edge_counts` (built on a new
+  `terminator_successors`, exhaustive over `TerminatorKind`; a wildcard arm
+  there would under-count a future variant's edges and reopen the hole):
+  the entry block must have zero in-edges and every block stepped into
+  exactly one, so any merge fails closed. Mutation-tested — disabling the
+  guard makes the regression test fail. A second, unreproduced finding was
+  guarded defensively the same session: `operand_as_caller_arg` could link
+  a REASSIGNED parameter to its entry-value symbol (today's rustc routes
+  such reads through a temp, verified by dumping MIR, but that is an
+  unverified lowering detail), now blocked by `assigned_locals`. Probed
+  clean: the caller/callee same-name symbol-collision case, sequential
+  calls, `v - 1` under `v > 0`, conditional reassignment,
+  `capture_shift_amount`'s width invariant, and the
+  `__pb_caller_arg1`/`__pb_caller_arg10` prefix trap. Tests **437 → 439**.
 - ✅ **Call-site precondition discharge, Increment 3** (2026-08-08) — same
   continuous session as Increments 1 (audit+commit) and 2, continued at the
   user's "keep moving forward". Closes Increment 2's remaining residual: a
@@ -2661,7 +2698,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 437 passing, 0 warnings, clippy clean
+# Stable: 439 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

@@ -7,9 +7,19 @@ bottom on first sit-down; refer back to individual sections
 during work.
 
 Last known-good commit at hand-off: the latest on `main` — run
-`git log -1`. The most recent milestone is **call-site precondition discharge,
-Increment 3** (2026-08-08, rule PB077 still — see the dated subsection at the
-end of §1): extends Increment 2 to a call site whose actual is a COMPUTED
+`git log -1`. The most recent work is a **dedicated adversarial audit of the
+three PB077 increments (2026-08-08, see the dated subsection at the end of
+§1), which found and closed one CONFIRMED CARDINAL false discharge in
+Increment 3 hours after it shipped.** A call sitting at a MERGE POINT (a
+loop header) had its actual captured from one predecessor only, so the
+emitted hypothesis was true on the first iteration and false on the second;
+`let mut t = v + 1; loop { safe_div(10, t); …; t = 0; }` reported
+*discharged*, exit 0, and panicked with a divide-by-zero when actually run.
+Closed by a unique-reachability (in-edge count) guard; mutation-tested; a
+second, unreproduced parameter-reassignment vector was guarded defensively
+in the same pass. **Read that subsection before extending PB077.** The
+milestone it audits is **call-site precondition discharge,
+Increment 3** (2026-08-08, rule PB077): extends Increment 2 to a call site whose actual is a COMPUTED
 EXPRESSION (`v + 1`) over constants and/or the caller's own parameters,
 traced back through the caller's own straight-line statements —
 `fn caller(v: u32) { let t = v + 1; safe_div(10, t) }` under a caller
@@ -84,7 +94,7 @@ deep-audit cleanup passes. Branch `main`, with `origin` remote on GitHub.
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 437 tests passing (226 subset-lib + 100 vc + 76 integration + 12 aorte_proofs + 5 allowlist-exhaustiveness + 18 driver-bin),
+- **State:** 439 tests passing (228 subset-lib + 100 vc + 78 integration + 12 aorte_proofs + 5 allowlist-exhaustiveness + 18 driver-bin),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -262,16 +272,19 @@ d3682f6 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **437 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **439 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The **437** breaks down: 4 (cargo-pitbull bin) + 14 (pitbull-rustc bin) + 226
-(subset lib) + 76 (integration) + 12 (aorte_proofs) + 5 (allowlist_exhaustiveness)
-+ 100 (vc) = 437 (the 2026-08-08 call-site precondition Increment 3 added +13
-over 424: 7 visitor unit tests for the expression-capture encoding —
+The **439** breaks down: 4 (cargo-pitbull bin) + 14 (pitbull-rustc bin) + 228
+(subset lib) + 78 (integration) + 12 (aorte_proofs) + 5 (allowlist_exhaustiveness)
++ 100 (vc) = 439 (the 2026-08-08 PB077 AUDIT added +2 over 437 — the
+merge-point/loop-back-edge false-discharge regression and the
+reassigned-caller-parameter guard, each pinned by a visitor unit test plus an
+e2e test on the real wrapper; the 2026-08-08 call-site precondition
+Increment 3 added +13 over 424: 7 visitor unit tests for the expression-capture encoding —
 single-hop, chained, two-caller-params, the Goto-chain traversal, the
 branch boundary, and the contradictory-preconditions-via-expression
 vacuity pin — and 6 e2e integration tests pinning discharge / an
@@ -933,6 +946,94 @@ red-team discipline). Beyond PB077 itself: loops/PB042, PB043
 path-condition capture, PB041 SCC+measure remain the untouched
 multi-week items.
 
+### 2026-08-08 PB077 audit — one CONFIRMED false discharge found and fixed
+
+**A dedicated adversarial audit of the three PB077 increments, run
+immediately after they landed, found a reproduced CARDINAL false discharge
+in Increment 3 (shipped hours earlier in commit `4332996`) and closed it.**
+The lesson is the familiar one, and it applies to this session's own work:
+a feature can pass its unit tests, pass its author's hand-built red-team
+probes, ship — and still be wrong in a shape nobody thought to probe.
+
+**The bug (CRITICAL, exit 0 on a program that panics).** Increment 3's
+`capture_call_arg_expr` traces a call-site actual back through the caller's
+statements and emits the captured expression as a HYPOTHESIS
+(`(assert (= b <expr>))`). Its walk followed a linear `Goto`/`Assert` chain
+from bb0 and stopped at the call's block — but never checked that the call
+block is reachable ONLY by that chain. It is not, whenever the call sits at
+a merge point. The reproducer:
+```rust
+#[pitbull::requires("b > 0")]
+pub fn safe_div(a: u32, b: u32) -> u32 { a / b }
+
+#[pitbull::requires("v >= 5")]
+#[pitbull::requires("v < 100")]
+pub fn caller(v: u32) -> u32 {
+    let mut t = v + 1;
+    loop {
+        let r = safe_div(10, t);
+        if r == 7 { return r; }
+        t = 0;                      // second iteration divides by zero
+    }
+}
+```
+The loop header holds the call and is reachable both from bb0 (`t = v + 1`,
+provably `> 0`) and from the loop body (`t = 0`). The walk saw only bb0's
+value, so the emitted hypothesis was TRUE on iteration 1 and FALSE on
+iteration 2 — and the solver dutifully "proved" `b > 0` from it.
+**Wrapper verdict before the fix: `pb077-callsite-2 (PB077): discharged`,
+exit 0.** Runtime ground truth, verified by compiling and running the same
+source rather than argued: `thread 'main' panicked: attempt to divide by
+zero`. Note the pre-existing back-edge (`visited`) guard could NOT catch
+this — the walk breaks at the call block before ever traversing the back
+edge, so the loop is invisible to it.
+
+**The fix.** `block_in_edge_counts` counts every in-edge of every block
+(built on a new `terminator_successors`, EXHAUSTIVE over `TerminatorKind`
+with no wildcard — a `_ => vec![]` arm there would silently under-count a
+future variant's edges and reopen exactly this hole). The walk now requires
+the entry block to have zero in-edges and every block it steps INTO to have
+exactly one. Any merge — loop back-edge, `if`/`else` join, shared
+continuation — fails closed. Verified after the fix: the reproducer gaps and
+exits 1, while all six legitimate Increment 3 shapes (single-hop, chained,
+two-caller-params, and the Increment 1/2 forms) still discharge unchanged.
+**Mutation-tested**: disabling the guard makes the new regression test fail
+with the CARDINAL message, so it demonstrably catches the class it exists
+for.
+
+**Second finding (defence in depth, no repro).** `operand_as_caller_arg`
+(Increment 2) links a call-site actual to `__pb_caller_arg{i}`, whose
+meaning is the parameter's value ON ENTRY — what the caller's own `requires`
+constrains. Nothing stopped it linking a parameter the body had REASSIGNED
+(`fn f(mut v: u32) { v = 0; g(v) }`), which would prove the callee's
+contract from a premise false at the call site. Probing found today's rustc
+routes reads of a mutated parameter through a fresh temp (confirmed by
+dumping MIR), which incidentally hides the shape — but that is an unverified
+lowering detail of exactly the kind this project has been burned by before,
+so the link is now guarded explicitly by `assigned_locals` (also exhaustive
+over `StatementKind`, plus call destinations). Increment 3 needs no such
+guard: it TRACKS assignments as it walks, so it produces the correct pin
+(`b = 0`) and correctly refutes.
+
+**Also probed clean** (no findings): the symbol-collision case the canonical
+`__pb_caller_arg` naming exists for (`fn caller(b: u32) { safe_div(10, b) }`
+where caller and callee both name a parameter `b` — correctly refuted, no
+collision); two sequential calls to precondition-carrying functions (both
+discharge correctly); a decrement that can violate the contract (`v - 1`
+under only `v > 0` — correctly refuted); conditional reassignment behind a
+branch (gapped); `capture_shift_amount`'s width handling (its variable path
+delegates to `capture_operand` with the target type, so the
+"every referenced caller symbol is exactly `target_ty`" invariant that
+`CallsiteBinding::Expr` relies on genuinely holds); and the
+`__pb_caller_arg1`-vs-`__pb_caller_arg10` prefix trap in the symbol scanner
+(decodes correctly; now pinned by a test). The 34-probe independent
+red-team suite was re-run and still reports zero false discharges.
+
+**Method note worth keeping:** the loop bug was found by asking "the
+captured expression is a HYPOTHESIS, not a goal — what would make it FALSE
+at the call site?" rather than by probing more input values. For an
+assumption-emitting feature, that question is the productive one.
+
 ---
 
 ## 2. Architecture overview
@@ -1063,11 +1164,11 @@ git log --oneline -1
 # not pin a specific hash here). See the recent-commit-log block in §1.
 ```
 
-### Step 4.2 — Stable test suite (the 437-test baseline)
+### Step 4.2 — Stable test suite (the 439-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
-# Expected: "test result: ok" lines totaling 437 passing, 0 failed, 0 ignored
+# Expected: "test result: ok" lines totaling 439 passing, 0 failed, 0 ignored
 ```
 
 **A green run here is NOT by itself evidence the verifier works** (learned the
@@ -1153,7 +1254,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 437 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 439 passing.
 # Note: the 2-of-N agreement capstone additionally requires BOTH z3 and
 # cvc5 on PATH; with PITBULL_REQUIRE_E2E set it panics if either is missing.
 ```
@@ -1210,7 +1311,7 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 437 passing (same as without Z3 — the new tests
+# Expected: 439 passing (same as without Z3 — the new tests
 # also pass via graceful-skip if no solver is present, but with
 # z3 they exercise the real `unsat` verdict path).
 ```
@@ -1445,7 +1546,7 @@ git commit -m "..."
 | PB060 build-script hash recorded, not verified (2026-07-09 audit) | `trusted_build_scripts[].sha256` is format-validated (64 hex chars) only; no code hashes the referenced build.rs and compares, so a changed build script stays trusted. | `pitbull-subset/src/config.rs::validate` | Requires resolving the build.rs path per crate + hashing at wrapper start; disclosed inline in config.rs. |
 | PB072/PB073/PB074 unimplemented (2026-07-09 audit) | Cargo.lock presence, hermetic-environment, and pitbull-spec version checks do not exist (a config.rs comment previously claimed the driver performs them — corrected). PB073 is the named compensating control for the `PITBULL_*` env-injection residuals (`PITBULL_TOML` redirect, `PITBULL_ALLOW_UNSAFE_PATHS` from a hostile build.rs), so those residuals are currently guarded only by `check_env_path` hygiene. | driver | Implementing PB073 (refuse or fingerprint suspicious `PITBULL_*` provenance, e.g. a sentinel set by the subcommand) is the highest-leverage of the three. |
 | Bang-macro `unsafe {}` HIR skip (2026-07-09 audit) | The PB001 HIR pre-pass skips blocks whose span `from_expansion()`, and PB059 provenance-checks only Derive/Attr macros — a local `macro_rules!` expanding to `unsafe { … }` evades both. MIR-level operation rules (PB004/PB007/PB009…) still fire on the operations INSIDE, so this is a PB001-reporting gap more than a free pass, but it is untested. | `pitbull-driver/src/bin/pitbull-rustc.rs` (HIR pre-pass), config PB059 | Needs a Bang-macro provenance policy (allowlist local macros?) without false-flagging std macros like `assert!`. |
-| Call-site precondition SMT discharge (2026-07-09 audit; **Increment 1 DONE 2026-08-03, Increment 2 DONE 2026-08-07, Increment 3 DONE 2026-08-08 — rule PB077**) | Was: the fail-closed CoverageGap (`maybe_gap_callsite_preconditions`) made calls to precondition-carrying fns honest but CONSERVATIVE — `safe_div(10, 5)` gapped even though `5 > 0`. **Increment 1 PROVES constant actuals**; `unsat` ⇒ discharged (`safe_div(10, 5)` verifies), `sat` ⇒ refuted (`safe_div(10, 0)`). **Increment 2 additionally PROVES a bare caller-parameter actual** (`fn caller(v: u32) { safe_div(10, v) }` under `requires("v > 0")`): `operand_as_caller_arg` links the callee's parameter symbol to a canonical `__pb_caller_arg{index}` symbol (never derived from user identifier text, so it can't collide with a same-named callee parameter), and `caller_precondition_hypotheses` folds the caller's OWN precondition set in as hypotheses (best-effort — an untranslatable caller clause is dropped, not fatal). **Increment 3 additionally PROVES a computed EXPRESSION actual** (`let t = v + 1; safe_div(10, t)`): `capture_call_arg_expr` reuses `capture_rvalue`/`capture_operand` verbatim (the SAME machinery `#[pitbull::ensures]` uses for its return-effect capture — verified generic over target type before reuse, not copied) to trace the actual back through the caller's own statements. Its first draft walked only the call's own block and gapped nearly every real checked-arithmetic expression — confirmed by dumping real MIR (`rustc -Z unpretty=mir`) after the first red-team probe failed: `v + 1` lowers to `AddWithOverflow` (a tuple) in one block, read back via a `.0`-projected statement in the block the overflow `Assert` jumps to. Fixed by reusing `capture_body_effect`'s Goto/Assert-chain traversal and writing every capture into BOTH the `env` and `checked` maps; a value behind an actual branch (`SwitchInt`) is still correctly refused (the same boundary `capture_body_effect` itself draws — never guess which arm ran). All three increments route through `pitbull-vc::compile` verbatim like `EnsuresPostcondition`, and the pins/links/expressions are hypotheses, so the pre-existing, obligation-kind-agnostic F1 consistency guard runs over them regardless of which increment produced them — confirmed on the real wrapper for all three: a caller with mutually-contradictory preconditions gets `REFUSED — preconditions are contradictory`, never a vacuous discharge. | visitor + `pitbull-vc` + wrapper | **STILL OPEN (completeness, not soundness):** a raw-SMT-LIB clause anywhere in either contract, a `usize`/`isize`/non-int parameter, a mixed-width two-ident comparison, an ident naming no parameter, a value behind a branch, and a bitwise/cast/field-read/call-result operand (`capture_rvalue`'s own documented boundary) all keep the fail-closed CoverageGap. **Read before extending:** this is the one place in the codebase where a change *broadens what is accepted*, so every relaxation must be re-run against the 34-probe red-team suite (`red_team_no_false_discharge`) AND the full PB077 e2e set (now 15 tests across three increments). |
+| Call-site precondition SMT discharge (2026-07-09 audit; **Increment 1 DONE 2026-08-03, Increment 2 DONE 2026-08-07, Increment 3 DONE 2026-08-08 — rule PB077**) | Was: the fail-closed CoverageGap (`maybe_gap_callsite_preconditions`) made calls to precondition-carrying fns honest but CONSERVATIVE — `safe_div(10, 5)` gapped even though `5 > 0`. **Increment 1 PROVES constant actuals**; `unsat` ⇒ discharged (`safe_div(10, 5)` verifies), `sat` ⇒ refuted (`safe_div(10, 0)`). **Increment 2 additionally PROVES a bare caller-parameter actual** (`fn caller(v: u32) { safe_div(10, v) }` under `requires("v > 0")`): `operand_as_caller_arg` links the callee's parameter symbol to a canonical `__pb_caller_arg{index}` symbol (never derived from user identifier text, so it can't collide with a same-named callee parameter), and `caller_precondition_hypotheses` folds the caller's OWN precondition set in as hypotheses (best-effort — an untranslatable caller clause is dropped, not fatal). **Increment 3 additionally PROVES a computed EXPRESSION actual** (`let t = v + 1; safe_div(10, t)`): `capture_call_arg_expr` reuses `capture_rvalue`/`capture_operand` verbatim (the SAME machinery `#[pitbull::ensures]` uses for its return-effect capture — verified generic over target type before reuse, not copied) to trace the actual back through the caller's own statements. Its first draft walked only the call's own block and gapped nearly every real checked-arithmetic expression — confirmed by dumping real MIR (`rustc -Z unpretty=mir`) after the first red-team probe failed: `v + 1` lowers to `AddWithOverflow` (a tuple) in one block, read back via a `.0`-projected statement in the block the overflow `Assert` jumps to. Fixed by reusing `capture_body_effect`'s Goto/Assert-chain traversal and writing every capture into BOTH the `env` and `checked` maps; a value behind an actual branch (`SwitchInt`) is still correctly refused (the same boundary `capture_body_effect` itself draws — never guess which arm ran). **A 2026-08-08 audit then found Increment 3's walk was missing a UNIQUE-REACHABILITY check and reproduced a CARDINAL false discharge through it** (a call at a merge point — a loop header — captured from one predecessor only: exit 0 on a program that divides by zero on its second iteration). Closed by `block_in_edge_counts` (entry block must have zero in-edges, every block stepped into exactly one), mutation-tested; and `operand_as_caller_arg` additionally refuses to link a parameter the body ever REASSIGNS, so the entry-value hypothesis cannot be applied to a changed value. All three increments route through `pitbull-vc::compile` verbatim like `EnsuresPostcondition`, and the pins/links/expressions are hypotheses, so the pre-existing, obligation-kind-agnostic F1 consistency guard runs over them regardless of which increment produced them — confirmed on the real wrapper for all three: a caller with mutually-contradictory preconditions gets `REFUSED — preconditions are contradictory`, never a vacuous discharge. | visitor + `pitbull-vc` + wrapper | **STILL OPEN (completeness, not soundness):** a raw-SMT-LIB clause anywhere in either contract, a `usize`/`isize`/non-int parameter, a mixed-width two-ident comparison, an ident naming no parameter, a value behind a branch, a call whose block is reachable by more than one path (any merge / loop), a reassigned caller parameter, and a bitwise/cast/field-read/call-result operand (`capture_rvalue`'s own documented boundary) all keep the fail-closed CoverageGap. **Read before extending:** this is the one place in the codebase where a change *broadens what is accepted*, so every relaxation must be re-run against the 34-probe red-team suite (`red_team_no_false_discharge`) AND the full PB077 e2e set (now 17 tests across three increments plus the audit regressions). The audit subsection at the end of §1 records the productive question for this surface: the captured actual and the caller's clauses are HYPOTHESES, so ask "what would make this premise FALSE at the call site?", not "what other inputs should I try?" |
 | `extract_arg_names` index-only binding (2026-07-09 audit) | Arg names bind by `argument_index` alone without checking the debug-info place; a destructured pattern arg could attach a binding's name to the tuple local. Neutralized TODAY by the VC layer's primitive-int filter, but becomes a wrong-variable-binding vector when multi-width support widens that filter. | `pitbull-subset/src/mir_api/adapter.rs::extract_arg_names` | Require `info.value` to be a projection-free place on exactly local `i+1` before trusting the name. |
 | PB049 silent skip on projected operands | ✅ DONE in audit-cleanup. `maybe_emit_overflow_obligation` now emits a `PB049: ... skipped` audit note when operand types can't be resolved (projected operands like `p.0 + p.1`, mismatched types). Pre-fix the obligation was silently dropped — auditors reading "0 obligations" would falsely conclude verified. | — | Closed (audit finding N1, 2026-05-26). |
 | SARIF / TOML symlink follow | ✅ DONE in audit-cleanup. `check_env_path` now refuses symlink leaf paths via `symlink_metadata().file_type().is_symlink()`. Pre-fix a build.rs could create a `.json`-extension symlink to overwrite `~/.config/.../settings.json` via `PITBULL_SARIF_OUT`. | — | Closed (audit finding N2, 2026-05-26). |

@@ -124,6 +124,25 @@ pub struct SubsetVisitor<'cfg> {
     /// (`lhs` / `rhs`) when the operand is a direct read of a
     /// function parameter.
     current_body_arg_names: Vec<String>,
+    /// Every MIR local the currently-walked body ever WRITES (any
+    /// statement that stores to a place, plus every call destination),
+    /// computed once per body in `visit_body`.
+    ///
+    /// SOUNDNESS (2026-08-08 audit): `operand_as_caller_arg` links a
+    /// call-site actual to `__pb_caller_arg{i}`, a symbol whose meaning is
+    /// the parameter's value ON ENTRY — that is what the caller's own
+    /// `#[pitbull::requires]` constrains. If the body REASSIGNS that
+    /// parameter's local before the call (`fn f(mut v: u32) { v = 0;
+    /// g(v) }`), the entry value and the passed value differ, and folding
+    /// the entry-value hypothesis in would prove the callee's precondition
+    /// from a premise that is false at the call site. Today's rustc
+    /// happens to route reads of a mutated parameter through a fresh temp
+    /// (verified by dumping MIR), which incidentally hides the shape from
+    /// `operand_as_caller_arg` — but that is an unverified lowering
+    /// detail, exactly the kind of inferred-behaviour assumption this
+    /// project has been burned by before, so the link is guarded
+    /// explicitly rather than left to depend on it.
+    current_body_assigned_locals: std::collections::HashSet<u32>,
     /// Spec-derived preconditions for the currently-walked body —
     /// raw SMT-LIB assertion forms that get attached as
     /// `assumptions` to every VC obligation this body emits. Set
@@ -300,6 +319,7 @@ impl<'cfg> SubsetVisitor<'cfg> {
             vc_obligations: Vec::new(),
             current_body_locals: Vec::new(),
             current_body_arg_names: Vec::new(),
+            current_body_assigned_locals: std::collections::HashSet::new(),
             current_body_preconditions: Vec::new(),
             current_body_ensures: Vec::new(),
             current_body_return_ty: None,
@@ -457,6 +477,11 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // binding to map predicate variables (`x` in `x < 100`) to
         // operand positions (lhs/rhs of the binary op).
         self.current_body_arg_names.clone_from(&body.arg_names);
+        // 2026-08-08 audit: every local this body ever writes — see the
+        // field's doc comment for why `operand_as_caller_arg` must consult
+        // it before linking a call-site actual to a parameter's ENTRY-value
+        // symbol.
+        self.current_body_assigned_locals = Self::assigned_locals(body);
         // Q.4 (2026-05-26): cache the return type so
         // `emit_ensures_obligation` can size the SMT bit-vector
         // for `result`. Cleared on body exit alongside other
@@ -1394,6 +1419,34 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // (processing ITS statements too, then stopping BEFORE following
         // its terminator further — we want the env as of the call, not
         // wherever the call's own terminator would lead).
+        // UNIQUE-REACHABILITY GUARD (2026-08-08, closing a reproduced
+        // CARDINAL false discharge). Walking a linear chain is only sound
+        // if execution cannot reach the call block by ANY other route: the
+        // captured expression is emitted as a HYPOTHESIS (`(= b <expr>)`),
+        // so if some other path reaches the call with a different value,
+        // that hypothesis is simply FALSE at the call site and the solver
+        // will "prove" the precondition from a false premise.
+        //
+        // The exploit that motivated this (verified end-to-end, exit 0 on
+        // a program that panics at runtime):
+        //     let mut t = v + 1;
+        //     loop { let r = safe_div(10, t); if r == 7 { return r; } t = 0; }
+        // The loop header holds the call and is reachable BOTH from bb0
+        // (where `t = v + 1`, provably > 0) and from the loop body (where
+        // `t = 0`). The walk saw only bb0's value, "proved" `t > 0`, and
+        // the second iteration divided by zero. The pre-existing
+        // `visited`/back-edge guard could not catch it — the walk BREAKS at
+        // the call block before ever traversing the back edge.
+        //
+        // The guard: entry must have no in-edges, and every block stepped
+        // INTO must have exactly one. Then any execution reaching the call
+        // block came through precisely this chain, so the statements walked
+        // here are exactly the ones that ran. A merge point of any kind
+        // (loop back-edge, if/else join, shared continuation) fails closed.
+        let in_edges = Self::block_in_edge_counts(all_blocks);
+        if in_edges.first().copied().unwrap_or(0) != 0 {
+            return None; // something jumps back to the entry block
+        }
         let mut current: u32 = 0;
         let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
         loop {
@@ -1427,17 +1480,30 @@ impl<'cfg> SubsetVisitor<'cfg> {
             if current == call_block_idx {
                 break;
             }
-            match &block.terminator.kind {
-                TerminatorKind::Goto { target } => current = target.0,
-                TerminatorKind::Assert { target, .. } => current = target.0,
+            let next = match &block.terminator.kind {
+                TerminatorKind::Goto { target } => target.0,
+                TerminatorKind::Assert { target, .. } => target.0,
                 // Branches, calls (a DIFFERENT call than the one we're
                 // resolving — this function only reaches one), drops, tail
                 // calls, yields, unreachable, unwinds, inline asm — none of
                 // these precede `call_block_idx` on a straight-line path,
                 // so reaching one first means the true path is NOT linear.
                 // Fail closed; never guess which branch executes.
+                //
+                // A wildcard is acceptable HERE (unlike in
+                // `terminator_successors`, which must stay exhaustive):
+                // this arm's behaviour is `return None`, so a future
+                // variant lands on the fail-closed side by default.
                 _ => return None,
+            };
+            // The unique-reachability half of the guard: stepping INTO a
+            // block with more than one in-edge means execution could have
+            // arrived there another way, carrying values this walk never
+            // saw. Refuse rather than assume our path is the one that ran.
+            if in_edges.get(next as usize).copied().unwrap_or(0) != 1 {
+                return None;
             }
+            current = next;
         }
         // Resolve `op` itself against the fully-built env. Only a BARE
         // (unprojected) local read is an entry point — the same
@@ -1456,6 +1522,108 @@ impl<'cfg> SubsetVisitor<'cfg> {
         let smt = env.get(&p.local.0)?.clone();
         let referenced_callers = Self::referenced_caller_arg_indices(&smt);
         Some((smt, referenced_callers))
+    }
+    /// Every MIR local `body` ever writes: the base local of any place a
+    /// statement stores to, plus every call destination.
+    ///
+    /// EXHAUSTIVE over `StatementKind` with no wildcard arm, for the same
+    /// reason as `terminator_successors`: this is a "nothing is missed"
+    /// guard, so a `_ =>` arm would silently under-report a future
+    /// variant's write and reopen the hole it exists to close. Reads
+    /// (`FakeRead`, `PlaceMention`, `AscribeUserType`) and storage markers
+    /// are deliberately NOT writes — they cannot change a value — but
+    /// `Retag` IS counted, since it exists precisely to change a pointer's
+    /// aliasing provenance and costs nothing to over-approximate here.
+    fn assigned_locals(body: &crate::mir_api::Body) -> std::collections::HashSet<u32> {
+        use crate::mir_api::{StatementKind as SK, TerminatorKind as TK};
+        let mut written = std::collections::HashSet::new();
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    SK::Assign(place, _)
+                    | SK::SetDiscriminant { place, .. }
+                    | SK::Deinit(place)
+                    | SK::Retag(_, place) => {
+                        written.insert(place.local.0);
+                    }
+                    // Reads / annotations / markers / no-ops: never change
+                    // a local's value.
+                    SK::FakeRead(_)
+                    | SK::PlaceMention(_)
+                    | SK::AscribeUserType(_)
+                    | SK::StorageLive(_)
+                    | SK::StorageDead(_)
+                    | SK::Coverage
+                    | SK::Intrinsic(_)
+                    | SK::ConstEvalCounter
+                    | SK::Nop => {}
+                }
+            }
+            // A call writes its destination place.
+            if let TK::Call { destination, .. } = &block.terminator.kind {
+                written.insert(destination.local.0);
+            }
+        }
+        written
+    }
+    /// Every basic block a terminator can transfer control to.
+    ///
+    /// EXHAUSTIVE over `TerminatorKind` with no wildcard arm, deliberately
+    /// and per this file's audit posture: this feeds
+    /// `block_in_edge_counts`, whose soundness argument is "no incoming
+    /// edge is missed". A `_ => vec![]` arm would silently under-count a
+    /// future variant's edges and reopen the very false discharge the
+    /// counts exist to close (see `capture_call_arg_expr`). If
+    /// `rustc_public` gains a variant, this fails to compile — which is
+    /// the intended outcome.
+    ///
+    /// Unwind/cleanup edges are not modelled by the shadow IR at all (no
+    /// variant carries one), so they cannot be missed here; the shapes
+    /// that would introduce them are separately rejected (PB048).
+    fn terminator_successors(kind: &crate::mir_api::TerminatorKind) -> Vec<u32> {
+        use crate::mir_api::TerminatorKind as TK;
+        match kind {
+            TK::Goto { target }
+            | TK::Drop { target, .. }
+            | TK::Assert { target, .. } => vec![target.0],
+            TK::SwitchInt { targets, .. } => targets.iter().map(|t| t.0).collect(),
+            TK::Call { target, .. } => target.iter().map(|t| t.0).collect(),
+            TK::Yield { resume, .. } => vec![resume.0],
+            TK::FalseEdge { real_target } | TK::FalseUnwind { real_target } => {
+                vec![real_target.0]
+            }
+            // Terminal / no-successor kinds.
+            TK::UnwindResume
+            | TK::UnwindTerminate
+            | TK::Return
+            | TK::Unreachable
+            | TK::TailCall { .. }
+            | TK::CoroutineDrop
+            | TK::InlineAsm { .. } => Vec::new(),
+        }
+    }
+    /// In-edge count per basic block, over the WHOLE body — the guard that
+    /// makes `capture_call_arg_expr`'s linear walk sound.
+    ///
+    /// A block with more than one predecessor is a MERGE POINT: execution
+    /// can arrive carrying values from a path this walk never inspected.
+    /// The motivating case is a loop back-edge (found by adversarial probe
+    /// 2026-08-08, a reproduced CARDINAL false discharge — see
+    /// `capture_call_arg_expr`), but any merge has the same defect.
+    fn block_in_edge_counts(all_blocks: &[crate::mir_api::BasicBlockData]) -> Vec<usize> {
+        let mut counts = vec![0usize; all_blocks.len()];
+        for block in all_blocks {
+            for target in Self::terminator_successors(&block.terminator.kind) {
+                if let Some(slot) = counts.get_mut(target as usize) {
+                    *slot += 1;
+                }
+                // An out-of-range target is malformed shadow IR. It cannot
+                // raise any in-range count, so ignoring it never makes a
+                // block look LESS reachable than it is — the fail-closed
+                // direction for this guard.
+            }
+        }
+        counts
     }
     /// Extract every distinct caller-argument index a captured SMT
     /// expression references, by scanning for the canonical
@@ -1528,6 +1696,17 @@ impl<'cfg> SubsetVisitor<'cfg> {
         let arg_idx = local_idx - 1;
         if arg_idx >= self.current_body_arg_names.len() {
             return None; // a temp/let-bound local, not an argument slot
+        }
+        // 2026-08-08 audit: `__pb_caller_arg{i}` means the parameter's
+        // value ON ENTRY (that is what the caller's own `requires`
+        // constrains). If this body ever writes that local, the entry
+        // value and the value at this call site can differ, and the
+        // hypothesis would be false at the call site. Refuse the link;
+        // `capture_call_arg_expr` (Increment 3) may still resolve the
+        // operand correctly, because it TRACKS assignments as it walks
+        // rather than assuming the entry value survives.
+        if self.current_body_assigned_locals.contains(&place.local.0) {
+            return None;
         }
         let ty = primitive_int_name_from_ty(&self.current_body_locals.get(local_idx)?.ty)?;
         Some((arg_idx, ty))
@@ -9225,6 +9404,28 @@ mod tests {
             SubsetVisitor::referenced_caller_arg_indices(""),
             Vec::<usize>::new(),
         );
+        // The classic prefix trap: `__pb_caller_arg1` is a textual prefix
+        // of `__pb_caller_arg10`. Mis-parsing would attribute a hypothesis
+        // to the WRONG parameter (or declare a symbol the problem never
+        // uses), so both must decode exactly and independently.
+        assert_eq!(
+            SubsetVisitor::referenced_caller_arg_indices(
+                "(bvadd __pb_caller_arg1 __pb_caller_arg10)"
+            ),
+            vec![1, 10],
+        );
+        assert_eq!(
+            SubsetVisitor::referenced_caller_arg_indices("(bvsub __pb_caller_arg10 x)"),
+            vec![10],
+            "a two-digit index must not decode as its one-digit prefix",
+        );
+        // Defensive: a marker with no digits after it must terminate the
+        // scan rather than spin (it cannot be produced by
+        // `caller_arg_symbol`, but the loop must still be total).
+        assert_eq!(
+            SubsetVisitor::referenced_caller_arg_indices("__pb_caller_arg)"),
+            Vec::<usize>::new(),
+        );
     }
     /// A single-statement caller body: `local[params.len()+1] = lhs <op>
     /// rhs;` followed by a call to `path` with `call_args`. Sequential
@@ -9486,6 +9687,165 @@ mod tests {
                 },
             ],
             span: Span::default(),
+        }
+    }
+    // === 2026-08-08 audit regressions (a reproduced CARDINAL false
+    // discharge and its defence-in-depth sibling) ===
+    #[test]
+    fn pb077_expr_merge_point_into_the_call_block_is_not_captured() {
+        // REGRESSION for a CONFIRMED false discharge (2026-08-08, exit 0 on
+        // a program that panics at runtime). Two blocks BOTH jump to the
+        // call block, so execution can arrive carrying a value this walk
+        // never inspected — the shape a loop back-edge produces:
+        //     let mut t = v + 1;
+        //     loop { let r = safe_div(10, t); if r == 7 { return r; } t = 0; }
+        // The walk saw only `t = v + 1` (provably > 0), "proved" the
+        // callee's `b > 0`, and iteration 2 divided by zero. The
+        // pre-existing back-edge guard could not catch it: the walk BREAKS
+        // at the call block before ever traversing the back edge. The
+        // in-edge count guard is what closes it.
+        use crate::mir_api::*;
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let bool_ty = Ty { kind: TyKind::RigidTy(RigidTy::Bool) };
+        let local =
+            |ty: Ty| LocalDecl { ty, span: Span::default(), mutability: Mutability::Not };
+        // bb0: t = v + 1; goto bb2      <- the walk's path
+        // bb1: t = 0;     goto bb2      <- the OTHER predecessor
+        // bb2: call callee(t)
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![pb077_u32()],
+            arg_names: vec!["v".to_string()],
+            return_ty: bool_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![local(bool_ty.clone()), local(pb077_u32()), local(pb077_u32())],
+            blocks: vec![
+                BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(2), projection: vec![] },
+                            Rvalue::BinaryOp(BinOp::Add, op_param(0), op_const_u32(1)),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator {
+                        kind: TerminatorKind::Goto { target: BasicBlock(2) },
+                        span: Span::default(),
+                    },
+                },
+                BasicBlockData {
+                    statements: vec![Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(2), projection: vec![] },
+                            Rvalue::Use(op_const_u32(0)),
+                        ),
+                        span: Span::default(),
+                    }],
+                    terminator: Terminator {
+                        kind: TerminatorKind::Goto { target: BasicBlock(2) },
+                        span: Span::default(),
+                    },
+                },
+                BasicBlockData {
+                    statements: vec![],
+                    terminator: Terminator {
+                        kind: TerminatorKind::Call {
+                            func: Operand::Constant(ConstOperand {
+                                ty: bool_ty,
+                                def_id: None,
+                                path: Some("demo::callee".to_string()),
+                                value: None,
+                            }),
+                            args: vec![op_local(2)],
+                            destination: Place { local: Local(0), projection: vec![] },
+                            target: None,
+                        },
+                        span: Span::default(),
+                    },
+                },
+            ],
+            span: Span::default(),
+        };
+        let (discharge, _consistency, gapped) = pb077_run_2(&cfg, spec, &["v >= 5"], &body);
+        assert!(
+            discharge.is_none(),
+            "CARDINAL: a call block with TWO predecessors must never be \
+             captured from one of them — the other path may carry a \
+             different value (this exact shape verified exit 0 on a \
+             divide-by-zero program before the fix)",
+        );
+        assert!(gapped, "it must fall back to the fail-closed coverage gap");
+    }
+    #[test]
+    fn pb077_reassigned_caller_parameter_is_not_linked_to_its_entry_value() {
+        // Defence in depth (2026-08-08 audit). `__pb_caller_arg{i}` means
+        // the parameter's value ON ENTRY — what the caller's own
+        // `requires` constrains. If the body REASSIGNS that local, the
+        // entry value and the value passed can differ, so the link would
+        // rest on a premise false at the call site. Today's rustc happens
+        // to route reads of a mutated parameter through a temp (verified by
+        // dumping MIR), which hides the shape — but that is an unverified
+        // lowering detail, so the guard is explicit.
+        use crate::mir_api::*;
+        let cfg = SubsetConfig::default_for_test();
+        let spec = pb077_callee_spec(&["b"], &[pb077_u32()], &["b > 0"]);
+        let bool_ty = Ty { kind: TyKind::RigidTy(RigidTy::Bool) };
+        let local =
+            |ty: Ty| LocalDecl { ty, span: Span::default(), mutability: Mutability::Not };
+        // `_1 = 0;` then `callee(copy _1)` — a DIRECT read of the parameter
+        // local after it was overwritten, which is precisely the shape
+        // `operand_as_caller_arg` must refuse to link.
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![pb077_u32()],
+            arg_names: vec!["v".to_string()],
+            return_ty: bool_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![local(bool_ty.clone()), local(pb077_u32())],
+            blocks: vec![BasicBlockData {
+                statements: vec![Statement {
+                    kind: StatementKind::Assign(
+                        Place { local: Local(1), projection: vec![] },
+                        Rvalue::Use(op_const_u32(0)),
+                    ),
+                    span: Span::default(),
+                }],
+                terminator: Terminator {
+                    kind: TerminatorKind::Call {
+                        func: Operand::Constant(ConstOperand {
+                            ty: bool_ty,
+                            def_id: None,
+                            path: Some("demo::callee".to_string()),
+                            value: None,
+                        }),
+                        args: vec![op_param(0)],
+                        destination: Place { local: Local(0), projection: vec![] },
+                        target: None,
+                    },
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let (discharge, _consistency, _gapped) = pb077_run_2(&cfg, spec, &["v > 0"], &body);
+        // Increment 3's expression capture legitimately resolves this — it
+        // TRACKS the assignment rather than assuming the entry value — so
+        // the obligation may still be emitted; what must NOT happen is a
+        // link to the entry-value symbol, which would let the caller's
+        // `v > 0` "prove" a parameter that is now 0.
+        if let Some(smt) = discharge {
+            assert!(
+                !smt.contains("(assert (= b __pb_caller_arg0))"),
+                "must not link a REASSIGNED parameter to its entry-value \
+                 symbol:\n{smt}",
+            );
+            assert!(
+                smt.contains("(assert (= b #x00000000))"),
+                "the tracked assignment (`v = 0`) is the correct pin:\n{smt}",
+            );
         }
     }
     #[test]
