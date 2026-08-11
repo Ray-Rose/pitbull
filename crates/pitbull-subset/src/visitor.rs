@@ -3678,6 +3678,27 @@ impl<'cfg> SubsetVisitor<'cfg> {
     /// solver — the obligation reports as undischarged. That's
     /// the audit-safe direction: missing-bind ⇒ over-approximate
     /// "could fail", not under-approximate "vacuously holds".
+    ///
+    /// SOUNDNESS — entry-value semantics (2026-08-08 obligation sweep).
+    /// The name this returns is used to attach the user's
+    /// `#[pitbull::requires]` clauses to the operand as SMT HYPOTHESES,
+    /// and those clauses describe the parameter's value ON ENTRY. If the
+    /// body ever REASSIGNS the parameter's local, an operand reading it
+    /// mid-body may hold a different value, and the entry-value
+    /// hypothesis would be false at the obligation site — the same
+    /// premise-falsification class as the PB077 merge-point false
+    /// discharge fixed the same day, reached through mutation instead of
+    /// control flow. So a written local refuses to bind. Not
+    /// exploitable on today's rustc — dumping real MIR shows any
+    /// assignment to a parameter reroutes ALL its reads (even ones
+    /// before the assignment) through fresh temps, which never map to
+    /// arg slots — but that is load-bearing, unverified lowering
+    /// behaviour of exactly the kind this project refuses to lean on,
+    /// and the naive binding is directly constructible in shadow IR.
+    /// The guard's granularity (body-wide, not flow-sensitive)
+    /// matches the observed lowering exactly, so it costs zero live
+    /// completeness: every read today's rustc routes through a temp
+    /// already failed to bind before this guard existed.
     fn local_arg_name(&self, local: crate::mir_api::Local) -> Option<String> {
         // Local `_0` is the return slot; `_1..=_arg_count` are args.
         // arg_names is indexed [0..arg_count) → maps to locals [1..=arg_count].
@@ -3686,6 +3707,12 @@ impl<'cfg> SubsetVisitor<'cfg> {
             return None;
         }
         let arg_idx = local_idx - 1;
+        if arg_idx >= self.current_body_arg_names.len() {
+            return None;
+        }
+        if self.current_body_assigned_locals.contains(&local.0) {
+            return None; // reassigned parameter — entry-value contract void
+        }
         let name = self.current_body_arg_names.get(arg_idx)?;
         if name.is_empty() {
             None
@@ -3779,6 +3806,24 @@ impl<'cfg> SubsetVisitor<'cfg> {
         // Walk the linear block chain from bb0, following Goto /
         // Assert-success until Return. A revisited block is a back-edge
         // (loop) → fail closed. The visited set also bounds the walk.
+        //
+        // WHY NO IN-EDGE-COUNT GUARD (2026-08-08 obligation sweep) — this
+        // walk was audited against the merge-point false discharge found
+        // in `capture_call_arg_expr` (PB077) the same day, and is immune
+        // by a closed-chain argument the PB077 walk cannot make: every
+        // block from bb0 through to the END of this chain has its
+        // terminator constrained (Goto/Assert = exactly one successor,
+        // Return = none, anything else aborts the capture), so the set of
+        // blocks reachable from function entry IS the walked chain.
+        // A block outside the chain with an edge INTO it is therefore
+        // dead code — no execution can ever take that edge — and a merge
+        // WITHIN the chain would require some block to be visited twice,
+        // which the `visited` set catches. `capture_call_arg_expr` is
+        // different precisely because it stops at an INTERIOR block (the
+        // call), whose own continuation re-enters the unconstrained rest
+        // of the CFG and can loop back in; hence its explicit
+        // `block_in_edge_counts` guard. If this walk is ever changed to
+        // stop anywhere short of `Return`, it inherits that requirement.
         let mut current: u32 = 0;
         let mut visited: std::collections::HashSet<u32> =
             std::collections::HashSet::new();
@@ -5487,6 +5532,189 @@ mod tests {
             vec!["(assert (bvult lhs #x00000064))".to_string()],
             "predicate `x < 100` must bind to lhs (where x is) and \
              translate to an unsigned-less-than BV assertion",
+        );
+    }
+    /// 2026-08-08 obligation sweep (SOUNDNESS): the same body as
+    /// `predicate_precondition_binds_lhs_operand`, but the parameter local
+    /// is REASSIGNED before the arithmetic op reads it directly. The
+    /// `requires("x < 100")` clause describes `x`'s value ON ENTRY; at the
+    /// op site `x` holds something else, so binding the clause there would
+    /// discharge the overflow check from a premise false at the site —
+    /// the mutation-reached sibling of the PB077 merge-point false
+    /// discharge. Today's rustc reroutes reads of an assigned parameter
+    /// through temps (verified by MIR dump), so this exact shape is not
+    /// live — but nothing forbids it, shadow IR expresses it directly, and
+    /// the guard in `local_arg_name` must refuse it.
+    #[test]
+    fn predicate_precondition_does_not_bind_to_reassigned_parameter() {
+        use crate::mir_api::*;
+        let u32_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U32)) };
+        let local = |m| LocalDecl { ty: u32_ty.clone(), span: Span::default(), mutability: m };
+        // `fn f(mut x: u32, y: u32) { x = y; x + 1 }` with the op reading
+        // `_1` DIRECTLY (the hypothetical future lowering).
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![u32_ty.clone(), u32_ty.clone()],
+            arg_names: vec!["x".into(), "y".into()],
+            return_ty: u32_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![
+                local(Mutability::Not),
+                local(Mutability::Mut),
+                local(Mutability::Not),
+                local(Mutability::Not),
+            ],
+            blocks: vec![BasicBlockData {
+                statements: vec![
+                    // x = y
+                    Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(1), projection: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: Local(2),
+                                projection: vec![],
+                            })),
+                        ),
+                        span: Span::default(),
+                    },
+                    // _3 = x + 1, reading local _1 directly
+                    Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(3), projection: vec![] },
+                            Rvalue::BinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place { local: Local(1), projection: vec![] }),
+                                Operand::Constant(ConstOperand {
+                                    ty: u32_ty.clone(),
+                                    def_id: None,
+                                    path: None,
+                                    value: Some(1),
+                                }),
+                            ),
+                        ),
+                        span: Span::default(),
+                    },
+                ],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_preconditions(vec!["x < 100".into()]);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        assert_eq!(report.vc_obligations.len(), 1, "the add still gets its obligation");
+        assert!(
+            !report.vc_obligations[0]
+                .assumptions
+                .iter()
+                .any(|a| a.contains("bvult")),
+            "CARDINAL: the entry-value clause `x < 100` must NOT be assumed \
+             at an op reading the REASSIGNED `x`; got assumptions {:?}",
+            report.vc_obligations[0].assumptions,
+        );
+        assert!(
+            report
+                .audit_notes
+                .iter()
+                .any(|n| n.message.contains("does not bind to any operand")),
+            "the refused clause must be surfaced, not silently dropped; got {:?}",
+            report.audit_notes,
+        );
+    }
+    /// Sibling of the above for PB054: an index projection whose index
+    /// local is a REASSIGNED parameter must not carry `idx_source_name`
+    /// (which would let `requires("i < len")` — an entry-value contract —
+    /// constrain an index that no longer holds the entry value).
+    #[test]
+    fn index_bound_source_name_not_bound_for_reassigned_parameter() {
+        use crate::mir_api::*;
+        let u8_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::U8)) };
+        let usize_ty = Ty { kind: TyKind::RigidTy(RigidTy::Uint(UintTy::Usize)) };
+        let slice_ty = Ty {
+            kind: TyKind::RigidTy(RigidTy::Ref(
+                Mutability::Not,
+                Box::new(Ty { kind: TyKind::RigidTy(RigidTy::Slice(Box::new(u8_ty.clone()))) }),
+            )),
+        };
+        let mk = |ty: &Ty| LocalDecl {
+            ty: ty.clone(),
+            span: Span::default(),
+            mutability: Mutability::Not,
+        };
+        // `fn at(s: &[u8], mut i: usize) { i = 100; s[i] }` with the index
+        // projection reading `_2` DIRECTLY.
+        let body = Body {
+            def_id: DefId(0),
+            arg_tys: vec![slice_ty.clone(), usize_ty.clone()],
+            arg_names: vec!["s".into(), "i".into()],
+            return_ty: u8_ty.clone(),
+            is_unsafe: false,
+            is_async: false,
+            locals: vec![mk(&u8_ty), mk(&slice_ty), mk(&usize_ty)],
+            blocks: vec![BasicBlockData {
+                statements: vec![
+                    // i = 100
+                    Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(2), projection: vec![] },
+                            Rvalue::Use(Operand::Constant(ConstOperand {
+                                ty: usize_ty.clone(),
+                                def_id: None,
+                                path: None,
+                                value: Some(100),
+                            })),
+                        ),
+                        span: Span::default(),
+                    },
+                    // _0 = s[i], Index(_2) directly
+                    Statement {
+                        kind: StatementKind::Assign(
+                            Place { local: Local(0), projection: vec![] },
+                            Rvalue::Use(Operand::Copy(Place {
+                                local: Local(1),
+                                projection: vec![
+                                    ProjectionElem::Deref,
+                                    ProjectionElem::Index(Local(2)),
+                                ],
+                            })),
+                        ),
+                        span: Span::default(),
+                    },
+                ],
+                terminator: Terminator {
+                    kind: TerminatorKind::Return,
+                    span: Span::default(),
+                },
+            }],
+            span: Span::default(),
+        };
+        let cfg = SubsetConfig::default_for_test();
+        let mut v = SubsetVisitor::new(&cfg);
+        v.set_current_preconditions(vec!["i < len".into()]);
+        v.visit_body(&body, false);
+        let report = v.into_report();
+        let idx_names: Vec<_> = report
+            .vc_obligations
+            .iter()
+            .filter_map(|o| match &o.kind {
+                crate::vc::VcObligationKind::IndexBound { idx_source_name } => {
+                    Some(idx_source_name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!idx_names.is_empty(), "the index still gets its obligation");
+        assert!(
+            idx_names.iter().all(Option::is_none),
+            "CARDINAL: a REASSIGNED index parameter must not bind its \
+             source name (the `i < len` entry-value contract would \
+             constrain an index that is now 100); got {idx_names:?}",
         );
     }
     /// O.2 + audit hardening (F2): a predicate-format precondition

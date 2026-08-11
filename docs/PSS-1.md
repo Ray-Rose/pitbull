@@ -2599,6 +2599,34 @@ the std form and now also matches. No shadow type changes.
     expression, Increment 3's scope) so the test keeps pinning a real
     residual instead of a stale one.
   - **Not yet covered:** arbitrary expression actuals (Increment 3).
+- ✅ **Obligation-assumption sweep: entry-value binding guarded, PB076
+  proven immune** (2026-08-08, same session as the PB077 audit below —
+  its question applied to every other hypothesis-emitting surface).
+  (A) `local_arg_name` — the choke point resolving operand locals to
+  parameter names for PB049 lhs/rhs, unary-neg, variable shift amounts,
+  and PB054's `idx_source_name` — attached entry-value `requires` clauses
+  to mid-body reads without checking whether the parameter had been
+  REASSIGNED. Directly constructible in shadow IR as a false discharge
+  (`fn f(mut x: u32, y: u32) { x = y; x + 1 }` under `requires("x <
+  100")`); NOT live on today's rustc — real-MIR dumps (taken before
+  assuming exploitability) show any assignment to a parameter reroutes
+  all its reads through temps, body-wide, which never bind — but that is
+  unverified load-bearing lowering, so the guard is now explicit:
+  `local_arg_name` refuses any local in `current_body_assigned_locals`.
+  Body-wide granularity matches the observed lowering exactly → zero live
+  completeness cost. Mutation-tested unit pins + 3 e2e wrapper pins.
+  SAFETY-MANUAL §3.7 now states the entry-value semantics for users.
+  (B) `capture_body_effect` (PB076) audited for the PB077 merge-point
+  bug: immune by a closed-chain argument (every terminator constrained
+  bb0→Return ⇒ reachable set = walked chain ⇒ outside in-edges are dead
+  code; internal merges force a revisit the `visited` set catches),
+  now documented in its comments — with the warning that any variant
+  stopping short of `Return` inherits the in-edge-guard requirement —
+  and pinned by `wrapper_ensures_behind_a_loop_never_discharges`.
+  (C) PB043/PB041 pending-only, constant pins path-independent, ensures
+  env TRACKS reassignment: all clean. Tests **441 → 446** (the prior
+  entry's "437 → 439" undercounted itself — it landed +4, at 441; counts
+  are now re-derived from suite output rather than hand-carried).
 - ✅ **PB077 audit: one CONFIRMED false discharge found and fixed**
   (2026-08-08, immediately after Increment 3 shipped in `4332996`).
   Increment 3 emits the captured actual as a HYPOTHESIS
@@ -2698,7 +2726,7 @@ the std form and now also matches. No shadow type changes.
   right home for tests that exercise the adapter against real MIR.
 **Verification today:**
 ```bash
-# Stable: 439 passing, 0 warnings, clippy clean
+# Stable: 446 passing, 0 warnings, clippy clean
 cargo +stable test --workspace --all-features
 cargo +stable clippy --workspace --all-features --all-targets
 # Nightly + opt-in: wrapper builds + lints, end-to-end PB049/PB054

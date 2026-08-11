@@ -4810,3 +4810,97 @@ fn wrapper_proves_callsite_precondition_via_two_caller_params_combined() {
     );
     assert_eq!(code, Some(0), "stderr:\n{stderr}");
 }
+
+// =============================================================================
+// 2026-08-08 obligation-assumption sweep: entry-value binding regressions
+// =============================================================================
+//
+// The PB077 audit's question -- "this is a HYPOTHESIS; what makes it false at
+// the site where it is assumed?" -- applied to the other obligation kinds.
+// A `#[pitbull::requires]` clause describes a parameter's value ON ENTRY, but
+// PB049/PB054 attach it to an operand read mid-body. If the body reassigned
+// that parameter first, the premise is false at the site. Today's rustc
+// reroutes every read of an assigned parameter through a fresh temp (verified
+// by MIR dump -- even reads BEFORE the assignment), which shields the naive
+// binding; the `local_arg_name` guard makes that shield explicit instead of
+// an unverified lowering accident. These tests pin the fail-closed verdicts
+// on the real wrapper so a future lowering change cannot silently reopen it.
+#[test]
+fn wrapper_refuses_pb049_discharge_for_reassigned_parameter() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_refuses_pb049_discharge_for_reassigned_parameter: SKIPPED");
+        return;
+    };
+    // `x` is reassigned to the unconstrained `y` before `x + 1`, so the
+    // entry-value clause `x < 100` proves nothing about the operand;
+    // f(0, u32::MAX) overflows at runtime. Never discharge.
+    let src = "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+               #[pitbull::requires(\"x < 100\")]\n\
+               pub fn f(mut x: u32, y: u32) -> u32 { x = y; x + 1 }\n";
+    let (stderr, code) = run_wrapper_on_source(&env, src, &[]).expect("wrapper should spawn");
+    assert!(
+        !stderr.contains("(PB049): discharged"),
+        "CARDINAL: an entry-value clause must not discharge an op on the \
+         REASSIGNED parameter; code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+}
+#[test]
+fn wrapper_refuses_pb054_discharge_for_reassigned_index_parameter() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_refuses_pb054_discharge_for_reassigned_index_parameter: SKIPPED");
+        return;
+    };
+    // `i` is reassigned to 100 before `s[i]`; `requires("i < len")`
+    // describes the ENTRY i. at(&[1,2,3], 0) indexes out of bounds at
+    // runtime. Never discharge.
+    let src = "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+               #[pitbull::requires(\"i < len\")]\n\
+               pub fn at(s: &[u8], mut i: usize) -> u8 { i = 100; s[i] }\n";
+    let (stderr, code) = run_wrapper_on_source(&env, src, &[]).expect("wrapper should spawn");
+    assert!(
+        !stderr.contains("(PB054): discharged"),
+        "CARDINAL: `i < len` must not discharge an index whose parameter \
+         was REASSIGNED; code {code:?}, stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+}
+#[test]
+fn wrapper_ensures_behind_a_loop_never_discharges() {
+    let Some(env) = E2eEnv::probe() else {
+        if std::env::var_os("PITBULL_REQUIRE_E2E").is_some() {
+            panic!("PITBULL_REQUIRE_E2E set but e2e prerequisites missing");
+        }
+        eprintln!("wrapper_ensures_behind_a_loop_never_discharges: SKIPPED");
+        return;
+    };
+    // Pins `capture_body_effect`'s closed-chain soundness argument (see its
+    // doc comment): a returning body containing a loop necessarily contains
+    // a branch, which aborts the effect capture, so a FALSE postcondition
+    // whose falsity lives on the looped path (`r = 0`, making
+    // `result == x` wrong) must report pending -- never discharged. This is
+    // the PB076 face of the PB077 merge-point bug class, structurally
+    // prevented rather than guarded.
+    let src = "#![feature(register_tool)]\n#![register_tool(pitbull)]\n\
+               #[pitbull::ensures(\"result == x\")]\n\
+               pub fn f(x: u32) -> u32 {\n    let mut r = x;\n    \
+               let mut n = 0u32;\n    while n < 1 { r = 0; n = 1; }\n    r\n}\n";
+    let (stderr, code) = run_wrapper_on_source(&env, src, &[]).expect("wrapper should spawn");
+    assert!(
+        !stderr.contains("(PB076): discharged"),
+        "CARDINAL: a false postcondition behind a loop must never \
+         discharge; code {code:?}, stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("(PB076): pending"),
+        "the loop aborts effect capture, so the obligation must be \
+         PENDING (fail closed); stderr:\n{stderr}",
+    );
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+}

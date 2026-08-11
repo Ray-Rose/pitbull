@@ -321,6 +321,19 @@ the boundary is never *silent*:
   Prefer indexing whose bound the verifier derives, or ensure your `len`
   genuinely equals the slice length. This is the standard SPARK contract —
   *garbage precondition in, garbage proof out* — stated explicitly.
+- **`#[requires]` clauses describe parameters' values ON ENTRY, and Pitbull
+  enforces that reading (2026-08-08 obligation sweep).** A clause like
+  `x < 100` is attached as a hypothesis only to operands that provably still
+  hold the entry value: if the function body ever reassigns a parameter
+  (`mut x` plus an assignment), every obligation reading that parameter
+  refuses the clause and reports the refusal as an audit note, rather than
+  assuming an entry-value fact about a value that may have changed. The
+  refusal is deliberately body-wide, not flow-sensitive — a clause can fail
+  to apply even at a read that precedes the assignment (a conservative
+  false *reject*, never a false discharge). If you need a contract to
+  discharge an operation on a reassigned parameter, bind the value to a
+  fresh `let` first and derive the bound, or restructure so the parameter
+  is not mutated.
 - **Two config flags widen the TCB by design.** `strict_library_acceptance =
   false` reverts the prelude allow-list to trust-all-stdlib, and
   `fail_on_coverage_gaps = false` downgrades coverage gaps to non-blocking

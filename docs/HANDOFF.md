@@ -94,7 +94,7 @@ deep-audit cleanup passes. Branch `main`, with `origin` remote on GitHub.
   v0.1 ships a PSS-1 subset enforcer; v0.2 adds the VC-generation
   spine and SMT dispatch through a **multi-solver agreement gate**
   (Z3 + CVC5 by default). See `docs/PSS-1.md` for the specification.
-- **State:** 439 tests passing (228 subset-lib + 100 vc + 78 integration + 12 aorte_proofs + 5 allowlist-exhaustiveness + 18 driver-bin),
+- **State:** 446 tests passing (230 subset-lib + 100 vc + 81 integration + 12 aorte_proofs + 5 allowlist-exhaustiveness + 18 driver-bin),
   both lanes warning-clean, clippy error-clean. Done:
   the v0.2 deductive backend (Tasks M + N), spec-context narrowing
   (O.1 → O.2 → O.2.5 → O.3), full PB054 discharge (P / P.1 / P.2),
@@ -272,15 +272,23 @@ d3682f6 Task Q.2: extract #[pitbull::requires] and #[pitbull::trusted] from impl
 
 | Lane | Status |
 |---|---|
-| `cargo +stable test --workspace --all-features` | **439 passing**, 0 failed, 0 ignored, 0 warnings |
+| `cargo +stable test --workspace --all-features` | **446 passing**, 0 failed, 0 ignored, 0 warnings |
 | `cargo +stable check --workspace --all-features` | warning-clean |
 | `cargo +stable clippy --workspace --all-features --all-targets` | clippy-clean (no `error:` lines) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 clippy -p pitbull-driver --bin pitbull-rustc` | clippy-clean (lints the `cfg(rustc_public_real)` dispatch path) |
 | `PITBULL_USE_RUSTC_PUBLIC=1 cargo +nightly-2026-01-29 build -p pitbull-driver --bin pitbull-rustc` | warning-clean |
 
-The **439** breaks down: 4 (cargo-pitbull bin) + 14 (pitbull-rustc bin) + 228
-(subset lib) + 78 (integration) + 12 (aorte_proofs) + 5 (allowlist_exhaustiveness)
-+ 100 (vc) = 439 (the 2026-08-08 PB077 AUDIT added +2 over 437 — the
+The **446** breaks down: 4 (cargo-pitbull bin) + 14 (pitbull-rustc bin) + 230
+(subset lib) + 81 (integration) + 12 (aorte_proofs) + 5 (allowlist_exhaustiveness)
++ 100 (vc) = 446 (the 2026-08-08 obligation-assumption SWEEP added +5 over
+441 — 2 visitor unit tests for the entry-value binding guard, both
+mutation-tested, and 3 e2e pins: PB049/PB054 reassigned-parameter refusals
+plus the PB076 ensures-behind-a-loop pending pin. NOTE a drift correction:
+the PB077-audit commit's docs said "437 → 439", but that audit actually
+added +4 tests — 2 unit AND 2 e2e — so its true landing count was **441**;
+the sum was re-derived programmatically this session and the arithmetic
+here is now checked against the suite output, not hand-carried. The
+2026-08-08 PB077 AUDIT itself added the
 merge-point/loop-back-edge false-discharge regression and the
 reassigned-caller-parameter guard, each pinned by a visitor unit test plus an
 e2e test on the real wrapper; the 2026-08-08 call-site precondition
@@ -1034,6 +1042,78 @@ captured expression is a HYPOTHESIS, not a goal — what would make it FALSE
 at the call site?" rather than by probing more input values. For an
 assumption-emitting feature, that question is the productive one.
 
+### 2026-08-08 obligation-assumption sweep (PB049/PB054/PB076)
+
+**The PB077 audit's question, applied systematically to every OTHER
+hypothesis-emitting surface.** Every obligation kind that assumes a
+`#[pitbull::requires]` clause was swept for the same premise-falsification
+class: the clause describes a parameter's value ON ENTRY, so anything that
+attaches it to a value read mid-body must answer "can the value have
+changed by then?"
+
+**Finding A (latent, guarded — the mutation-reached sibling of the PB077
+bug).** `local_arg_name` — the single choke point through which PB049
+lhs/rhs binding, unary-negation binding, variable-shift-amount binding, AND
+PB054's `idx_source_name` all resolve an operand local to a parameter
+name — never consulted the body's assignments. In shadow IR the naive
+binding is directly constructible: `fn f(mut x: u32, y: u32) { x = y;
+x + 1 }` under `requires("x < 100")` with the op reading `_1` directly
+would assume `x < 100` about an operand holding `y` (unconstrained) —
+discharge from a false premise, runtime overflow for `y = u32::MAX`. **On
+today's rustc this is NOT live**: dumping real MIR for the reassigned
+shapes (`-Z unpretty=mir`, checked BEFORE assuming exploitability — the
+standing lesson) shows any assignment to a parameter reroutes ALL of that
+parameter's reads through fresh temps, even reads BEFORE the assignment,
+and temps never map to arg slots, so the binding already refused. But that
+shield is load-bearing, unverified lowering behaviour — the same situation
+as the Increment 2 reassigned-caller-parameter finding, resolved the same
+way: `local_arg_name` now refuses any local in
+`current_body_assigned_locals` (entry-value contract void). The guard's
+body-wide granularity exactly matches the observed lowering (rustc's
+temp-rerouting is also body-wide), so it costs ZERO live completeness:
+every read it newly refuses already failed to bind through a temp. Both
+new unit tests are **mutation-tested** (disabling the guard fails them);
+three e2e tests pin the wrapper verdicts (`NOT DISCHARGED` + the
+audit-note refusal) so a future lowering change cannot silently reopen the
+vector. Verified refusal messages route through the existing
+no-silent-skips paths ("does not bind to any operand" / "at least one side
+does not resolve").
+
+**Finding B (sound, now documented + pinned).** `capture_body_effect`
+(PB076's return-effect capture, the machinery PB077's Increment 3 reused)
+was audited for the merge-point bug and is **immune by a closed-chain
+argument the PB077 walk cannot make**: it constrains EVERY block's
+terminator from bb0 through to `Return` (Goto/Assert = one successor,
+Return = none, anything else aborts the capture), so the reachable-from-
+entry set IS the walked chain; an edge into the chain from outside comes
+from dead code, and a merge within the chain forces a revisit the
+`visited` set catches. PB077's capture needed `block_in_edge_counts`
+precisely because it stops at an INTERIOR block whose continuation
+re-enters the unconstrained CFG. The argument is now written into
+`capture_body_effect`'s comments with an explicit warning that stopping
+anywhere short of `Return` inherits the in-edge-guard requirement, and
+pinned empirically by `wrapper_ensures_behind_a_loop_never_discharges`
+(a FALSE postcondition whose falsity lives on the looped path: reports
+`pending`, exit 1 — a returning body with a loop necessarily contains a
+branch, which aborts capture).
+
+**Also probed clean:** PB043/PB041 emit pending-only obligations
+(`compile` returns `None` — nothing to falsely discharge); constant pins
+(O.2.5) pin literal values, which no path can change; the ensures
+hypothesis set is expressed over entry-value symbols by construction
+(`capture_body_effect` TRACKS reassignment through its env rather than
+assuming entry values survive). Raw-SMT-LIB preconditions splicing across
+obligations of the same body remain the documented power-user GIGO surface
+(cross-kind splices die as undeclared-symbol solver errors — fail closed;
+same-kind splices constrain the canonical `lhs`/`rhs` names positionally,
+which is what raw-SMT means here).
+
+Tests **441 → 446** (2 unit + 3 e2e; see the count-drift correction in the
+breakdown above — the PB077-audit commit's "439" undercounted its own +4).
+SAFETY-MANUAL §3.7 gained the user-facing statement of the entry-value
+semantics: a `requires` clause never applies to a reassigned parameter,
+body-wide, and the refusal is a visible audit note.
+
 ---
 
 ## 2. Architecture overview
@@ -1164,11 +1244,11 @@ git log --oneline -1
 # not pin a specific hash here). See the recent-commit-log block in §1.
 ```
 
-### Step 4.2 — Stable test suite (the 439-test baseline)
+### Step 4.2 — Stable test suite (the 446-test baseline)
 
 ```bash
 cargo +stable test --workspace --all-features 2>&1 | grep "^test result"
-# Expected: "test result: ok" lines totaling 439 passing, 0 failed, 0 ignored
+# Expected: "test result: ok" lines totaling 446 passing, 0 failed, 0 ignored
 ```
 
 **A green run here is NOT by itself evidence the verifier works** (learned the
@@ -1254,7 +1334,7 @@ See Section 5 for verification details.)
 
 ```bash
 PITBULL_REQUIRE_E2E=1 cargo +stable test --workspace --all-features -- --test-threads=1
-# Expected: all integration tests run (none gracefully skipped). Still 439 passing.
+# Expected: all integration tests run (none gracefully skipped). Still 446 passing.
 # Note: the 2-of-N agreement capstone additionally requires BOTH z3 and
 # cvc5 on PATH; with PITBULL_REQUIRE_E2E set it panics if either is missing.
 ```
@@ -1311,7 +1391,7 @@ should exercise the actual solver path:
 
 ```bash
 cargo +stable test --workspace --all-features
-# Expected: 439 passing (same as without Z3 — the new tests
+# Expected: 446 passing (same as without Z3 — the new tests
 # also pass via graceful-skip if no solver is present, but with
 # z3 they exercise the real `unsat` verdict path).
 ```
